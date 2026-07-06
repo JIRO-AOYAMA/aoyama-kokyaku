@@ -19,6 +19,7 @@ SHEET_NAME = "Sheet1"
 # secrets.toml に入れる設定
 DROPBOX_ACCESS_TOKEN = st.secrets.get("DROPBOX_ACCESS_TOKEN", "")
 DROPBOX_FILE_PATH = st.secrets.get("DROPBOX_FILE_PATH", "")
+APP_PASSWORD = st.secrets.get("APP_PASSWORD", "")
 
 REQUIRED_COLUMNS = [
     "ID",
@@ -40,6 +41,31 @@ st.set_page_config(
     page_icon="🚚",
     layout="centered",
 )
+
+# =========================
+# ログイン認証
+# =========================
+if "authenticated" not in st.session_state:
+    st.session_state.authenticated = False
+
+if not st.session_state.authenticated:
+    st.title("🔒 青山商店")
+    st.caption("顧客検索アプリ")
+
+    if not APP_PASSWORD:
+        st.error("APP_PASSWORD が設定されていません。Streamlit Cloud の Secrets に APP_PASSWORD を追加してください。")
+        st.stop()
+
+    password = st.text_input("パスワード", type="password")
+
+    if st.button("ログイン"):
+        if password == APP_PASSWORD:
+            st.session_state.authenticated = True
+            st.rerun()
+        else:
+            st.error("パスワードが違います。")
+
+    st.stop()
 
 
 # =========================
@@ -522,8 +548,19 @@ if "selected_customer" not in st.session_state:
     st.session_state["selected_customer"] = None
 
 
-st.title("🚚 青山商店")
-st.caption("顧客検索アプリ")
+col_title, col_logout = st.columns([3, 1])
+
+with col_title:
+    st.title("🚚 青山商店")
+    st.caption("顧客検索アプリ")
+
+with col_logout:
+    st.write("")
+    if st.button("ログアウト"):
+        st.session_state.authenticated = False
+        st.session_state.page = "home"
+        st.session_state.selected_customer = None
+        st.rerun()
 
 df = load_data()
 
