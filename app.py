@@ -1,7 +1,6 @@
 import json
 import math
 from datetime import date, timedelta
-import calendar
 from io import BytesIO
 from pathlib import Path
 
@@ -18,6 +17,10 @@ EXCEL_FILE = "配車予定 次郎.xlsm"
 SHEET_NAME = "Sheet1"
 
 # secrets.toml に入れる設定
+DROPBOX_APP_KEY = st.secrets.get("DROPBOX_APP_KEY", "")
+DROPBOX_APP_SECRET = st.secrets.get("DROPBOX_APP_SECRET", "")
+DROPBOX_REFRESH_TOKEN = st.secrets.get("DROPBOX_REFRESH_TOKEN", "")
+# 移行期間用。Streamlit CloudではRefresh Token方式の3項目を使う。
 DROPBOX_ACCESS_TOKEN = st.secrets.get("DROPBOX_ACCESS_TOKEN", "")
 DROPBOX_FILE_PATH = st.secrets.get("DROPBOX_FILE_PATH", "")
 APP_PASSWORD = st.secrets.get("APP_PASSWORD", "")
@@ -53,10 +56,14 @@ if not st.session_state.authenticated:
     st.title("🔒 青山商店")
     st.caption("顧客検索アプリ")
 
+    if not APP_PASSWORD:
+        st.error("APP_PASSWORD が設定されていません。Streamlit Cloud の Secrets に APP_PASSWORD を追加してください。")
+        st.stop()
+
     password = st.text_input("パスワード", type="password")
 
     if st.button("ログイン"):
-        if APP_PASSWORD and password == APP_PASSWORD:
+        if password == APP_PASSWORD:
             st.session_state.authenticated = True
             st.rerun()
         else:
@@ -158,7 +165,84 @@ def make_dropbox_api_arg(path_or_id):
     return json.dumps({"path": path_or_id}, ensure_ascii=True).encode("utf-8").decode("latin1")
 
 
-def search_dropbox_file_by_name(filename):
+@st.cache_data(ttl=3300, show_spinner=False)
+def request_dropbox_access_token(app_key, app_secret, refresh_token):
+    """Refresh Tokenから短期アクセストークンを取得する"""
+    url = "https://api.dropboxapi.com/oauth2/token"
+    data = {
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+    }
+
+    try:
+        response = requests.post(
+            url,
+            data=data,
+            auth=(app_key, app_secret),
+            timeout=30,
+        )
+    except Exception as e:
+        return None, None, str(e)
+
+    if response.status_code != 200:
+        return None, response.status_code, response.text
+
+    return response.json().get("access_token"), None, None
+
+
+def has_dropbox_auth_config():
+    return bool(
+        DROPBOX_APP_KEY
+        or DROPBOX_APP_SECRET
+        or DROPBOX_REFRESH_TOKEN
+        or DROPBOX_ACCESS_TOKEN
+    )
+
+
+def get_dropbox_access_token():
+    """
+    Streamlit CloudではRefresh Token方式で短期アクセストークンを取得する。
+    DROPBOX_ACCESS_TOKENは既存環境をすぐ壊さないための移行用。
+    """
+    if DROPBOX_APP_KEY or DROPBOX_APP_SECRET or DROPBOX_REFRESH_TOKEN:
+        missing = []
+        if not DROPBOX_APP_KEY:
+            missing.append("DROPBOX_APP_KEY")
+        if not DROPBOX_APP_SECRET:
+            missing.append("DROPBOX_APP_SECRET")
+        if not DROPBOX_REFRESH_TOKEN:
+            missing.append("DROPBOX_REFRESH_TOKEN")
+
+        if missing:
+            st.error("Dropbox API設定が不足しています。")
+            st.write("Streamlit Cloud の Secrets に以下を追加してください。")
+            st.code("\n".join(missing))
+            st.stop()
+
+        access_token, status_code, error_text = request_dropbox_access_token(
+            DROPBOX_APP_KEY,
+            DROPBOX_APP_SECRET,
+            DROPBOX_REFRESH_TOKEN,
+        )
+
+        if not access_token:
+            st.error("Dropboxのアクセストークン更新に失敗しました。")
+            if status_code:
+                st.write(f"Dropboxからの応答コード：{status_code}")
+            st.code(error_text or "access_token が返りませんでした。")
+            st.stop()
+
+        return access_token
+
+    if DROPBOX_ACCESS_TOKEN:
+        return DROPBOX_ACCESS_TOKEN
+
+    st.error("Dropbox API設定が不足しています。")
+    st.write("secrets.toml に DROPBOX_APP_KEY / DROPBOX_APP_SECRET / DROPBOX_REFRESH_TOKEN を設定してください。")
+    st.stop()
+
+
+def search_dropbox_file_by_name(filename, access_token):
     """
     DROPBOX_FILE_PATHが空、またはパス指定で失敗した時に、
     Dropbox内からファイル名で検索する。
@@ -166,7 +250,7 @@ def search_dropbox_file_by_name(filename):
     url = "https://api.dropboxapi.com/2/files/search_v2"
 
     headers = {
-        "Authorization": f"Bearer {DROPBOX_ACCESS_TOKEN}",
+        "Authorization": f"Bearer {access_token}",
         "Content-Type": "application/json",
     }
 
@@ -214,12 +298,12 @@ def search_dropbox_file_by_name(filename):
     return metadata.get("id"), metadata.get("path_display", "")
 
 
-def download_dropbox_file(path_or_id):
+def download_dropbox_file(path_or_id, access_token):
     """Dropbox APIでExcelをダウンロードする"""
     url = "https://content.dropboxapi.com/2/files/download"
 
     headers = {
-        "Authorization": f"Bearer {DROPBOX_ACCESS_TOKEN}",
+        "Authorization": f"Bearer {access_token}",
         "Dropbox-API-Arg": make_dropbox_api_arg(path_or_id),
     }
 
@@ -238,22 +322,23 @@ def download_dropbox_file(path_or_id):
 
 def read_excel_from_dropbox_api():
     """Dropbox APIでExcelをダウンロードして読み込む"""
-    if not DROPBOX_ACCESS_TOKEN:
+    if not has_dropbox_auth_config():
         st.error("Dropbox API設定が不足しています。")
-        st.write("secrets.toml に DROPBOX_ACCESS_TOKEN を設定してください。")
+        st.write("secrets.toml に DROPBOX_APP_KEY / DROPBOX_APP_SECRET / DROPBOX_REFRESH_TOKEN を設定してください。")
         st.stop()
 
+    access_token = get_dropbox_access_token()
     content = None
     response = None
 
     # 1. まずDROPBOX_FILE_PATHがあれば、それを試す
     if DROPBOX_FILE_PATH:
-        content, response = download_dropbox_file(DROPBOX_FILE_PATH)
+        content, response = download_dropbox_file(DROPBOX_FILE_PATH, access_token)
 
     # 2. パス指定で失敗したら、ファイル名で検索する
     if content is None:
-        file_id, path_display = search_dropbox_file_by_name(EXCEL_FILE)
-        content, response = download_dropbox_file(file_id)
+        file_id, path_display = search_dropbox_file_by_name(EXCEL_FILE, access_token)
+        content, response = download_dropbox_file(file_id, access_token)
 
         if content is None:
             st.error("Dropbox APIからExcelファイルをダウンロードできませんでした。")
@@ -354,7 +439,7 @@ def load_data():
     Dropbox API設定があればDropbox上のExcelを読む。
     設定がなければ同じフォルダのローカルExcelを読む。
     """
-    if DROPBOX_ACCESS_TOKEN:
+    if has_dropbox_auth_config():
         excel_source = read_excel_from_dropbox_api()
     else:
         excel_source = read_excel_local()
@@ -535,195 +620,6 @@ def show_delivery_list(df):
                 st.rerun()
 
 
-
-# =========================
-# 配車カレンダー
-# =========================
-def get_month_start():
-    today = date.today()
-    if "calendar_year" not in st.session_state:
-        st.session_state["calendar_year"] = today.year
-    if "calendar_month" not in st.session_state:
-        st.session_state["calendar_month"] = today.month
-
-    return date(st.session_state["calendar_year"], st.session_state["calendar_month"], 1)
-
-
-def change_month(delta):
-    current = get_month_start()
-    month = current.month + delta
-    year = current.year
-
-    if month < 1:
-        month = 12
-        year -= 1
-    elif month > 12:
-        month = 1
-        year += 1
-
-    st.session_state["calendar_year"] = year
-    st.session_state["calendar_month"] = month
-
-
-def make_calendar_rows(df, month_start):
-    last_day = calendar.monthrange(month_start.year, month_start.month)[1]
-    start_day = date(month_start.year, month_start.month, 1)
-    end_day = date(month_start.year, month_start.month, last_day)
-
-    rows_by_day = {}
-
-    for day_num in range(1, last_day + 1):
-        target_day = date(month_start.year, month_start.month, day_num)
-        rows_by_day[target_day] = []
-
-    for _, row in df.iterrows():
-        next_delivery = to_date(row["次回配達予定"])
-        if next_delivery is None:
-            continue
-
-        if start_day <= next_delivery <= end_day:
-            customer_name = clean_value(row["顧客名"])
-            region = clean_value(row["地域"])
-            product_name = clean_value(row["商品名"])
-
-            rows_by_day.setdefault(next_delivery, []).append(
-                {
-                    "顧客名": customer_name,
-                    "地域": region,
-                    "商品名": product_name,
-                }
-            )
-
-    for target_day in rows_by_day:
-        rows_by_day[target_day] = sorted(rows_by_day[target_day], key=lambda x: x["顧客名"])
-
-    return rows_by_day
-
-
-def show_calendar_header():
-    month_start = get_month_start()
-
-    if st.button("← ホームへ戻る"):
-        set_page("home")
-        st.rerun()
-
-    st.markdown("---")
-    st.header("🗓 配車カレンダー")
-
-    col_prev, col_month, col_next = st.columns([1, 2, 1])
-
-    with col_prev:
-        if st.button("◀ 前月"):
-            change_month(-1)
-            st.rerun()
-
-    with col_month:
-        st.markdown(f"### {month_start.year}年{month_start.month}月")
-
-    with col_next:
-        if st.button("翌月 ▶"):
-            change_month(1)
-            st.rerun()
-
-    return month_start
-
-
-def show_two_day_calendar(df, month_start):
-    rows_by_day = make_calendar_rows(df, month_start)
-    last_day = calendar.monthrange(month_start.year, month_start.month)[1]
-
-    st.subheader("📱 2日表示")
-
-    for day_num in range(1, last_day + 1, 2):
-        day1 = date(month_start.year, month_start.month, day_num)
-        day2 = date(month_start.year, month_start.month, day_num + 1) if day_num + 1 <= last_day else None
-
-        col1, col2 = st.columns(2)
-
-        for col, target_day in [(col1, day1), (col2, day2)]:
-            with col:
-                if target_day is None:
-                    st.write("")
-                    continue
-
-                weekday = ["月", "火", "水", "木", "金", "土", "日"][target_day.weekday()]
-                st.markdown(f"#### {target_day.month}/{target_day.day}（{weekday}）")
-
-                items = rows_by_day.get(target_day, [])
-
-                if not items:
-                    st.caption("予定なし")
-                else:
-                    for i, item in enumerate(items):
-                        name = item["顧客名"]
-                        region = item["地域"]
-                        product_name = item["商品名"]
-
-                        with st.container(border=True):
-                            st.markdown(f"**👤 {name}**")
-                            st.caption(f"地域：{region}")
-                            st.caption(f"商品：{product_name}")
-
-                            if st.button("詳細", key=f"cal_2day_{target_day}_{i}_{name}"):
-                                select_customer(name)
-                                st.rerun()
-
-        st.markdown("---")
-
-
-def show_month_calendar(df, month_start):
-    rows_by_day = make_calendar_rows(df, month_start)
-    last_day = calendar.monthrange(month_start.year, month_start.month)[1]
-
-    st.subheader("🗓 月表示")
-    st.caption("横スクロールできます。")
-
-    max_count = 0
-    for items in rows_by_day.values():
-        max_count = max(max_count, len(items))
-
-    if max_count == 0:
-        max_count = 1
-
-    table_rows = []
-
-    for day_num in range(1, last_day + 1):
-        target_day = date(month_start.year, month_start.month, day_num)
-        weekday = ["月", "火", "水", "木", "金", "土", "日"][target_day.weekday()]
-        items = rows_by_day.get(target_day, [])
-
-        row_data = {
-            "月/日": f"{target_day.month}/{target_day.day}（{weekday}）"
-        }
-
-        for i in range(max_count):
-            col_name = f"牧場名{i + 1}"
-            if i < len(items):
-                row_data[col_name] = items[i]["顧客名"]
-            else:
-                row_data[col_name] = ""
-
-        table_rows.append(row_data)
-
-    month_df = pd.DataFrame(table_rows)
-    st.dataframe(month_df, use_container_width=True, hide_index=True)
-
-
-def show_dispatch_calendar(df):
-    month_start = show_calendar_header()
-
-    view = st.radio(
-        "表示切替",
-        ["📱 2日表示", "🗓 月表示"],
-        horizontal=True,
-    )
-
-    if view == "📱 2日表示":
-        show_two_day_calendar(df, month_start)
-    else:
-        show_month_calendar(df, month_start)
-
-
 # =========================
 # メイン
 # =========================
@@ -734,8 +630,19 @@ if "selected_customer" not in st.session_state:
     st.session_state["selected_customer"] = None
 
 
-st.title("🚚 青山商店")
-st.caption("顧客検索アプリ")
+col_title, col_logout = st.columns([3, 1])
+
+with col_title:
+    st.title("🚚 青山商店")
+    st.caption("顧客検索アプリ")
+
+with col_logout:
+    st.write("")
+    if st.button("ログアウト"):
+        st.session_state.authenticated = False
+        st.session_state.page = "home"
+        st.session_state.selected_customer = None
+        st.rerun()
 
 df = load_data()
 
@@ -750,19 +657,8 @@ if st.session_state["page"] == "home":
         set_page("delivery")
         st.rerun()
 
-    st.markdown("---")
-    st.subheader("🗓 配車カレンダー")
-    st.caption("2日表示 / 月表示")
-
-    if st.button("配車カレンダーを見る"):
-        set_page("calendar")
-        st.rerun()
-
 elif st.session_state["page"] == "delivery":
     show_delivery_list(df)
-
-elif st.session_state["page"] == "calendar":
-    show_dispatch_calendar(df)
 
 elif st.session_state["page"] == "detail":
     selected = st.session_state.get("selected_customer")
