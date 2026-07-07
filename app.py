@@ -12,7 +12,7 @@ import streamlit as st
 # =========================
 # 基本設定
 # =========================
-APP_TITLE = "青山商店 顧客検索"
+APP_TITLE = "青山商店 業務アプリ"
 EXCEL_FILE = "配車予定 次郎.xlsm"
 SHEET_NAME = "Sheet1"
 
@@ -54,7 +54,7 @@ if "authenticated" not in st.session_state:
 
 if not st.session_state.authenticated:
     st.title("🔒 青山商店")
-    st.caption("顧客検索アプリ")
+    st.caption("業務アプリ")
 
     if not APP_PASSWORD:
         st.error("APP_PASSWORD が設定されていません。Streamlit Cloud の Secrets に APP_PASSWORD を追加してください。")
@@ -152,6 +152,48 @@ def format_number(value, decimal=1, blank_text="未設定"):
         return f"{num:.{decimal}f}"
     except Exception:
         return text
+
+
+def find_existing_column(df, candidates):
+    """候補名の中から、Excelに存在する列名を1つ探す"""
+    for candidate in candidates:
+        if candidate in df.columns:
+            return candidate
+    return None
+
+
+def find_date_column(df):
+    """配車カレンダーで使う日付列を探す"""
+    candidates = [
+        "配車日",
+        "配車予定日",
+        "配達日",
+        "配達予定日",
+        "配送日",
+        "配送予定日",
+        "納品日",
+        "予定日",
+        "日付",
+        "次回配達予定",
+    ]
+
+    found = find_existing_column(df, candidates)
+    if found:
+        return found
+
+    keywords = ["配車", "配達", "配送", "納品", "予定", "日付"]
+
+    for col in df.columns:
+        col_text = str(col)
+        if "数量" in col_text:
+            continue
+
+        if any(keyword in col_text for keyword in keywords):
+            parsed = pd.to_datetime(df[col], errors="coerce")
+            if parsed.notna().any():
+                return col
+
+    return None
 
 
 # =========================
@@ -421,7 +463,13 @@ def normalize_excel_table(excel_source):
         st.write("Excelから読み取れた列：", list(df.columns))
         st.stop()
 
-    df = df[REQUIRED_COLUMNS].copy()
+    # 既存機能に必要な列を先頭に置きつつ、備考などの追加列も残す
+    ordered_columns = REQUIRED_COLUMNS.copy()
+    for col in df.columns:
+        if col not in ordered_columns:
+            ordered_columns.append(col)
+
+    df = df[ordered_columns].copy()
 
     # 検索に必要な行だけ残す
     df = df.dropna(subset=["顧客名", "ひらがな"])
@@ -621,6 +669,125 @@ def show_delivery_list(df):
 
 
 # =========================
+# 配車カレンダー
+# =========================
+def get_dispatch_display_columns(df):
+    """配車予定として表示できる列だけを探す"""
+    return [
+        ("取引先名", find_existing_column(df, ["取引先名", "顧客名", "得意先名", "お客様名", "牧場名", "名前", "名称"])),
+        ("地域", find_existing_column(df, ["地域", "地区", "エリア", "住所", "市町村"])),
+        ("商品名", find_existing_column(df, ["商品名", "商品", "品名", "製品名"])),
+        ("数量", find_existing_column(df, ["数量", "配達数量", "配送数量", "使用数量/日", "使用数量", "注文数", "本数", "量"])),
+        ("備考", find_existing_column(df, ["備考", "メモ", "コメント", "注意事項", "摘要"])),
+    ]
+
+
+def get_default_dispatch_date(df, date_column):
+    """予定がある日付のうち、今日以降で一番近い日を初期表示にする"""
+    parsed = pd.to_datetime(df[date_column], errors="coerce").dropna()
+    if parsed.empty:
+        return date.today()
+
+    available_dates = sorted(set(parsed.dt.date))
+    today = date.today()
+
+    for target_date in available_dates:
+        if target_date >= today:
+            return target_date
+
+    return available_dates[-1]
+
+
+def make_dispatch_list(df, target_date, date_column):
+    """選択した日の配車予定だけを取り出す"""
+    parsed_dates = pd.to_datetime(df[date_column], errors="coerce").dt.date
+    dispatch_df = df[parsed_dates == target_date].copy()
+
+    if dispatch_df.empty:
+        return dispatch_df
+
+    sort_candidates = [
+        find_existing_column(dispatch_df, ["取引先名", "顧客名", "得意先名", "お客様名", "牧場名"]),
+        find_existing_column(dispatch_df, ["地域", "地区", "エリア"]),
+        find_existing_column(dispatch_df, ["商品名", "商品", "品名"]),
+    ]
+    sort_columns = [col for col in sort_candidates if col]
+
+    if sort_columns:
+        dispatch_df = dispatch_df.sort_values(sort_columns).reset_index(drop=True)
+
+    return dispatch_df
+
+
+def show_dispatch_calendar(df):
+    st.markdown("---")
+    st.header("🗓 配車カレンダー")
+
+    if df.empty:
+        st.warning("Excelから読み込めるデータがありません。")
+        return
+
+    date_column = find_date_column(df)
+
+    if not date_column:
+        st.error("配車カレンダーに使える日付列が見つかりません。")
+        st.write("次のような列名があるか確認してください。")
+        st.code("配車日 / 配達日 / 配達予定日 / 日付 / 次回配達予定")
+        st.write("Excelから読み取れた列：")
+        st.write(list(df.columns))
+        return
+
+    default_date = get_default_dispatch_date(df, date_column)
+
+    selected_date = st.date_input(
+        "日付を選択",
+        value=default_date,
+    )
+
+    dispatch_df = make_dispatch_list(df, selected_date, date_column)
+
+    st.caption(f"使用している日付列：{date_column}")
+
+    if dispatch_df.empty:
+        st.info("この日の配車予定はありません。")
+        return
+
+    display_columns = get_dispatch_display_columns(dispatch_df)
+    display_columns = [(label, col) for label, col in display_columns if col]
+
+    if not display_columns:
+        st.error("表示できる列が見つかりません。")
+        st.write("Excelから読み取れた列：")
+        st.write(list(dispatch_df.columns))
+        return
+
+    st.write(f"予定：{len(dispatch_df)}件")
+
+    for i, row in dispatch_df.iterrows():
+        customer_name_col = find_existing_column(dispatch_df, ["取引先名", "顧客名", "得意先名", "お客様名", "牧場名"])
+        customer_name = clean_value(row[customer_name_col]) if customer_name_col else f"予定 {i + 1}"
+
+        with st.container(border=True):
+            st.subheader(customer_name)
+
+            for label, col in display_columns:
+                value = row[col]
+
+                if label == "数量":
+                    display_value = format_number(value)
+                else:
+                    display_value = clean_value(value)
+
+                if display_value != "未設定":
+                    st.write(f"**{label}：** {display_value}")
+
+            if customer_name_col and "顧客名" in dispatch_df.columns:
+                if st.button("顧客詳細を見る", key=f"dispatch_detail_{i}_{customer_name}"):
+                    select_customer(clean_value(row["顧客名"]))
+                    st.rerun()
+
+
+# =========================
 # メイン
 # =========================
 if "page" not in st.session_state:
@@ -630,11 +797,47 @@ if "selected_customer" not in st.session_state:
     st.session_state["selected_customer"] = None
 
 
+MENU_OPTIONS = {
+    "顧客検索": "home",
+    "配達予定一覧": "delivery",
+    "配車カレンダー": "calendar",
+}
+
+current_page = st.session_state.get("page", "home")
+menu_pages = list(MENU_OPTIONS.values())
+menu_labels = list(MENU_OPTIONS.keys())
+
+if current_page in menu_pages:
+    current_menu_index = menu_pages.index(current_page)
+else:
+    current_menu_index = 0
+
+with st.sidebar:
+    st.title("🚚 青山商店")
+    st.caption("業務アプリ")
+
+    selected_menu = st.radio(
+        "メニュー",
+        menu_labels,
+        index=current_menu_index,
+    )
+
+selected_page = MENU_OPTIONS[selected_menu]
+
+if st.session_state["page"] == "detail":
+    if selected_page != "home":
+        st.session_state["page"] = selected_page
+        st.session_state["selected_customer"] = None
+        st.rerun()
+else:
+    st.session_state["page"] = selected_page
+
+
 col_title, col_logout = st.columns([3, 1])
 
 with col_title:
-    st.title("🚚 青山商店")
-    st.caption("顧客検索アプリ")
+    st.title(f"🚚 {APP_TITLE}")
+    st.caption("顧客検索・配達予定・配車カレンダー")
 
 with col_logout:
     st.write("")
@@ -657,8 +860,19 @@ if st.session_state["page"] == "home":
         set_page("delivery")
         st.rerun()
 
+    st.markdown("---")
+    st.subheader("🗓 配車カレンダー")
+    st.caption("日付を選んで、その日の配車予定を確認できます。")
+
+    if st.button("配車カレンダーを見る"):
+        set_page("calendar")
+        st.rerun()
+
 elif st.session_state["page"] == "delivery":
     show_delivery_list(df)
+
+elif st.session_state["page"] == "calendar":
+    show_dispatch_calendar(df)
 
 elif st.session_state["page"] == "detail":
     selected = st.session_state.get("selected_customer")
