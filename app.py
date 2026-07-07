@@ -1,6 +1,7 @@
 import json
 import math
 from datetime import date, timedelta
+import calendar
 from io import BytesIO
 from pathlib import Path
 
@@ -52,14 +53,10 @@ if not st.session_state.authenticated:
     st.title("🔒 青山商店")
     st.caption("顧客検索アプリ")
 
-    if not APP_PASSWORD:
-        st.error("APP_PASSWORD が設定されていません。Streamlit Cloud の Secrets に APP_PASSWORD を追加してください。")
-        st.stop()
-
     password = st.text_input("パスワード", type="password")
 
     if st.button("ログイン"):
-        if password == APP_PASSWORD:
+        if APP_PASSWORD and password == APP_PASSWORD:
             st.session_state.authenticated = True
             st.rerun()
         else:
@@ -538,6 +535,195 @@ def show_delivery_list(df):
                 st.rerun()
 
 
+
+# =========================
+# 配車カレンダー
+# =========================
+def get_month_start():
+    today = date.today()
+    if "calendar_year" not in st.session_state:
+        st.session_state["calendar_year"] = today.year
+    if "calendar_month" not in st.session_state:
+        st.session_state["calendar_month"] = today.month
+
+    return date(st.session_state["calendar_year"], st.session_state["calendar_month"], 1)
+
+
+def change_month(delta):
+    current = get_month_start()
+    month = current.month + delta
+    year = current.year
+
+    if month < 1:
+        month = 12
+        year -= 1
+    elif month > 12:
+        month = 1
+        year += 1
+
+    st.session_state["calendar_year"] = year
+    st.session_state["calendar_month"] = month
+
+
+def make_calendar_rows(df, month_start):
+    last_day = calendar.monthrange(month_start.year, month_start.month)[1]
+    start_day = date(month_start.year, month_start.month, 1)
+    end_day = date(month_start.year, month_start.month, last_day)
+
+    rows_by_day = {}
+
+    for day_num in range(1, last_day + 1):
+        target_day = date(month_start.year, month_start.month, day_num)
+        rows_by_day[target_day] = []
+
+    for _, row in df.iterrows():
+        next_delivery = to_date(row["次回配達予定"])
+        if next_delivery is None:
+            continue
+
+        if start_day <= next_delivery <= end_day:
+            customer_name = clean_value(row["顧客名"])
+            region = clean_value(row["地域"])
+            product_name = clean_value(row["商品名"])
+
+            rows_by_day.setdefault(next_delivery, []).append(
+                {
+                    "顧客名": customer_name,
+                    "地域": region,
+                    "商品名": product_name,
+                }
+            )
+
+    for target_day in rows_by_day:
+        rows_by_day[target_day] = sorted(rows_by_day[target_day], key=lambda x: x["顧客名"])
+
+    return rows_by_day
+
+
+def show_calendar_header():
+    month_start = get_month_start()
+
+    if st.button("← ホームへ戻る"):
+        set_page("home")
+        st.rerun()
+
+    st.markdown("---")
+    st.header("🗓 配車カレンダー")
+
+    col_prev, col_month, col_next = st.columns([1, 2, 1])
+
+    with col_prev:
+        if st.button("◀ 前月"):
+            change_month(-1)
+            st.rerun()
+
+    with col_month:
+        st.markdown(f"### {month_start.year}年{month_start.month}月")
+
+    with col_next:
+        if st.button("翌月 ▶"):
+            change_month(1)
+            st.rerun()
+
+    return month_start
+
+
+def show_two_day_calendar(df, month_start):
+    rows_by_day = make_calendar_rows(df, month_start)
+    last_day = calendar.monthrange(month_start.year, month_start.month)[1]
+
+    st.subheader("📱 2日表示")
+
+    for day_num in range(1, last_day + 1, 2):
+        day1 = date(month_start.year, month_start.month, day_num)
+        day2 = date(month_start.year, month_start.month, day_num + 1) if day_num + 1 <= last_day else None
+
+        col1, col2 = st.columns(2)
+
+        for col, target_day in [(col1, day1), (col2, day2)]:
+            with col:
+                if target_day is None:
+                    st.write("")
+                    continue
+
+                weekday = ["月", "火", "水", "木", "金", "土", "日"][target_day.weekday()]
+                st.markdown(f"#### {target_day.month}/{target_day.day}（{weekday}）")
+
+                items = rows_by_day.get(target_day, [])
+
+                if not items:
+                    st.caption("予定なし")
+                else:
+                    for i, item in enumerate(items):
+                        name = item["顧客名"]
+                        region = item["地域"]
+                        product_name = item["商品名"]
+
+                        with st.container(border=True):
+                            st.markdown(f"**👤 {name}**")
+                            st.caption(f"地域：{region}")
+                            st.caption(f"商品：{product_name}")
+
+                            if st.button("詳細", key=f"cal_2day_{target_day}_{i}_{name}"):
+                                select_customer(name)
+                                st.rerun()
+
+        st.markdown("---")
+
+
+def show_month_calendar(df, month_start):
+    rows_by_day = make_calendar_rows(df, month_start)
+    last_day = calendar.monthrange(month_start.year, month_start.month)[1]
+
+    st.subheader("🗓 月表示")
+    st.caption("横スクロールできます。")
+
+    max_count = 0
+    for items in rows_by_day.values():
+        max_count = max(max_count, len(items))
+
+    if max_count == 0:
+        max_count = 1
+
+    table_rows = []
+
+    for day_num in range(1, last_day + 1):
+        target_day = date(month_start.year, month_start.month, day_num)
+        weekday = ["月", "火", "水", "木", "金", "土", "日"][target_day.weekday()]
+        items = rows_by_day.get(target_day, [])
+
+        row_data = {
+            "月/日": f"{target_day.month}/{target_day.day}（{weekday}）"
+        }
+
+        for i in range(max_count):
+            col_name = f"牧場名{i + 1}"
+            if i < len(items):
+                row_data[col_name] = items[i]["顧客名"]
+            else:
+                row_data[col_name] = ""
+
+        table_rows.append(row_data)
+
+    month_df = pd.DataFrame(table_rows)
+    st.dataframe(month_df, use_container_width=True, hide_index=True)
+
+
+def show_dispatch_calendar(df):
+    month_start = show_calendar_header()
+
+    view = st.radio(
+        "表示切替",
+        ["📱 2日表示", "🗓 月表示"],
+        horizontal=True,
+    )
+
+    if view == "📱 2日表示":
+        show_two_day_calendar(df, month_start)
+    else:
+        show_month_calendar(df, month_start)
+
+
 # =========================
 # メイン
 # =========================
@@ -548,19 +734,8 @@ if "selected_customer" not in st.session_state:
     st.session_state["selected_customer"] = None
 
 
-col_title, col_logout = st.columns([3, 1])
-
-with col_title:
-    st.title("🚚 青山商店")
-    st.caption("顧客検索アプリ")
-
-with col_logout:
-    st.write("")
-    if st.button("ログアウト"):
-        st.session_state.authenticated = False
-        st.session_state.page = "home"
-        st.session_state.selected_customer = None
-        st.rerun()
+st.title("🚚 青山商店")
+st.caption("顧客検索アプリ")
 
 df = load_data()
 
@@ -575,8 +750,19 @@ if st.session_state["page"] == "home":
         set_page("delivery")
         st.rerun()
 
+    st.markdown("---")
+    st.subheader("🗓 配車カレンダー")
+    st.caption("2日表示 / 月表示")
+
+    if st.button("配車カレンダーを見る"):
+        set_page("calendar")
+        st.rerun()
+
 elif st.session_state["page"] == "delivery":
     show_delivery_list(df)
+
+elif st.session_state["page"] == "calendar":
+    show_dispatch_calendar(df)
 
 elif st.session_state["page"] == "detail":
     selected = st.session_state.get("selected_customer")
