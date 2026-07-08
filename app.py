@@ -1,6 +1,8 @@
+import calendar
 import json
 import math
 from datetime import date, timedelta
+from html import escape
 from io import BytesIO
 from pathlib import Path
 
@@ -22,7 +24,8 @@ DROPBOX_APP_SECRET = st.secrets.get("DROPBOX_APP_SECRET", "")
 DROPBOX_REFRESH_TOKEN = st.secrets.get("DROPBOX_REFRESH_TOKEN", "")
 # 移行期間用。Streamlit CloudではRefresh Token方式の3項目を使う。
 DROPBOX_ACCESS_TOKEN = st.secrets.get("DROPBOX_ACCESS_TOKEN", "")
-DROPBOX_FILE_PATH = st.secrets.get("DROPBOX_FILE_PATH", "")
+DROPBOX_DEFAULT_FILE_PATH = "/1共有　青山商店　本社/配車表-北海道-/配車予定 次郎.xlsm"
+DROPBOX_FILE_PATH = st.secrets.get("DROPBOX_FILE_PATH", DROPBOX_DEFAULT_FILE_PATH)
 APP_PASSWORD = st.secrets.get("APP_PASSWORD", "")
 
 REQUIRED_COLUMNS = [
@@ -35,6 +38,17 @@ REQUIRED_COLUMNS = [
     "残数",
     "ひらがな",
 ]
+
+REQUIRED_COLUMN_CANDIDATES = {
+    "ID": ["ID", "id", "顧客ID", "顧客コード", "コード", "No", "NO", "番号"],
+    "顧客名": ["顧客名", "牧場名", "取引先名", "得意先名", "お客様名", "名前", "名称"],
+    "地域": ["地域", "地区", "エリア", "住所", "市町村"],
+    "商品名": ["商品名", "商品", "品名", "製品名"],
+    "使用数量/日": ["使用数量/日", "使用数量", "使用量/日", "一日使用量", "数量/日", "日量"],
+    "次回配達予定": ["次回配達予定", "配達予定日", "配送予定日", "配達日", "配送日", "納品日", "予定日", "日付"],
+    "残数": ["残数", "残量", "残", "在庫", "残り"],
+    "ひらがな": ["ひらがな", "ふりがな", "フリガナ", "かな", "カナ", "よみがな", "読み仮名"],
+}
 
 
 # =========================
@@ -162,6 +176,20 @@ def find_existing_column(df, candidates):
     return None
 
 
+def find_required_column_mapping(column_names):
+    """Excelの列名候補を、アプリ内で使う標準列名へ対応させる"""
+    normalized_columns = [str(col).strip() for col in column_names]
+    mapping = {}
+
+    for required_column, candidates in REQUIRED_COLUMN_CANDIDATES.items():
+        for candidate in candidates:
+            if candidate in normalized_columns:
+                mapping[required_column] = candidate
+                break
+
+    return mapping
+
+
 def find_date_column(df):
     """配車カレンダーで使う日付列を探す"""
     candidates = [
@@ -284,62 +312,6 @@ def get_dropbox_access_token():
     st.stop()
 
 
-def search_dropbox_file_by_name(filename, access_token):
-    """
-    DROPBOX_FILE_PATHが空、またはパス指定で失敗した時に、
-    Dropbox内からファイル名で検索する。
-    """
-    url = "https://api.dropboxapi.com/2/files/search_v2"
-
-    headers = {
-        "Authorization": f"Bearer {access_token}",
-        "Content-Type": "application/json",
-    }
-
-    data = {
-        "query": filename,
-        "options": {
-            "filename_only": True,
-            "max_results": 20,
-        },
-    }
-
-    try:
-        response = requests.post(url, headers=headers, json=data, timeout=30)
-    except Exception as e:
-        st.error("Dropbox内のファイル検索に失敗しました。")
-        st.exception(e)
-        st.stop()
-
-    if response.status_code != 200:
-        st.error("Dropbox内のファイル検索に失敗しました。")
-        st.write("Dropboxからの応答：")
-        st.code(response.text)
-        st.stop()
-
-    result = response.json()
-    matches = result.get("matches", [])
-
-    if not matches:
-        st.error(f"Dropbox内でファイルが見つかりません：{filename}")
-        st.write("ファイル名が完全一致しているか確認してください。")
-        st.stop()
-
-    # 名前が完全一致するファイルを優先
-    for match in matches:
-        metadata = match.get("metadata", {}).get("metadata", {})
-        file_id = metadata.get("id")
-        name = metadata.get("name", "")
-        path_display = metadata.get("path_display", "")
-
-        if file_id and name == filename:
-            return file_id, path_display
-
-    # 完全一致が取れない場合は先頭候補
-    metadata = matches[0].get("metadata", {}).get("metadata", {})
-    return metadata.get("id"), metadata.get("path_display", "")
-
-
 def download_dropbox_file(path_or_id, access_token):
     """Dropbox APIでExcelをダウンロードする"""
     url = "https://content.dropboxapi.com/2/files/download"
@@ -362,6 +334,40 @@ def download_dropbox_file(path_or_id, access_token):
     return response.content, response
 
 
+def get_dropbox_file_path():
+    """Dropboxから直接取得するファイルパスを返す"""
+    path = str(DROPBOX_FILE_PATH or "").strip()
+
+    if not path:
+        return DROPBOX_DEFAULT_FILE_PATH
+
+    return path
+
+
+def show_dropbox_download_error(path, response):
+    st.error("DropboxからExcelファイルを直接取得できませんでした。")
+    st.write("Dropboxの指定パスを確認してください。")
+
+    st.write("現在アプリが取得しようとしたパス：")
+    st.code(path)
+    st.write("Secretsに設定すべき正しい値：")
+    st.code(f'DROPBOX_FILE_PATH = "{DROPBOX_DEFAULT_FILE_PATH}"')
+
+    if response is not None:
+        st.write(f"Dropboxからの応答コード：{response.status_code}")
+        try:
+            error_body = json.dumps(response.json(), ensure_ascii=False, indent=2)
+        except Exception:
+            error_body = response.text
+        st.code(error_body)
+
+    st.write("よくある原因：")
+    st.write("- パスの先頭に不要なフォルダ名が入っている")
+    st.write("- 全角スペースが半角スペースに変わっている")
+    st.write("- Dropbox上でファイル名またはフォルダ名が変更された")
+    st.stop()
+
+
 def read_excel_from_dropbox_api():
     """Dropbox APIでExcelをダウンロードして読み込む"""
     if not has_dropbox_auth_config():
@@ -370,26 +376,11 @@ def read_excel_from_dropbox_api():
         st.stop()
 
     access_token = get_dropbox_access_token()
-    content = None
-    response = None
+    dropbox_file_path = get_dropbox_file_path()
+    content, response = download_dropbox_file(dropbox_file_path, access_token)
 
-    # 1. まずDROPBOX_FILE_PATHがあれば、それを試す
-    if DROPBOX_FILE_PATH:
-        content, response = download_dropbox_file(DROPBOX_FILE_PATH, access_token)
-
-    # 2. パス指定で失敗したら、ファイル名で検索する
     if content is None:
-        file_id, path_display = search_dropbox_file_by_name(EXCEL_FILE, access_token)
-        content, response = download_dropbox_file(file_id, access_token)
-
-        if content is None:
-            st.error("Dropbox APIからExcelファイルをダウンロードできませんでした。")
-            st.write("ファイル検索では見つかりましたが、ダウンロードに失敗しました。")
-            st.write("見つかったパス：")
-            st.code(path_display)
-            st.write("Dropboxからの応答：")
-            st.code(response.text)
-            st.stop()
+        show_dropbox_download_error(dropbox_file_path, response)
 
     return BytesIO(content)
 
@@ -435,10 +426,11 @@ def normalize_excel_table(excel_source):
 
     for idx, row in raw.iterrows():
         values = [str(v).strip() for v in row.tolist() if not pd.isna(v)]
-        score = sum(1 for col in REQUIRED_COLUMNS if col in values)
+        column_mapping = find_required_column_mapping(values)
+        score = len(column_mapping)
 
-        # IDだけは上部表示にも出るので、顧客名・ひらがながある行を重視
-        if "顧客名" in values and "ひらがな" in values and score >= 5:
+        # IDだけは上部表示にも出るので、顧客名・ひらがなに相当する列がある行を重視
+        if "顧客名" in column_mapping and "ひらがな" in column_mapping and score >= 5:
             header_row_index = idx
             break
 
@@ -456,12 +448,23 @@ def normalize_excel_table(excel_source):
     # 列名の空白除去
     df.columns = [str(c).strip() for c in df.columns]
 
-    missing = [col for col in REQUIRED_COLUMNS if col not in df.columns]
+    column_mapping = find_required_column_mapping(df.columns)
+    missing = [col for col in REQUIRED_COLUMNS if col not in column_mapping]
     if missing:
         st.error("必要な列が見つかりません。")
         st.write("見つからない列：", missing)
+        st.write("使用できる列名候補：")
+        for col in missing:
+            st.write(f"- {col}: {', '.join(REQUIRED_COLUMN_CANDIDATES[col])}")
         st.write("Excelから読み取れた列：", list(df.columns))
         st.stop()
+
+    rename_mapping = {
+        actual_column: required_column
+        for required_column, actual_column in column_mapping.items()
+        if actual_column != required_column
+    }
+    df = df.rename(columns=rename_mapping)
 
     # 既存機能に必要な列を先頭に置きつつ、備考などの追加列も残す
     ordered_columns = REQUIRED_COLUMNS.copy()
@@ -671,15 +674,53 @@ def show_delivery_list(df):
 # =========================
 # 配車カレンダー
 # =========================
-def get_dispatch_display_columns(df):
-    """配車予定として表示できる列だけを探す"""
-    return [
-        ("取引先名", find_existing_column(df, ["取引先名", "顧客名", "得意先名", "お客様名", "牧場名", "名前", "名称"])),
-        ("地域", find_existing_column(df, ["地域", "地区", "エリア", "住所", "市町村"])),
-        ("商品名", find_existing_column(df, ["商品名", "商品", "品名", "製品名"])),
-        ("数量", find_existing_column(df, ["数量", "配達数量", "配送数量", "使用数量/日", "使用数量", "注文数", "本数", "量"])),
-        ("備考", find_existing_column(df, ["備考", "メモ", "コメント", "注意事項", "摘要"])),
+DISPATCH_COLUMN_CANDIDATES = {
+    "date": ["次回配達予定", "配達予定日", "配送予定日", "配達日", "配送日", "納品日", "予定日", "日付"],
+    "customer": ["顧客名", "牧場名", "取引先名", "得意先名", "お客様名", "名前", "名称"],
+    "region": ["地域", "地区", "エリア", "住所", "市町村"],
+    "product": ["商品名", "商品", "品名", "製品名"],
+}
+
+DISPATCH_REQUIRED_LABELS = {
+    "date": "日付（例：次回配達予定）",
+    "customer": "顧客名・牧場名",
+    "region": "地域",
+    "product": "商品名",
+}
+
+WEEKDAYS_JA = ["月", "火", "水", "木", "金", "土", "日"]
+
+
+def find_dispatch_columns(df):
+    """配車カレンダーに必要な列を、候補名から探す"""
+    return {
+        key: find_existing_column(df, candidates)
+        for key, candidates in DISPATCH_COLUMN_CANDIDATES.items()
+    }
+
+
+def show_missing_dispatch_columns_error(df, dispatch_columns):
+    missing = [
+        DISPATCH_REQUIRED_LABELS[key]
+        for key, col in dispatch_columns.items()
+        if not col
     ]
+
+    if not missing:
+        return False
+
+    st.error("配車カレンダーに必要な列が見つかりません。")
+    st.write("見つからない項目：", missing)
+    st.write("次のような列名が使えます。")
+    st.code(
+        "日付: 次回配達予定 / 配達予定日 / 日付\n"
+        "顧客: 顧客名 / 牧場名 / 取引先名\n"
+        "地域: 地域 / 地区 / エリア\n"
+        "商品: 商品名 / 商品 / 品名"
+    )
+    st.write("Excelから読み取れた列：")
+    st.write(list(df.columns))
+    return True
 
 
 def get_default_dispatch_date(df, date_column):
@@ -698,93 +739,296 @@ def get_default_dispatch_date(df, date_column):
     return available_dates[-1]
 
 
-def make_dispatch_list(df, target_date, date_column):
-    """選択した日の配車予定だけを取り出す"""
+def get_calendar_month_start(df, date_column):
+    """表示中の月をsession_stateで保持する"""
+    if "dispatch_calendar_year" not in st.session_state or "dispatch_calendar_month" not in st.session_state:
+        default_date = get_default_dispatch_date(df, date_column)
+        st.session_state["dispatch_calendar_year"] = default_date.year
+        st.session_state["dispatch_calendar_month"] = default_date.month
+
+    return date(
+        st.session_state["dispatch_calendar_year"],
+        st.session_state["dispatch_calendar_month"],
+        1,
+    )
+
+
+def change_dispatch_month(delta):
+    current = date(
+        st.session_state["dispatch_calendar_year"],
+        st.session_state["dispatch_calendar_month"],
+        1,
+    )
+    month = current.month + delta
+    year = current.year
+
+    if month < 1:
+        month = 12
+        year -= 1
+    elif month > 12:
+        month = 1
+        year += 1
+
+    st.session_state["dispatch_calendar_year"] = year
+    st.session_state["dispatch_calendar_month"] = month
+
+
+def format_month_day(target_day):
+    weekday = WEEKDAYS_JA[target_day.weekday()]
+    return f"{target_day.month}/{target_day.day}（{weekday}）"
+
+
+def make_dispatch_items_by_day(df, month_start, dispatch_columns):
+    last_day = calendar.monthrange(month_start.year, month_start.month)[1]
+    start_day = date(month_start.year, month_start.month, 1)
+    end_day = date(month_start.year, month_start.month, last_day)
+
+    rows_by_day = {
+        date(month_start.year, month_start.month, day_num): []
+        for day_num in range(1, last_day + 1)
+    }
+
+    date_column = dispatch_columns["date"]
+    customer_column = dispatch_columns["customer"]
+    region_column = dispatch_columns["region"]
+    product_column = dispatch_columns["product"]
     parsed_dates = pd.to_datetime(df[date_column], errors="coerce").dt.date
-    dispatch_df = df[parsed_dates == target_date].copy()
 
-    if dispatch_df.empty:
-        return dispatch_df
+    for idx, row in df.iterrows():
+        delivery_date = parsed_dates.loc[idx]
 
-    sort_candidates = [
-        find_existing_column(dispatch_df, ["取引先名", "顧客名", "得意先名", "お客様名", "牧場名"]),
-        find_existing_column(dispatch_df, ["地域", "地区", "エリア"]),
-        find_existing_column(dispatch_df, ["商品名", "商品", "品名"]),
+        if pd.isna(delivery_date) or not (start_day <= delivery_date <= end_day):
+            continue
+
+        item = {
+            "顧客名": clean_value(row[customer_column]),
+            "地域": clean_value(row[region_column]),
+            "商品名": clean_value(row[product_column]),
+        }
+        rows_by_day[delivery_date].append(item)
+
+    for delivery_date, items in rows_by_day.items():
+        rows_by_day[delivery_date] = sorted(
+            items,
+            key=lambda item: (item["顧客名"], item["地域"], item["商品名"]),
+        )
+
+    return rows_by_day
+
+
+def inject_dispatch_calendar_css():
+    st.markdown(
+        """
+        <style>
+        .dispatch-month-title {
+            text-align: center;
+            font-size: 1.2rem;
+            font-weight: 700;
+            padding-top: 0.35rem;
+        }
+        .dispatch-two-day-row {
+            display: grid;
+            grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+            gap: 0.75rem;
+            margin: 0.75rem 0 1.25rem;
+        }
+        .dispatch-day-panel {
+            border: 1px solid rgba(49, 51, 63, 0.18);
+            border-radius: 8px;
+            padding: 0.75rem;
+            background: #ffffff;
+            min-width: 0;
+        }
+        .dispatch-day-title {
+            font-weight: 700;
+            margin-bottom: 0.5rem;
+        }
+        .dispatch-item {
+            border-top: 1px solid rgba(49, 51, 63, 0.12);
+            padding: 0.55rem 0;
+        }
+        .dispatch-item:first-of-type {
+            border-top: 0;
+            padding-top: 0;
+        }
+        .dispatch-name {
+            font-weight: 700;
+            line-height: 1.35;
+            word-break: break-word;
+        }
+        .dispatch-line,
+        .dispatch-empty {
+            color: rgba(49, 51, 63, 0.72);
+            font-size: 0.9rem;
+            line-height: 1.45;
+            word-break: break-word;
+        }
+        @media (max-width: 420px) {
+            .dispatch-two-day-row {
+                gap: 0.45rem;
+            }
+            .dispatch-day-panel {
+                padding: 0.6rem;
+            }
+            .dispatch-name,
+            .dispatch-line,
+            .dispatch-empty {
+                font-size: 0.85rem;
+            }
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_two_day_panel(target_day, items):
+    html_parts = [
+        '<div class="dispatch-day-panel">',
+        f'<div class="dispatch-day-title">{escape(format_month_day(target_day))}</div>',
     ]
-    sort_columns = [col for col in sort_candidates if col]
 
-    if sort_columns:
-        dispatch_df = dispatch_df.sort_values(sort_columns).reset_index(drop=True)
+    if not items:
+        html_parts.append('<div class="dispatch-empty">予定なし</div>')
+    else:
+        for item in items:
+            html_parts.extend(
+                [
+                    '<div class="dispatch-item">',
+                    f'<div class="dispatch-name">👤 {escape(item["顧客名"])}</div>',
+                    f'<div class="dispatch-line">地域：{escape(item["地域"])}</div>',
+                    f'<div class="dispatch-line">商品：{escape(item["商品名"])}</div>',
+                    '</div>',
+                ]
+            )
 
-    return dispatch_df
+    html_parts.append("</div>")
+    return "\n".join(html_parts)
+
+
+def show_dispatch_month_switcher(month_start):
+    col_prev, col_month, col_next = st.columns([1, 2, 1])
+
+    with col_prev:
+        if st.button("◀", key="dispatch_prev_month", use_container_width=True):
+            change_dispatch_month(-1)
+            st.rerun()
+
+    with col_month:
+        st.markdown(
+            f'<div class="dispatch-month-title">{month_start.year}年{month_start.month}月</div>',
+            unsafe_allow_html=True,
+        )
+
+    with col_next:
+        if st.button("▶", key="dispatch_next_month", use_container_width=True):
+            change_dispatch_month(1)
+            st.rerun()
+
+
+def show_two_day_dispatch_calendar(rows_by_day, month_start):
+    st.subheader("📱 2日表示")
+
+    last_day = calendar.monthrange(month_start.year, month_start.month)[1]
+
+    for day_num in range(1, last_day + 1, 2):
+        day1 = date(month_start.year, month_start.month, day_num)
+        day2 = date(month_start.year, month_start.month, day_num + 1) if day_num + 1 <= last_day else None
+
+        left_panel = render_two_day_panel(day1, rows_by_day.get(day1, []))
+        if day2:
+            right_panel = render_two_day_panel(day2, rows_by_day.get(day2, []))
+        else:
+            right_panel = '<div class="dispatch-day-panel"><div class="dispatch-empty">&nbsp;</div></div>'
+
+        st.markdown(
+            f'<div class="dispatch-two-day-row">{left_panel}{right_panel}</div>',
+            unsafe_allow_html=True,
+        )
+
+
+def make_month_dispatch_table(rows_by_day, month_start):
+    last_day = calendar.monthrange(month_start.year, month_start.month)[1]
+    max_count = max((len(items) for items in rows_by_day.values()), default=0)
+    farm_column_count = max(5, max_count)
+
+    table_rows = []
+
+    for day_num in range(1, last_day + 1):
+        target_day = date(month_start.year, month_start.month, day_num)
+        items = rows_by_day.get(target_day, [])
+
+        row_data = {"月/日": format_month_day(target_day)}
+
+        for item_index in range(farm_column_count):
+            column_name = f"牧場名{item_index + 1}"
+            row_data[column_name] = items[item_index]["顧客名"] if item_index < len(items) else ""
+
+        table_rows.append(row_data)
+
+    return pd.DataFrame(table_rows)
+
+
+def show_month_dispatch_calendar(rows_by_day, month_start):
+    st.subheader("🗓 月表示")
+    st.caption("横スクロールで1か月分を確認できます。")
+
+    month_df = make_month_dispatch_table(rows_by_day, month_start)
+    column_config = {
+        "月/日": st.column_config.TextColumn("月/日", width="small"),
+    }
+
+    for column_name in month_df.columns:
+        if column_name != "月/日":
+            column_config[column_name] = st.column_config.TextColumn(column_name, width="medium")
+
+    st.dataframe(
+        month_df,
+        hide_index=True,
+        use_container_width=True,
+        height=min(760, 38 * (len(month_df) + 1)),
+        column_config=column_config,
+    )
 
 
 def show_dispatch_calendar(df):
     st.markdown("---")
     st.header("🗓 配車カレンダー")
+    inject_dispatch_calendar_css()
 
     if df.empty:
         st.warning("Excelから読み込めるデータがありません。")
         return
 
-    date_column = find_date_column(df)
+    dispatch_columns = find_dispatch_columns(df)
 
-    if not date_column:
-        st.error("配車カレンダーに使える日付列が見つかりません。")
-        st.write("次のような列名があるか確認してください。")
-        st.code("配車日 / 配達日 / 配達予定日 / 日付 / 次回配達予定")
-        st.write("Excelから読み取れた列：")
-        st.write(list(df.columns))
+    if show_missing_dispatch_columns_error(df, dispatch_columns):
         return
 
-    default_date = get_default_dispatch_date(df, date_column)
+    month_start = get_calendar_month_start(df, dispatch_columns["date"])
+    show_dispatch_month_switcher(month_start)
+    rows_by_day = make_dispatch_items_by_day(df, month_start, dispatch_columns)
 
-    selected_date = st.date_input(
-        "日付を選択",
-        value=default_date,
+    st.caption(
+        f"使用している日付列：{dispatch_columns['date']} / "
+        f"顧客名：{dispatch_columns['customer']} / "
+        f"地域：{dispatch_columns['region']} / "
+        f"商品名：{dispatch_columns['product']}"
     )
 
-    dispatch_df = make_dispatch_list(df, selected_date, date_column)
+    total_count = sum(len(items) for items in rows_by_day.values())
+    st.write(f"{month_start.month}月の予定：{total_count}件")
 
-    st.caption(f"使用している日付列：{date_column}")
+    view = st.radio(
+        "表示切替",
+        ["📱 2日表示", "🗓 月表示"],
+        horizontal=True,
+    )
 
-    if dispatch_df.empty:
-        st.info("この日の配車予定はありません。")
-        return
-
-    display_columns = get_dispatch_display_columns(dispatch_df)
-    display_columns = [(label, col) for label, col in display_columns if col]
-
-    if not display_columns:
-        st.error("表示できる列が見つかりません。")
-        st.write("Excelから読み取れた列：")
-        st.write(list(dispatch_df.columns))
-        return
-
-    st.write(f"予定：{len(dispatch_df)}件")
-
-    for i, row in dispatch_df.iterrows():
-        customer_name_col = find_existing_column(dispatch_df, ["取引先名", "顧客名", "得意先名", "お客様名", "牧場名"])
-        customer_name = clean_value(row[customer_name_col]) if customer_name_col else f"予定 {i + 1}"
-
-        with st.container(border=True):
-            st.subheader(customer_name)
-
-            for label, col in display_columns:
-                value = row[col]
-
-                if label == "数量":
-                    display_value = format_number(value)
-                else:
-                    display_value = clean_value(value)
-
-                if display_value != "未設定":
-                    st.write(f"**{label}：** {display_value}")
-
-            if customer_name_col and "顧客名" in dispatch_df.columns:
-                if st.button("顧客詳細を見る", key=f"dispatch_detail_{i}_{customer_name}"):
-                    select_customer(clean_value(row["顧客名"]))
-                    st.rerun()
+    if view == "📱 2日表示":
+        show_two_day_dispatch_calendar(rows_by_day, month_start)
+    else:
+        show_month_dispatch_calendar(rows_by_day, month_start)
 
 
 # =========================
@@ -798,9 +1042,9 @@ if "selected_customer" not in st.session_state:
 
 
 MENU_OPTIONS = {
-    "顧客検索": "home",
-    "配達予定一覧": "delivery",
-    "配車カレンダー": "calendar",
+    "🔍 顧客検索": "home",
+    "📅 配達予定一覧": "delivery",
+    "🗓 配車カレンダー": "calendar",
 }
 
 current_page = st.session_state.get("page", "home")
@@ -862,7 +1106,7 @@ if st.session_state["page"] == "home":
 
     st.markdown("---")
     st.subheader("🗓 配車カレンダー")
-    st.caption("日付を選んで、その日の配車予定を確認できます。")
+    st.caption("2日表示 / 月表示で配車予定を確認できます。")
 
     if st.button("配車カレンダーを見る"):
         set_page("calendar")
