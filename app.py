@@ -835,16 +835,30 @@ def inject_dispatch_calendar_css():
         .dispatch-day-panel {
             border: 1px solid rgba(49, 51, 63, 0.18);
             border-radius: 8px;
+            color: #111827 !important;
+            overflow: visible;
             padding: 0.75rem;
             background: #ffffff;
             min-width: 0;
         }
         .dispatch-day-title {
+            display: block;
+            color: #111827 !important;
+            background: #f3f4f6;
+            border-radius: 6px;
+            font-size: 0.95rem;
             font-weight: 700;
-            margin-bottom: 0.5rem;
+            line-height: 1.35;
+            margin-bottom: 0.55rem;
+            overflow-wrap: anywhere;
+            padding: 0.25rem 0.4rem;
+            text-align: center;
+            white-space: normal;
         }
         .dispatch-item {
             border-top: 1px solid rgba(49, 51, 63, 0.12);
+            display: block;
+            overflow: visible;
             padding: 0.55rem 0;
         }
         .dispatch-item:first-of-type {
@@ -852,16 +866,24 @@ def inject_dispatch_calendar_css():
             padding-top: 0;
         }
         .dispatch-name {
+            color: #111827 !important;
+            display: block;
+            font-size: 0.95rem;
             font-weight: 700;
             line-height: 1.35;
-            word-break: break-word;
+            overflow-wrap: anywhere;
+            white-space: normal;
+            word-break: normal;
         }
         .dispatch-line,
         .dispatch-empty {
-            color: rgba(49, 51, 63, 0.72);
+            color: #374151 !important;
+            display: block;
             font-size: 0.9rem;
             line-height: 1.45;
-            word-break: break-word;
+            overflow-wrap: anywhere;
+            white-space: normal;
+            word-break: normal;
         }
         @media (max-width: 420px) {
             .dispatch-two-day-row {
@@ -875,6 +897,11 @@ def inject_dispatch_calendar_css():
             .dispatch-empty {
                 font-size: 0.85rem;
             }
+            .dispatch-day-title {
+                font-size: 0.82rem;
+                padding-left: 0.25rem;
+                padding-right: 0.25rem;
+            }
         }
         </style>
         """,
@@ -882,10 +909,30 @@ def inject_dispatch_calendar_css():
     )
 
 
-def render_two_day_panel(target_day, items):
+def render_two_day_cell(target_day, items):
+    cell_style = (
+        "width:50%;vertical-align:top;border:1px solid rgba(49,51,63,0.18);"
+        "border-radius:8px;background:#ffffff;color:#111827!important;"
+        "padding:8px;overflow:visible;"
+    )
+    title_style = (
+        "display:block;color:#111827!important;background:#f3f4f6;"
+        "border-radius:6px;font-size:13px;font-weight:700;line-height:1.35;"
+        "margin-bottom:8px;padding:4px;text-align:center;"
+        "white-space:normal;overflow-wrap:anywhere;"
+    )
+    name_style = (
+        "display:block;color:#111827!important;font-size:13px;font-weight:700;"
+        "line-height:1.35;white-space:normal;overflow-wrap:anywhere;"
+    )
+    line_style = (
+        "display:block;color:#374151!important;font-size:12px;line-height:1.45;"
+        "white-space:normal;overflow-wrap:anywhere;"
+    )
+
     html_parts = [
-        '<div class="dispatch-day-panel">',
-        f'<div class="dispatch-day-title">{escape(format_month_day(target_day))}</div>',
+        f'<td style="{cell_style}">',
+        f'<div class="dispatch-day-title" style="{title_style}">{escape(format_month_day(target_day))}</div>',
     ]
 
     if not items:
@@ -895,14 +942,14 @@ def render_two_day_panel(target_day, items):
             html_parts.extend(
                 [
                     '<div class="dispatch-item">',
-                    f'<div class="dispatch-name">👤 {escape(item["顧客名"])}</div>',
-                    f'<div class="dispatch-line">地域：{escape(item["地域"])}</div>',
-                    f'<div class="dispatch-line">商品：{escape(item["商品名"])}</div>',
+                    f'<div class="dispatch-name" style="{name_style}">👤 顧客：{escape(item["顧客名"])}</div>',
+                    f'<div class="dispatch-line" style="{line_style}">地域：{escape(item["地域"])}</div>',
+                    f'<div class="dispatch-line" style="{line_style}">商品：{escape(item["商品名"])}</div>',
                     '</div>',
                 ]
             )
 
-    html_parts.append("</div>")
+    html_parts.append("</td>")
     return "\n".join(html_parts)
 
 
@@ -935,16 +982,34 @@ def show_two_day_dispatch_calendar(rows_by_day, month_start):
         day1 = date(month_start.year, month_start.month, day_num)
         day2 = date(month_start.year, month_start.month, day_num + 1) if day_num + 1 <= last_day else None
 
-        left_panel = render_two_day_panel(day1, rows_by_day.get(day1, []))
+        left_panel = render_two_day_cell(day1, rows_by_day.get(day1, []))
         if day2:
-            right_panel = render_two_day_panel(day2, rows_by_day.get(day2, []))
+            right_panel = render_two_day_cell(day2, rows_by_day.get(day2, []))
         else:
-            right_panel = '<div class="dispatch-day-panel"><div class="dispatch-empty">&nbsp;</div></div>'
+            right_panel = (
+                '<td style="width:50%;vertical-align:top;border:1px solid rgba(49,51,63,0.18);'
+                'border-radius:8px;background:#ffffff;padding:8px;">&nbsp;</td>'
+            )
 
         st.markdown(
-            f'<div class="dispatch-two-day-row">{left_panel}{right_panel}</div>',
+            (
+                '<table style="width:100%;table-layout:fixed;border-collapse:separate;'
+                'border-spacing:6px 0;margin:8px 0 14px;">'
+                f'<tr>{left_panel}{right_panel}</tr>'
+                '</table>'
+            ),
             unsafe_allow_html=True,
         )
+
+
+def format_month_cell_item(item):
+    customer_name = clean_value(item.get("顧客名"))
+    product_name = clean_value(item.get("商品名"))
+
+    if product_name == "未設定":
+        return customer_name
+
+    return f"{customer_name}/{product_name}"
 
 
 def make_month_dispatch_table(rows_by_day, month_start):
@@ -962,7 +1027,7 @@ def make_month_dispatch_table(rows_by_day, month_start):
 
         for item_index in range(farm_column_count):
             column_name = f"牧場名{item_index + 1}"
-            row_data[column_name] = items[item_index]["顧客名"] if item_index < len(items) else ""
+            row_data[column_name] = format_month_cell_item(items[item_index]) if item_index < len(items) else ""
 
         table_rows.append(row_data)
 
@@ -1028,102 +1093,4 @@ def show_dispatch_calendar(df):
     if view == "📱 2日表示":
         show_two_day_dispatch_calendar(rows_by_day, month_start)
     else:
-        show_month_dispatch_calendar(rows_by_day, month_start)
-
-
-# =========================
-# メイン
-# =========================
-if "page" not in st.session_state:
-    st.session_state["page"] = "home"
-
-if "selected_customer" not in st.session_state:
-    st.session_state["selected_customer"] = None
-
-
-MENU_OPTIONS = {
-    "🔍 顧客検索": "home",
-    "📅 配達予定一覧": "delivery",
-    "🗓 配車カレンダー": "calendar",
-}
-
-current_page = st.session_state.get("page", "home")
-menu_pages = list(MENU_OPTIONS.values())
-menu_labels = list(MENU_OPTIONS.keys())
-
-if current_page in menu_pages:
-    current_menu_index = menu_pages.index(current_page)
-else:
-    current_menu_index = 0
-
-with st.sidebar:
-    st.title("🚚 青山商店")
-    st.caption("業務アプリ")
-
-    selected_menu = st.radio(
-        "メニュー",
-        menu_labels,
-        index=current_menu_index,
-    )
-
-selected_page = MENU_OPTIONS[selected_menu]
-
-if st.session_state["page"] == "detail":
-    if selected_page != "home":
-        st.session_state["page"] = selected_page
-        st.session_state["selected_customer"] = None
-        st.rerun()
-else:
-    st.session_state["page"] = selected_page
-
-
-col_title, col_logout = st.columns([3, 1])
-
-with col_title:
-    st.title(f"🚚 {APP_TITLE}")
-    st.caption("顧客検索・配達予定・配車カレンダー")
-
-with col_logout:
-    st.write("")
-    if st.button("ログアウト"):
-        st.session_state.authenticated = False
-        st.session_state.page = "home"
-        st.session_state.selected_customer = None
-        st.rerun()
-
-df = load_data()
-
-if st.session_state["page"] == "home":
-    show_customer_search(df)
-
-    st.markdown("---")
-    st.subheader("📅 配達予定一覧")
-    st.caption("過去7日 ～ 1か月後")
-
-    if st.button("配達予定一覧を見る"):
-        set_page("delivery")
-        st.rerun()
-
-    st.markdown("---")
-    st.subheader("🗓 配車カレンダー")
-    st.caption("2日表示 / 月表示で配車予定を確認できます。")
-
-    if st.button("配車カレンダーを見る"):
-        set_page("calendar")
-        st.rerun()
-
-elif st.session_state["page"] == "delivery":
-    show_delivery_list(df)
-
-elif st.session_state["page"] == "calendar":
-    show_dispatch_calendar(df)
-
-elif st.session_state["page"] == "detail":
-    selected = st.session_state.get("selected_customer")
-    if selected:
-        show_customer_detail(df, selected)
-    else:
-        set_page("home")
-        st.rerun()
-
-st.caption("※ このアプリはExcelのSheet1を読み込んで表示しています。Dropbox API設定がある場合はDropbox上のExcelを読み込みます。")
+        show_mont
