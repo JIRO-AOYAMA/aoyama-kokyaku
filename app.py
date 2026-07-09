@@ -170,7 +170,11 @@ def format_number(value, decimal=1, blank_text="未設定"):
 
 
 def is_blank_or_zero(value):
-    """空白・NaN・0ならTrue。使用数量/日を非表示にする判定用。"""
+    """空白・NaN・0ならTrue。使用数量/日を非表示にする判定用。
+
+    Excelから「0」「0.0」「０」「０．０」「0 kg」のような文字列で来ても
+    0として扱えるように少し広めに判定する。
+    """
     if value is None:
         return True
 
@@ -182,8 +186,21 @@ def is_blank_or_zero(value):
     if text == "" or text.lower() == "nan" or text.startswith("#"):
         return True
 
+    # 全角数字・全角小数点・カンマを整理
+    normalized = text.translate(str.maketrans({
+        "０": "0", "１": "1", "２": "2", "３": "3", "４": "4",
+        "５": "5", "６": "6", "７": "7", "８": "8", "９": "9",
+        "．": ".", "，": ",",
+    })).replace(",", "")
+
+    # 単位などが付いていても、先頭の数値だけ取り出して判定
+    import re
+    match = re.match(r"^[-+]?\d+(?:\.\d+)?", normalized)
+    if not match:
+        return False
+
     try:
-        return float(value) == 0
+        return float(match.group(0)) == 0
     except Exception:
         return False
 
@@ -936,6 +953,14 @@ def inject_dispatch_calendar_css():
         .dispatch-month-table th:first-child,
         .dispatch-month-table td:first-child {
             min-width: 86px;
+            position: sticky !important;
+            left: 0;
+            z-index: 3;
+            background: #ffffff;
+        }
+        .dispatch-month-table th:first-child {
+            z-index: 4;
+            background: #f3f4f6;
         }
         .dispatch-month-table th {
             background: #f3f4f6;
@@ -1061,7 +1086,7 @@ def make_month_dispatch_table(rows_by_day, month_start):
 
 def show_month_dispatch_calendar(rows_by_day, month_start):
     st.subheader("🗓 月表示")
-    st.caption("横スクロールで1か月分を確認できます。列が固定されないHTML表で表示します。")
+    st.caption("横スクロールで1か月分を確認できます。日付列は固定表示します。")
 
     month_df = make_month_dispatch_table(rows_by_day, month_start)
 
