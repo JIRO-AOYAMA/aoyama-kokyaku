@@ -101,6 +101,36 @@ if not st.session_state.authenticated:
     st.stop()
 
 
+
+# =========================
+# 共通CSS
+# =========================
+st.markdown(
+    """
+    <style>
+    .app-nav-link {
+        display: block;
+        width: 100%;
+        box-sizing: border-box;
+        text-align: center;
+        text-decoration: none !important;
+        padding: 0.55rem 0.75rem;
+        margin: 0.25rem 0;
+        border: 1px solid rgba(49, 51, 63, 0.2);
+        border-radius: 0.5rem;
+        color: inherit !important;
+        background: rgba(250, 250, 250, 0.9);
+        font-weight: 600;
+    }
+    .app-nav-link:hover {
+        border-color: rgba(49, 51, 63, 0.45);
+        background: rgba(240, 242, 246, 1);
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
 # =========================
 # 表示用の整形
 # =========================
@@ -581,19 +611,48 @@ def update_query_params(**params):
         pass
 
 
+
+def make_app_url(page="home", customer=None, customer_search=None, region_search=None):
+    """ブラウザの戻るボタンで戻れるように、通常リンク用URLを作る。"""
+    params = {"logged_in": "1", "page": page}
+    if customer:
+        params["customer"] = str(customer)
+    if customer_search:
+        params["customer_search"] = str(customer_search)
+    if region_search:
+        params["region_search"] = str(region_search)
+    return "?" + urllib.parse.urlencode(params)
+
+
+def render_page_link(label, page="home", customer=None, customer_search=None, region_search=None, class_name="app-nav-link"):
+    """st.buttonではなくHTMLリンクで画面遷移する。これによりブラウザ戻るが効く。"""
+    url = make_app_url(
+        page=page,
+        customer=customer,
+        customer_search=customer_search,
+        region_search=region_search,
+    )
+    return f'<a class="{class_name}" href="{url}" target="_self">{html.escape(str(label))}</a>'
+
 def sync_page_from_query_params():
     """URLのpage/customerを読んで、ブラウザ戻る・進むに追従する"""
-    page = str(get_query_value("page", "")).strip()
+    page = str(get_query_value("page", "home")).strip() or "home"
     customer = str(get_query_value("customer", "")).strip()
 
     valid_pages = {"home", "region", "calendar", "delivery", "detail"}
 
-    if page in valid_pages:
-        st.session_state["page"] = page
+    raw_page = str(get_query_value("page", "")).strip()
+    if page not in valid_pages:
+        page = "home"
+    if customer and not raw_page:
+        page = "detail"
 
-    if customer:
+    st.session_state["page"] = page
+
+    if page == "detail" and customer:
         st.session_state["selected_customer"] = customer
-        st.session_state["page"] = "detail"
+    elif page != "detail":
+        st.session_state["selected_customer"] = None
 
 
 def set_page(page_name, rerun=False):
@@ -615,9 +674,8 @@ def select_customer(customer_name, page_name="detail"):
 
 
 def show_back_home_button(key):
-    """各画面からホームへ戻るための共通ボタン"""
-    if st.button("← ホームへ戻る", key=key):
-        set_page("home", rerun=True)
+    """各画面からホームへ戻るための共通リンク。ブラウザ履歴にも残る。"""
+    st.markdown(render_page_link("← ホームへ戻る", page="home"), unsafe_allow_html=True)
 
 
 # =========================
@@ -630,9 +688,7 @@ def show_customer_detail(df, customer_name):
         st.warning("選択した顧客の情報が見つかりません。")
         return
 
-    if st.button("← ホームへ戻る"):
-        set_page("home")
-        st.rerun()
+    show_back_home_button("detail_back_home")
 
     # 使用数量/日が0・空白・NaNの商品行は、商品名ごと表示しない。
     visible_detail = detail[~detail["使用数量/日"].apply(is_blank_or_zero)].copy()
@@ -716,9 +772,10 @@ def show_customer_search(df):
             st.markdown(f"### 👤 {name}")
             st.write(f"地域：{region}")
 
-            if st.button("この顧客を見る", key=f"search_select_{i}_{name}"):
-                select_customer(name)
-                st.rerun()
+            st.markdown(
+                render_page_link("この顧客を見る", page="detail", customer=name, customer_search=keyword),
+                unsafe_allow_html=True,
+            )
 
 
 # =========================
@@ -769,9 +826,10 @@ def show_region_search(df):
             st.markdown(f"### 👤 {name}")
             st.write(f"地域：{region}")
 
-            if st.button("この顧客を見る", key=f"region_select_{i}_{name}"):
-                select_customer(name)
-                st.rerun()
+            st.markdown(
+                render_page_link("この顧客を見る", page="detail", customer=name, region_search=keyword),
+                unsafe_allow_html=True,
+            )
 
 
 # =========================
@@ -842,9 +900,10 @@ def show_delivery_list(df):
             with col2:
                 st.markdown(f"**{next_date}**")
 
-            if st.button("詳細を見る", key=f"delivery_select_{i}_{customer_name}"):
-                select_customer(customer_name)
-                st.rerun()
+            st.markdown(
+                render_page_link("詳細を見る", page="detail", customer=customer_name),
+                unsafe_allow_html=True,
+            )
 
 
 # =========================
@@ -1155,10 +1214,7 @@ def build_customer_detail_link(customer_name, label=None, class_name="dispatch-m
         return escape_html(label or customer_name)
 
     link_label = label or customer
-    # HTMLの<a>リンクで移動するとStreamlitのセッションが切れることがある。
-    # そのため、ログイン済みフラグもURLに残して、ログアウトするまでは再ログイン不要にする。
-    query = urllib.parse.urlencode({"logged_in": "1", "customer": customer})
-    url = f"?{query}"
+    url = make_app_url(page="detail", customer=customer)
     return f'<a class="{class_name}" href="{url}" target="_self">{escape_html(link_label)}</a>'
 
 
@@ -1347,23 +1403,15 @@ def show_home_menu():
 
     col1, col2 = st.columns(2)
     with col1:
-        if st.button("🔍 顧客検索", use_container_width=True, key="home_menu_customer"):
-            set_page("home")
-            st.rerun()
+        st.markdown(render_page_link("🔍 顧客検索", page="home"), unsafe_allow_html=True)
     with col2:
-        if st.button("📍 地域検索", use_container_width=True, key="home_menu_region"):
-            set_page("region")
-            st.rerun()
+        st.markdown(render_page_link("📍 地域検索", page="region"), unsafe_allow_html=True)
 
     col3, col4 = st.columns(2)
     with col3:
-        if st.button("🗓 配車カレンダー", use_container_width=True, key="home_menu_calendar"):
-            set_page("calendar")
-            st.rerun()
+        st.markdown(render_page_link("🗓 配車カレンダー", page="calendar"), unsafe_allow_html=True)
     with col4:
-        if st.button("📅 配達予定一覧", use_container_width=True, key="home_menu_delivery"):
-            set_page("delivery")
-            st.rerun()
+        st.markdown(render_page_link("📅 配達予定一覧", page="delivery"), unsafe_allow_html=True)
 
     st.markdown("---")
 
@@ -1388,36 +1436,20 @@ MENU_OPTIONS = {
 }
 
 current_page = st.session_state.get("page", "home")
-menu_pages = list(MENU_OPTIONS.values())
-menu_labels = list(MENU_OPTIONS.keys())
-
-if current_page in menu_pages:
-    current_menu_index = menu_pages.index(current_page)
-else:
-    current_menu_index = 0
 
 with st.sidebar:
     st.title("🚚 青山商店")
     st.caption("業務アプリ")
-
-    selected_menu = st.radio(
-        "メニュー",
-        menu_labels,
-        index=current_menu_index,
-    )
+    st.markdown("### メニュー")
+    st.markdown(render_page_link("🔍 顧客検索", page="home"), unsafe_allow_html=True)
+    st.markdown(render_page_link("📍 地域検索", page="region"), unsafe_allow_html=True)
+    st.markdown(render_page_link("🗓 配車カレンダー", page="calendar"), unsafe_allow_html=True)
+    st.markdown(render_page_link("📅 配達予定一覧", page="delivery"), unsafe_allow_html=True)
 
     st.markdown("---")
     if st.button("🔄 データ更新", use_container_width=True):
         st.cache_data.clear()
         st.rerun()
-
-selected_page = MENU_OPTIONS[selected_menu]
-
-if st.session_state["page"] == "detail":
-    if selected_page != "home":
-        set_page(selected_page, rerun=True)
-elif st.session_state["page"] != selected_page:
-    set_page(selected_page)
 
 
 col_title, col_logout = st.columns([3, 1])
