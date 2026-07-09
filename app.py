@@ -560,6 +560,18 @@ def select_customer(customer_name, page_name="detail"):
     st.session_state["page"] = page_name
 
 
+def show_back_home_button(key):
+    """各画面からホームへ戻るための共通ボタン"""
+    if st.button("← ホームへ戻る", key=key):
+        set_page("home")
+        st.session_state["selected_customer"] = None
+        try:
+            st.query_params.clear()
+        except Exception:
+            pass
+        st.rerun()
+
+
 # =========================
 # 顧客詳細
 # =========================
@@ -658,6 +670,7 @@ def show_customer_search(df):
 # =========================
 def show_region_search(df):
     st.subheader("📍 地域検索")
+    show_back_home_button("region_back_home")
 
     keyword = st.text_input(
         "地域名で検索",
@@ -738,9 +751,7 @@ def make_delivery_list(df):
 
 
 def show_delivery_list(df):
-    if st.button("← ホームへ戻る"):
-        set_page("home")
-        st.rerun()
+    show_back_home_button("delivery_back_home")
 
     st.markdown("---")
     st.header("📅 配達予定一覧")
@@ -1241,11 +1252,7 @@ def show_month_dispatch_calendar(rows_by_day, month_start):
 def show_dispatch_calendar(df):
     st.markdown("---")
     st.header("🗓 配車カレンダー")
-
-    if st.button("← ホームへ戻る", key="calendar_back_home"):
-        set_page("home")
-        st.session_state["selected_customer"] = None
-        st.rerun()
+    show_back_home_button("calendar_back_home")
 
     inject_dispatch_calendar_css()
 
