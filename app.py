@@ -1,4 +1,5 @@
 import calendar
+import html
 import json
 import math
 from datetime import date, timedelta
@@ -166,6 +167,25 @@ def format_number(value, decimal=1, blank_text="未設定"):
         return f"{num:.{decimal}f}"
     except Exception:
         return text
+
+
+def is_blank_or_zero(value):
+    """空白・NaN・0ならTrue。使用数量/日を非表示にする判定用。"""
+    if value is None:
+        return True
+
+    if isinstance(value, float) and math.isnan(value):
+        return True
+
+    text = str(value).strip()
+
+    if text == "" or text.lower() == "nan" or text.startswith("#"):
+        return True
+
+    try:
+        return float(value) == 0
+    except Exception:
+        return False
 
 
 def find_existing_column(df, candidates):
@@ -484,7 +504,7 @@ def normalize_excel_table(excel_source):
     return df
 
 
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=60)
 def load_data():
     """
     Dropbox API設定があればDropbox上のExcelを読む。
@@ -547,8 +567,9 @@ def show_customer_detail(df, customer_name):
                 st.caption("ID")
                 st.markdown(f"**{customer_id}**")
 
-                st.caption("使用数量/日")
-                st.markdown(f"**{usage}**")
+                if not is_blank_or_zero(row["使用数量/日"]):
+                    st.caption("使用数量/日")
+                    st.markdown(f"**{usage}**")
 
             with col2:
                 st.caption("次回配達予定")
@@ -885,6 +906,41 @@ def inject_dispatch_calendar_css():
             white-space: normal;
             word-break: normal;
         }
+        .dispatch-month-scroll {
+            width: 100%;
+            overflow-x: auto;
+            -webkit-overflow-scrolling: touch;
+            border: 1px solid rgba(49, 51, 63, 0.18);
+            border-radius: 8px;
+            background: #ffffff;
+        }
+        .dispatch-month-table {
+            border-collapse: collapse;
+            min-width: 760px;
+            width: max-content;
+            color: #111827 !important;
+            table-layout: auto;
+        }
+        .dispatch-month-table th,
+        .dispatch-month-table td {
+            border-bottom: 1px solid rgba(49, 51, 63, 0.12);
+            border-right: 1px solid rgba(49, 51, 63, 0.08);
+            padding: 0.45rem 0.6rem;
+            text-align: left;
+            vertical-align: top;
+            white-space: nowrap;
+            min-width: 130px;
+            font-size: 0.9rem;
+            position: static !important;
+        }
+        .dispatch-month-table th:first-child,
+        .dispatch-month-table td:first-child {
+            min-width: 86px;
+        }
+        .dispatch-month-table th {
+            background: #f3f4f6;
+            font-weight: 700;
+        }
         @media (max-width: 420px) {
             .dispatch-two-day-row {
                 gap: 0.45rem;
@@ -909,21 +965,28 @@ def inject_dispatch_calendar_css():
     )
 
 
-def render_two_day_column(target_day, items):
-    st.markdown(f"**{format_month_day(target_day)}**")
+def escape_html(value):
+    return html.escape(clean_value(value), quote=True)
+
+
+def build_two_day_panel_html(target_day, items):
+    parts = [
+        '<div class="dispatch-day-panel">',
+        f'<div class="dispatch-day-title">{html.escape(format_month_day(target_day))}</div>',
+    ]
 
     if not items:
-        st.caption("予定なし")
-        return
+        parts.append('<div class="dispatch-empty">予定なし</div>')
+    else:
+        for item in items:
+            parts.append('<div class="dispatch-item">')
+            parts.append(f'<div class="dispatch-name">👤 {escape_html(item.get("顧客名"))}</div>')
+            parts.append(f'<div class="dispatch-line">地域：{escape_html(item.get("地域"))}</div>')
+            parts.append(f'<div class="dispatch-line">商品：{escape_html(item.get("商品名"))}</div>')
+            parts.append('</div>')
 
-    for item_index, item in enumerate(items):
-        with st.container(border=True):
-            st.markdown(f"**👤 {clean_value(item.get('顧客名'))}**")
-            st.write(f"地域：{clean_value(item.get('地域'))}")
-            st.write(f"商品：{clean_value(item.get('商品名'))}")
-
-        if item_index < len(items) - 1:
-            st.write("")
+    parts.append('</div>')
+    return "".join(parts)
 
 
 def show_dispatch_month_switcher(month_start):
@@ -948,6 +1011,7 @@ def show_dispatch_month_switcher(month_start):
 
 def show_two_day_dispatch_calendar(rows_by_day, month_start):
     st.subheader("📱 2日表示")
+    st.caption("スマホでも2日分を横並びで表示します。")
 
     last_day = calendar.monthrange(month_start.year, month_start.month)[1]
 
@@ -955,19 +1019,13 @@ def show_two_day_dispatch_calendar(rows_by_day, month_start):
         day1 = date(month_start.year, month_start.month, day_num)
         day2 = date(month_start.year, month_start.month, day_num + 1) if day_num + 1 <= last_day else None
 
-        col1, col2 = st.columns(2)
+        left_panel = build_two_day_panel_html(day1, rows_by_day.get(day1, []))
+        right_panel = build_two_day_panel_html(day2, rows_by_day.get(day2, [])) if day2 else '<div></div>'
 
-        with col1:
-            render_two_day_column(day1, rows_by_day.get(day1, []))
-
-        with col2:
-            if day2:
-                render_two_day_column(day2, rows_by_day.get(day2, []))
-            else:
-                st.write("")
-
-        st.markdown("---")
-
+        st.markdown(
+            f'<div class="dispatch-two-day-row">{left_panel}{right_panel}</div>',
+            unsafe_allow_html=True,
+        )
 
 def format_month_cell_item(item):
     customer_name = clean_value(item.get("顧客名"))
@@ -1003,25 +1061,33 @@ def make_month_dispatch_table(rows_by_day, month_start):
 
 def show_month_dispatch_calendar(rows_by_day, month_start):
     st.subheader("🗓 月表示")
-    st.caption("横スクロールで1か月分を確認できます。")
+    st.caption("横スクロールで1か月分を確認できます。列が固定されないHTML表で表示します。")
 
     month_df = make_month_dispatch_table(rows_by_day, month_start)
-    column_config = {
-        "月/日": st.column_config.TextColumn("月/日", width="small"),
-    }
 
-    for column_name in month_df.columns:
-        if column_name != "月/日":
-            column_config[column_name] = st.column_config.TextColumn(column_name, width="medium")
-
-    st.dataframe(
-        month_df,
-        hide_index=True,
-        use_container_width=True,
-        height=min(760, 38 * (len(month_df) + 1)),
-        column_config=column_config,
+    header_cells = "".join(
+        f'<th>{html.escape(str(column))}</th>'
+        for column in month_df.columns
     )
 
+    body_rows = []
+    for _, row in month_df.iterrows():
+        cells = "".join(
+            f'<td>{html.escape(str(row[column])) if str(row[column]) != "nan" else ""}</td>'
+            for column in month_df.columns
+        )
+        body_rows.append(f"<tr>{cells}</tr>")
+
+    table_html = f"""
+    <div class="dispatch-month-scroll">
+      <table class="dispatch-month-table">
+        <thead><tr>{header_cells}</tr></thead>
+        <tbody>{''.join(body_rows)}</tbody>
+      </table>
+    </div>
+    """
+
+    st.markdown(table_html, unsafe_allow_html=True)
 
 def show_dispatch_calendar(df):
     st.markdown("---")
@@ -1097,6 +1163,11 @@ with st.sidebar:
         menu_labels,
         index=current_menu_index,
     )
+
+    st.markdown("---")
+    if st.button("🔄 データ更新", use_container_width=True):
+        st.cache_data.clear()
+        st.rerun()
 
 selected_page = MENU_OPTIONS[selected_menu]
 
