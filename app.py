@@ -3,7 +3,7 @@ import html
 import json
 import math
 import urllib.parse
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from io import BytesIO
 from pathlib import Path
 
@@ -36,6 +36,7 @@ DROPBOX_ACCESS_TOKEN = st.secrets.get("DROPBOX_ACCESS_TOKEN", "")
 DROPBOX_DEFAULT_FILE_PATH = "/1共有　青山商店　本社/配車表-北海道-/配車予定 次郎.xlsm"
 DROPBOX_FILE_PATH = st.secrets.get("DROPBOX_FILE_PATH", DROPBOX_DEFAULT_FILE_PATH)
 APP_PASSWORD = st.secrets.get("APP_PASSWORD", "")
+NOTES_FILE_PATH = st.secrets.get("NOTES_FILE_PATH", "/業務アプリ/notes.json")
 
 REQUIRED_COLUMNS = [
     "ID",
@@ -227,6 +228,28 @@ st.markdown(
         margin: 1.4rem 0;
         border-color: rgba(15, 23, 42, 0.08);
     }
+
+    .note-card {
+        border: 1px solid rgba(15, 23, 42, 0.10);
+        border-radius: 16px;
+        background: rgba(255, 255, 255, 0.92);
+        box-shadow: 0 8px 22px rgba(15, 23, 42, 0.06);
+        padding: 0.9rem 1rem;
+        margin: 0.65rem 0;
+    }
+    .note-meta {
+        color: #667085;
+        font-size: 0.86rem;
+        margin-bottom: 0.35rem;
+    }
+    .note-body {
+        color: #172033;
+        font-size: 1rem;
+        line-height: 1.65;
+        white-space: pre-wrap;
+        word-break: break-word;
+    }
+
 
     @media (max-width: 640px) {
         .block-container {
@@ -599,6 +622,242 @@ def read_excel_local():
 
     return excel_path
 
+# =========================
+# メモ帳（Dropbox保存）
+# =========================
+def get_jst_now():
+    """日本時間の現在日時を返す"""
+    return datetime.now(timezone(timedelta(hours=9)))
+
+
+def format_note_datetime(value):
+    """ISO形式の日時を見やすく表示する"""
+    try:
+        dt = datetime.fromisoformat(str(value))
+        return dt.strftime("%Y/%m/%d %H:%M")
+    except Exception:
+        return clean_value(value, blank_text="")
+
+
+def ensure_notes_folder(access_token):
+    """Dropbox上にメモ帳用フォルダを作る。既にあれば何もしない。"""
+    folder_path = str(Path(NOTES_FILE_PATH).parent).replace("\\", "/")
+    if not folder_path.startswith("/"):
+        folder_path = "/" + folder_path
+
+    if folder_path in ("", ".", "/"):
+        return
+
+    url = "https://api.dropboxapi.com/2/files/create_folder_v2"
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "path": folder_path,
+        "autorename": False,
+    }
+
+    try:
+        response = requests.post(url, headers=headers, json=payload, timeout=30)
+    except Exception:
+        return
+
+    if response.status_code in (200, 409):
+        return
+
+
+def load_notes_from_dropbox():
+    """Dropboxのnotes.jsonを読み込む。存在しなければ空リスト。"""
+    if not has_dropbox_auth_config():
+        st.error("メモ帳を使うにはDropbox API設定が必要です。")
+        st.stop()
+
+    access_token = get_dropbox_access_token()
+    path = str(NOTES_FILE_PATH or "/業務アプリ/notes.json").strip()
+    if not path.startswith("/"):
+        path = "/" + path
+
+    content, response = download_dropbox_file(path, access_token)
+
+    if content is None:
+        if response is not None and response.status_code == 409:
+            return []
+        st.error("メモ帳データをDropboxから読み込めませんでした。")
+        if response is not None:
+            st.write(f"Dropboxからの応答コード：{response.status_code}")
+            try:
+                st.code(json.dumps(response.json(), ensure_ascii=False, indent=2))
+            except Exception:
+                st.code(response.text)
+        st.stop()
+
+    try:
+        notes = json.loads(content.decode("utf-8"))
+    except Exception:
+        st.error("メモ帳データの形式が正しくありません。")
+        st.write("Dropbox上の notes.json を確認してください。")
+        st.stop()
+
+    if not isinstance(notes, list):
+        return []
+
+    return notes
+
+
+def save_notes_to_dropbox(notes):
+    """メモ一覧をDropboxのnotes.jsonへ保存する"""
+    if not has_dropbox_auth_config():
+        st.error("メモ帳を保存するにはDropbox API設定が必要です。")
+        st.stop()
+
+    access_token = get_dropbox_access_token()
+    ensure_notes_folder(access_token)
+
+    path = str(NOTES_FILE_PATH or "/業務アプリ/notes.json").strip()
+    if not path.startswith("/"):
+        path = "/" + path
+
+    url = "https://content.dropboxapi.com/2/files/upload"
+    api_arg = {
+        "path": path,
+        "mode": "overwrite",
+        "autorename": False,
+        "mute": True,
+        "strict_conflict": False,
+    }
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Dropbox-API-Arg": json.dumps(api_arg, ensure_ascii=True).encode("utf-8").decode("latin1"),
+        "Content-Type": "application/octet-stream",
+    }
+    body = json.dumps(notes, ensure_ascii=False, indent=2).encode("utf-8")
+
+    try:
+        response = requests.post(url, headers=headers, data=body, timeout=30)
+    except Exception as e:
+        st.error("メモ帳の保存中にDropbox APIへの接続に失敗しました。")
+        st.exception(e)
+        st.stop()
+
+    if response.status_code not in (200, 201):
+        st.error("メモ帳をDropboxに保存できませんでした。")
+        st.write(f"Dropboxからの応答コード：{response.status_code}")
+        try:
+            st.code(json.dumps(response.json(), ensure_ascii=False, indent=2))
+        except Exception:
+            st.code(response.text)
+        st.stop()
+
+
+def make_note_id():
+    return get_jst_now().strftime("%Y%m%d%H%M%S%f")
+
+
+def add_note(customer_name, body):
+    """顧客名に紐づくメモを1件追加する"""
+    note_text = str(body or "").strip()
+    if not note_text:
+        st.warning("メモ本文を入力してください。")
+        return False
+
+    notes = load_notes_from_dropbox()
+    now = get_jst_now().isoformat()
+
+    notes.append(
+        {
+            "id": make_note_id(),
+            "customer_name": clean_value(customer_name, blank_text=""),
+            "body": note_text,
+            "created_at": now,
+        }
+    )
+
+    notes = sorted(notes, key=lambda note: note.get("created_at", ""), reverse=True)
+    save_notes_to_dropbox(notes)
+    return True
+
+
+def get_notes_for_customer(customer_name):
+    target = clean_value(customer_name, blank_text="")
+    notes = load_notes_from_dropbox()
+    customer_notes = [
+        note for note in notes
+        if clean_value(note.get("customer_name"), blank_text="") == target
+    ]
+    return sorted(customer_notes, key=lambda note: note.get("created_at", ""), reverse=True)
+
+
+def render_note_card(note, show_customer=True):
+    customer_name = clean_value(note.get("customer_name"), blank_text="未設定")
+    created_at = format_note_datetime(note.get("created_at", ""))
+    body = html.escape(clean_value(note.get("body"), blank_text="")).replace("\n", "<br>")
+
+    if show_customer:
+        customer_link = build_customer_detail_link(customer_name, class_name="dispatch-month-link")
+        meta = f"{html.escape(created_at)}　{customer_link}"
+    else:
+        meta = html.escape(created_at)
+
+    st.markdown(
+        f"""
+        <div class="note-card">
+            <div class="note-meta">{meta}</div>
+            <div class="note-body">{body}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def show_customer_notes(customer_name):
+    st.markdown("---")
+    st.subheader("📝 この顧客のメモ")
+    st.caption("スマホではキーボードのマイクから音声入力できます。")
+
+    note_key = f"customer_note_input_{customer_name}"
+    note_text = st.text_area(
+        "メモ本文",
+        key=note_key,
+        height=120,
+        placeholder="例：次回は午前中希望。サンプル持参。など",
+    )
+
+    if st.button("メモを保存", key=f"save_customer_note_{customer_name}"):
+        if add_note(customer_name, note_text):
+            st.session_state[note_key] = ""
+            st.success("メモを保存しました。")
+            st.rerun()
+
+    customer_notes = get_notes_for_customer(customer_name)
+
+    if not customer_notes:
+        st.info("この顧客のメモはまだありません。")
+        return
+
+    st.markdown("#### メモ履歴")
+    for note in customer_notes:
+        render_note_card(note, show_customer=False)
+
+
+def show_notes_page(df):
+    show_back_home_button("notes_back_home")
+
+    st.markdown("---")
+    st.header("📝 メモ帳")
+    st.caption("全顧客のメモを新しい順で表示します。")
+
+    notes = load_notes_from_dropbox()
+    notes = sorted(notes, key=lambda note: note.get("created_at", ""), reverse=True)
+
+    if not notes:
+        st.info("メモはまだありません。顧客詳細画面から保存できます。")
+        return
+
+    for note in notes:
+        render_note_card(note, show_customer=True)
+
+
 
 # =========================
 # Excel読み込み・整形
@@ -762,7 +1021,7 @@ def sync_page_from_query_params():
     page = str(get_query_value("page", "home")).strip() or "home"
     customer = str(get_query_value("customer", "")).strip()
 
-    valid_pages = {"home", "region", "calendar", "delivery", "detail"}
+    valid_pages = {"home", "region", "calendar", "delivery", "notes", "detail"}
 
     raw_page = str(get_query_value("page", "")).strip()
     if page not in valid_pages:
@@ -819,10 +1078,7 @@ def show_customer_detail(df, customer_name):
     region = clean_value(detail.iloc[0]["地域"])
 
     st.markdown("---")
-    st.markdown(
-        f'<h1 style="font-size:2.2rem; margin:0.2rem 0 0.4rem 0;">👤 {html.escape(str(customer_name))}</h1>',
-        unsafe_allow_html=True,
-    )
+    st.header(f"👤 {customer_name}")
     st.write(f"**地域：** {region}")
     st.write(f"**商品数：** {len(visible_detail)}件")
 
@@ -838,10 +1094,7 @@ def show_customer_detail(df, customer_name):
         remaining = format_number(row["残数"])
 
         with st.container(border=True):
-            st.markdown(
-                f'<div style="font-size:1.65rem; font-weight:800; margin-bottom:0.4rem;">📦 {html.escape(str(product_name))}</div>',
-                unsafe_allow_html=True,
-            )
+            st.subheader(f"📦 {product_name}")
 
             col1, col2 = st.columns(2)
 
@@ -850,24 +1103,17 @@ def show_customer_detail(df, customer_name):
                 st.markdown(f"**{customer_id}**")
 
                 st.caption("使用数量/日")
-                st.markdown(
-                    f'<div style="font-size:1.35rem; font-weight:800;">{html.escape(str(usage))}</div>',
-                    unsafe_allow_html=True,
-                )
+                st.markdown(f"**{usage}**")
 
             with col2:
                 st.caption("次回配達予定")
-                st.markdown(
-                    f'<div style="font-size:1.35rem; font-weight:800;">{html.escape(str(next_date))}</div>',
-                    unsafe_allow_html=True,
-                )
+                st.markdown(f"**{next_date}**")
 
                 st.caption("残数")
-                st.markdown(
-                    f'<div style="font-size:1.35rem; font-weight:800;">{html.escape(str(remaining))}</div>',
-                    unsafe_allow_html=True,
-                )
+                st.markdown(f"**{remaining}**")
 
+
+    show_customer_notes(customer_name)
 
 # =========================
 # 顧客検索
@@ -1553,6 +1799,8 @@ def show_home_menu():
     with col4:
         st.markdown(render_page_link("📅 配達予定一覧", page="delivery"), unsafe_allow_html=True)
 
+    st.markdown(render_page_link("📝 メモ帳", page="notes"), unsafe_allow_html=True)
+
     st.markdown("---")
 
 # =========================
@@ -1573,6 +1821,7 @@ MENU_OPTIONS = {
     "📍 地域検索": "region",
     "🗓 配車カレンダー": "calendar",
     "📅 配達予定一覧": "delivery",
+    "📝 メモ帳": "notes",
 }
 
 current_page = st.session_state.get("page", "home")
@@ -1585,6 +1834,7 @@ with st.sidebar:
     st.markdown(render_page_link("📍 地域検索", page="region"), unsafe_allow_html=True)
     st.markdown(render_page_link("🗓 配車カレンダー", page="calendar"), unsafe_allow_html=True)
     st.markdown(render_page_link("📅 配達予定一覧", page="delivery"), unsafe_allow_html=True)
+    st.markdown(render_page_link("📝 メモ帳", page="notes"), unsafe_allow_html=True)
 
     st.markdown("---")
     if st.button("🔄 データ更新", use_container_width=True):
@@ -1596,7 +1846,7 @@ col_title, col_logout = st.columns([3, 1])
 
 with col_title:
     st.title(f"🚚 {APP_TITLE}")
-    st.caption("顧客検索・地域検索・配車カレンダー・配達予定")
+    st.caption("顧客検索・地域検索・配車カレンダー・配達予定・メモ帳")
 
 with col_logout:
     st.write("")
@@ -1630,6 +1880,9 @@ elif st.session_state["page"] == "calendar":
 
 elif st.session_state["page"] == "delivery":
     show_delivery_list(df)
+
+elif st.session_state["page"] == "notes":
+    show_notes_page(df)
 
 elif st.session_state["page"] == "detail":
     selected = st.session_state.get("selected_customer")
