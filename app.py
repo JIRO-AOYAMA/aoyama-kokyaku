@@ -2,6 +2,7 @@ import calendar
 import html
 import json
 import math
+import urllib.parse
 from datetime import date, timedelta
 from io import BytesIO
 from pathlib import Path
@@ -919,6 +920,21 @@ def inject_dispatch_calendar_css():
             white-space: normal;
             word-break: normal;
         }
+        .dispatch-name a,
+        .dispatch-month-link {
+            color: #2563eb !important;
+            font-weight: 700;
+            text-decoration: none;
+        }
+        .dispatch-name a:hover,
+        .dispatch-month-link:hover {
+            text-decoration: underline;
+        }
+        .dispatch-month-product {
+            color: #374151 !important;
+            font-size: 0.82rem;
+            white-space: normal;
+        }
         .dispatch-line,
         .dispatch-empty {
             color: #374151 !important;
@@ -1000,6 +1016,39 @@ def escape_html(value):
     return html.escape(clean_value(value), quote=True)
 
 
+def build_customer_detail_link(customer_name, label=None, class_name="dispatch-month-link"):
+    """配車カレンダーから顧客詳細へ移動するリンクを作る"""
+    customer = clean_value(customer_name, blank_text="").strip()
+
+    if not customer:
+        return escape_html(label or customer_name)
+
+    link_label = label or customer
+    url = f"?customer={urllib.parse.quote(customer)}"
+    return f'<a class="{class_name}" href="{url}" target="_self">{escape_html(link_label)}</a>'
+
+
+def handle_customer_query_param():
+    """HTMLリンクで指定された顧客名を受け取り、顧客詳細画面へ移動する"""
+    try:
+        customer = st.query_params.get("customer", "")
+    except Exception:
+        customer = ""
+
+    if isinstance(customer, list):
+        customer = customer[0] if customer else ""
+
+    customer = str(customer).strip()
+
+    if customer:
+        st.session_state["selected_customer"] = customer
+        st.session_state["page"] = "detail"
+        try:
+            st.query_params.clear()
+        except Exception:
+            pass
+
+
 def build_two_day_panel_html(target_day, items):
     parts = [
         '<div class="dispatch-day-panel">',
@@ -1010,8 +1059,9 @@ def build_two_day_panel_html(target_day, items):
         parts.append('<div class="dispatch-empty">予定なし</div>')
     else:
         for item in items:
+            customer_link = build_customer_detail_link(item.get("顧客名"), class_name="dispatch-month-link")
             parts.append('<div class="dispatch-item">')
-            parts.append(f'<div class="dispatch-name">👤 {escape_html(item.get("顧客名"))}</div>')
+            parts.append(f'<div class="dispatch-name">👤 {customer_link}</div>')
             parts.append(f'<div class="dispatch-line">地域：{escape_html(item.get("地域"))}</div>')
             parts.append(f'<div class="dispatch-line">商品：{escape_html(item.get("商品名"))}</div>')
             parts.append('</div>')
@@ -1061,11 +1111,12 @@ def show_two_day_dispatch_calendar(rows_by_day, month_start):
 def format_month_cell_item(item):
     customer_name = clean_value(item.get("顧客名"))
     product_name = clean_value(item.get("商品名"))
+    customer_link = build_customer_detail_link(customer_name, class_name="dispatch-month-link")
 
     if product_name == "未設定":
-        return customer_name
+        return customer_link
 
-    return f"{customer_name}/{product_name}"
+    return f'{customer_link}<br><span class="dispatch-month-product">{escape_html(product_name)}</span>'
 
 
 def make_month_dispatch_table(rows_by_day, month_start):
@@ -1103,10 +1154,17 @@ def show_month_dispatch_calendar(rows_by_day, month_start):
 
     body_rows = []
     for _, row in month_df.iterrows():
-        cells = "".join(
-            f'<td>{html.escape(str(row[column])) if str(row[column]) != "nan" else ""}</td>'
-            for column in month_df.columns
-        )
+        row_cells = []
+        for column in month_df.columns:
+            value = row[column]
+            if str(value) == "nan":
+                cell_value = ""
+            elif column == "月/日":
+                cell_value = html.escape(str(value))
+            else:
+                cell_value = str(value)
+            row_cells.append(f"<td>{cell_value}</td>")
+        cells = "".join(row_cells)
         body_rows.append(f"<tr>{cells}</tr>")
 
     table_html = f"""
@@ -1168,6 +1226,8 @@ if "page" not in st.session_state:
 
 if "selected_customer" not in st.session_state:
     st.session_state["selected_customer"] = None
+
+handle_customer_query_param()
 
 
 MENU_OPTIONS = {
