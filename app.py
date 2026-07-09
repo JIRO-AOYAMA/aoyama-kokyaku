@@ -21,7 +21,7 @@ APP_TITLE = "青山商店 業務アプリ"
 st.set_page_config(
     page_title=APP_TITLE,
     page_icon="🚚",
-    layout="centered",
+    layout="wide",
 )
 
 EXCEL_FILE = "配車予定 次郎.xlsm"
@@ -108,23 +108,146 @@ if not st.session_state.authenticated:
 st.markdown(
     """
     <style>
+    :root {
+        --aoyama-bg: #f6f7fb;
+        --aoyama-card: rgba(255, 255, 255, 0.92);
+        --aoyama-line: rgba(15, 23, 42, 0.10);
+        --aoyama-text: #172033;
+        --aoyama-muted: #667085;
+        --aoyama-blue: #2563eb;
+        --aoyama-green: #0f766e;
+        --aoyama-shadow: 0 12px 32px rgba(15, 23, 42, 0.08);
+    }
+
+    .stApp {
+        background:
+            radial-gradient(circle at top left, rgba(37, 99, 235, 0.13), transparent 28rem),
+            radial-gradient(circle at top right, rgba(15, 118, 110, 0.11), transparent 24rem),
+            linear-gradient(180deg, #f8fafc 0%, #eef2f7 100%);
+        color: var(--aoyama-text);
+    }
+
+    [data-testid="stHeader"] {
+        background: rgba(255, 255, 255, 0.72);
+        backdrop-filter: blur(12px);
+        border-bottom: 1px solid rgba(15, 23, 42, 0.06);
+    }
+
+    [data-testid="stSidebar"] {
+        background: linear-gradient(180deg, #0f172a 0%, #1e293b 100%);
+    }
+    [data-testid="stSidebar"] * {
+        color: #f8fafc !important;
+    }
+    [data-testid="stSidebar"] hr {
+        border-color: rgba(255, 255, 255, 0.15);
+    }
+
+    .block-container {
+        padding-top: 2.2rem;
+        padding-bottom: 3rem;
+        max-width: 1120px;
+    }
+
+    h1, h2, h3 {
+        letter-spacing: -0.03em;
+    }
+
+    div[data-testid="stVerticalBlockBorderWrapper"] {
+        border: 1px solid var(--aoyama-line) !important;
+        border-radius: 18px !important;
+        background: var(--aoyama-card) !important;
+        box-shadow: var(--aoyama-shadow);
+    }
+
     .app-nav-link {
-        display: block;
+        display: flex;
+        align-items: center;
+        justify-content: center;
         width: 100%;
+        min-height: 3.4rem;
         box-sizing: border-box;
         text-align: center;
         text-decoration: none !important;
-        padding: 0.55rem 0.75rem;
-        margin: 0.25rem 0;
-        border: 1px solid rgba(49, 51, 63, 0.2);
-        border-radius: 0.5rem;
-        color: inherit !important;
-        background: rgba(250, 250, 250, 0.9);
-        font-weight: 600;
+        padding: 0.75rem 0.9rem;
+        margin: 0.32rem 0;
+        border: 1px solid rgba(15, 23, 42, 0.08);
+        border-radius: 16px;
+        color: #172033 !important;
+        background: linear-gradient(180deg, #ffffff 0%, #f8fafc 100%);
+        font-weight: 800;
+        box-shadow: 0 8px 22px rgba(15, 23, 42, 0.07);
+        transition: transform 0.14s ease, box-shadow 0.14s ease, border-color 0.14s ease;
     }
     .app-nav-link:hover {
-        border-color: rgba(49, 51, 63, 0.45);
-        background: rgba(240, 242, 246, 1);
+        transform: translateY(-1px);
+        border-color: rgba(37, 99, 235, 0.32);
+        box-shadow: 0 14px 32px rgba(37, 99, 235, 0.13);
+        background: linear-gradient(180deg, #ffffff 0%, #eff6ff 100%);
+    }
+
+    [data-testid="stSidebar"] .app-nav-link {
+        justify-content: flex-start;
+        min-height: 2.9rem;
+        color: #f8fafc !important;
+        background: rgba(255, 255, 255, 0.08);
+        border-color: rgba(255, 255, 255, 0.12);
+        box-shadow: none;
+    }
+    [data-testid="stSidebar"] .app-nav-link:hover {
+        background: rgba(255, 255, 255, 0.16);
+        border-color: rgba(255, 255, 255, 0.28);
+        transform: none;
+    }
+
+    .stButton > button {
+        border-radius: 14px !important;
+        border: 1px solid rgba(15, 23, 42, 0.10) !important;
+        background: linear-gradient(180deg, #ffffff 0%, #f8fafc 100%) !important;
+        box-shadow: 0 6px 18px rgba(15, 23, 42, 0.07);
+        font-weight: 700 !important;
+    }
+    .stButton > button:hover {
+        border-color: rgba(37, 99, 235, 0.35) !important;
+        box-shadow: 0 10px 24px rgba(37, 99, 235, 0.12);
+    }
+
+    .stTextInput input {
+        border-radius: 14px !important;
+        border: 1px solid rgba(15, 23, 42, 0.13) !important;
+        background: rgba(255,255,255,0.92) !important;
+        padding: 0.72rem 0.9rem !important;
+    }
+
+    [data-testid="stMetricValue"], .stCaptionContainer {
+        color: var(--aoyama-muted);
+    }
+
+    hr {
+        margin: 1.4rem 0;
+        border-color: rgba(15, 23, 42, 0.08);
+    }
+
+    @media (max-width: 640px) {
+        .block-container {
+            padding-left: 0.8rem;
+            padding-right: 0.8rem;
+            padding-top: 1.4rem;
+        }
+        .app-nav-link {
+            min-height: 3.1rem;
+            border-radius: 14px;
+            font-size: 0.95rem;
+        }
+        h1 {
+            font-size: 1.55rem !important;
+        }
+        h2 {
+            font-size: 1.25rem !important;
+        }
+        h3 {
+            font-size: 1.08rem !important;
+        }
     }
     </style>
     """,
@@ -1069,18 +1192,19 @@ def inject_dispatch_calendar_css():
         }
         .dispatch-day-panel {
             border: 1px solid rgba(49, 51, 63, 0.18);
-            border-radius: 8px;
+            border-radius: 16px;
             color: #111827 !important;
             overflow: visible;
-            padding: 0.75rem;
-            background: #ffffff;
+            padding: 0.8rem;
+            background: linear-gradient(180deg, #ffffff 0%, #f8fafc 100%);
+            box-shadow: 0 8px 22px rgba(15, 23, 42, 0.07);
             min-width: 0;
         }
         .dispatch-day-title {
             display: block;
             color: #111827 !important;
-            background: #f3f4f6;
-            border-radius: 6px;
+            background: linear-gradient(135deg, #eff6ff 0%, #ecfdf5 100%);
+            border-radius: 12px;
             font-size: 0.95rem;
             font-weight: 700;
             line-height: 1.35;
@@ -1139,9 +1263,10 @@ def inject_dispatch_calendar_css():
             width: 100%;
             overflow-x: auto;
             -webkit-overflow-scrolling: touch;
-            border: 1px solid rgba(49, 51, 63, 0.18);
-            border-radius: 8px;
+            border: 1px solid rgba(15, 23, 42, 0.10);
+            border-radius: 16px;
             background: #ffffff;
+            box-shadow: 0 10px 26px rgba(15, 23, 42, 0.08);
         }
         .dispatch-month-table {
             border-collapse: collapse;
@@ -1175,8 +1300,8 @@ def inject_dispatch_calendar_css():
             background: #f3f4f6;
         }
         .dispatch-month-table th {
-            background: #f3f4f6;
-            font-weight: 700;
+            background: #eff6ff;
+            font-weight: 800;
         }
         @media (max-width: 420px) {
             .dispatch-two-day-row {
