@@ -561,14 +561,21 @@ def show_customer_detail(df, customer_name):
         set_page("home")
         st.rerun()
 
+    # 使用数量/日が0・空白・NaNの商品行は、商品名ごと表示しない。
+    visible_detail = detail[~detail["使用数量/日"].apply(is_blank_or_zero)].copy()
+
     region = clean_value(detail.iloc[0]["地域"])
 
     st.markdown("---")
     st.header(f"👤 {customer_name}")
     st.write(f"**地域：** {region}")
-    st.write(f"**商品数：** {len(detail)}件")
+    st.write(f"**商品数：** {len(visible_detail)}件")
 
-    for _, row in detail.iterrows():
+    if visible_detail.empty:
+        st.info("表示対象の商品はありません。使用数量/日が0または空白の商品は非表示にしています。")
+        return
+
+    for _, row in visible_detail.iterrows():
         product_name = clean_value(row["商品名"])
         customer_id = clean_value(row["ID"])
         usage = format_number(row["使用数量/日"])
@@ -584,9 +591,8 @@ def show_customer_detail(df, customer_name):
                 st.caption("ID")
                 st.markdown(f"**{customer_id}**")
 
-                if not is_blank_or_zero(row["使用数量/日"]):
-                    st.caption("使用数量/日")
-                    st.markdown(f"**{usage}**")
+                st.caption("使用数量/日")
+                st.markdown(f"**{usage}**")
 
             with col2:
                 st.caption("次回配達予定")
