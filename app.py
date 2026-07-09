@@ -36,7 +36,10 @@ DROPBOX_ACCESS_TOKEN = st.secrets.get("DROPBOX_ACCESS_TOKEN", "")
 DROPBOX_DEFAULT_FILE_PATH = "/1共有　青山商店　本社/配車表-北海道-/配車予定 次郎.xlsm"
 DROPBOX_FILE_PATH = st.secrets.get("DROPBOX_FILE_PATH", DROPBOX_DEFAULT_FILE_PATH)
 APP_PASSWORD = st.secrets.get("APP_PASSWORD", "")
-NOTES_FILE_PATH = st.secrets.get("NOTES_FILE_PATH", "/業務アプリ/notes.json")
+SUPABASE_URL = st.secrets.get("SUPABASE_URL", "")
+SUPABASE_SERVICE_ROLE_KEY = st.secrets.get("SUPABASE_SERVICE_ROLE_KEY", "")
+SUPABASE_ANON_KEY = st.secrets.get("SUPABASE_ANON_KEY", "")
+SUPABASE_NOTES_TABLE = st.secrets.get("SUPABASE_NOTES_TABLE", "notes")
 
 REQUIRED_COLUMNS = [
     "ID",
@@ -623,7 +626,7 @@ def read_excel_local():
     return excel_path
 
 # =========================
-# メモ帳（Dropbox保存）
+# メモ帳（Supabase保存）
 # =========================
 def get_jst_now():
     """日本時間の現在日時を返す"""
@@ -633,70 +636,113 @@ def get_jst_now():
 def format_note_datetime(value):
     """ISO形式の日時を見やすく表示する"""
     try:
-        dt = datetime.fromisoformat(str(value))
+        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if dt.tzinfo is not None:
+            dt = dt.astimezone(timezone(timedelta(hours=9)))
         return dt.strftime("%Y/%m/%d %H:%M")
     except Exception:
         return clean_value(value, blank_text="")
 
 
-def ensure_notes_folder(access_token):
-    """Dropbox上にメモ帳用フォルダを作る。既にあれば何もしない。"""
-    folder_path = str(Path(NOTES_FILE_PATH).parent).replace("\\", "/")
-    if not folder_path.startswith("/"):
-        folder_path = "/" + folder_path
+def get_supabase_key():
+    """Supabaseへ接続するキーを返す。StreamlitではSecrets内だけに置く。"""
+    return str(SUPABASE_SERVICE_ROLE_KEY or SUPABASE_ANON_KEY or "").strip()
 
-    if folder_path in ("", ".", "/"):
-        return
 
-    url = "https://api.dropboxapi.com/2/files/create_folder_v2"
+def has_supabase_config():
+    return bool(str(SUPABASE_URL or "").strip() and get_supabase_key())
+
+
+def get_supabase_notes_table():
+    table_name = str(SUPABASE_NOTES_TABLE or "notes").strip()
+
+    if not table_name.replace("_", "").isalnum():
+        st.error("Supabaseのメモ帳テーブル名が正しくありません。")
+        st.write("SUPABASE_NOTES_TABLE は英数字とアンダースコアだけで指定してください。")
+        st.stop()
+
+    return table_name
+
+
+def get_supabase_notes_url():
+    base_url = str(SUPABASE_URL or "").strip().rstrip("/")
+    table_name = urllib.parse.quote(get_supabase_notes_table(), safe="")
+    return f"{base_url}/rest/v1/{table_name}"
+
+
+def get_supabase_headers(prefer=None):
+    key = get_supabase_key()
     headers = {
-        "Authorization": f"Bearer {access_token}",
+        "apikey": key,
+        "Authorization": f"Bearer {key}",
+        "Accept": "application/json",
         "Content-Type": "application/json",
     }
-    payload = {
-        "path": folder_path,
-        "autorename": False,
+    if prefer:
+        headers["Prefer"] = prefer
+    return headers
+
+
+def show_supabase_config_error():
+    st.error("メモ帳を使うにはSupabase設定が必要です。")
+    st.write("Streamlit Cloud の Secrets に以下を追加してください。")
+    st.code(
+        '\n'.join(
+            [
+                'SUPABASE_URL = "https://xxxx.supabase.co"',
+                'SUPABASE_SERVICE_ROLE_KEY = "Supabaseのservice_roleキー"',
+                'SUPABASE_NOTES_TABLE = "notes"',
+            ]
+        )
+    )
+    st.stop()
+
+
+def show_supabase_response_error(action, response):
+    st.error(f"メモ帳をSupabaseに{action}できませんでした。")
+    if response is not None:
+        st.write(f"Supabaseからの応答コード：{response.status_code}")
+        try:
+            st.code(json.dumps(response.json(), ensure_ascii=False, indent=2))
+        except Exception:
+            st.code(response.text)
+    st.stop()
+
+
+def load_notes_from_supabase(customer_name=None, limit=500):
+    """Supabaseのnotesテーブルからメモを新しい順で読み込む"""
+    if not has_supabase_config():
+        show_supabase_config_error()
+
+    params = {
+        "select": "id,customer_name,body,created_at",
+        "order": "created_at.desc",
+        "limit": str(limit),
     }
 
-    try:
-        response = requests.post(url, headers=headers, json=payload, timeout=30)
-    except Exception:
-        return
-
-    if response.status_code in (200, 409):
-        return
-
-
-def load_notes_from_dropbox():
-    """Dropboxのnotes.jsonを読み込む。存在しなければ空リスト。"""
-    if not has_dropbox_auth_config():
-        st.error("メモ帳を使うにはDropbox API設定が必要です。")
-        st.stop()
-
-    access_token = get_dropbox_access_token()
-    path = str(NOTES_FILE_PATH or "/業務アプリ/notes.json").strip()
-    if not path.startswith("/"):
-        path = "/" + path
-
-    content, response = download_dropbox_file(path, access_token)
-
-    if content is None:
-        if response is not None and response.status_code == 409:
-            return []
-        st.error("メモ帳データをDropboxから読み込めませんでした。")
-        if response is not None:
-            st.write(f"Dropboxからの応答コード：{response.status_code}")
-            try:
-                st.code(json.dumps(response.json(), ensure_ascii=False, indent=2))
-            except Exception:
-                st.code(response.text)
-        st.stop()
+    if customer_name is not None:
+        target = clean_value(customer_name, blank_text="")
+        params["customer_name"] = f"eq.{target}"
 
     try:
-        notes = json.loads(content.decode("utf-8"))
+        response = requests.get(
+            get_supabase_notes_url(),
+            headers=get_supabase_headers(),
+            params=params,
+            timeout=30,
+        )
+    except Exception as e:
+        st.error("メモ帳の読み込み中にSupabaseへの接続に失敗しました。")
+        st.exception(e)
+        st.stop()
+
+    if response.status_code != 200:
+        show_supabase_response_error("読み込み", response)
+
+    try:
+        notes = response.json()
     except Exception:
-        st.error("メモ帳データの形式が正しくありません。")
-        st.write("Dropbox上の notes.json を確認してください。")
+        st.error("Supabaseから返ったメモ帳データの形式が正しくありません。")
         st.stop()
 
     if not isinstance(notes, list):
@@ -705,49 +751,25 @@ def load_notes_from_dropbox():
     return notes
 
 
-def save_notes_to_dropbox(notes):
-    """メモ一覧をDropboxのnotes.jsonへ保存する"""
-    if not has_dropbox_auth_config():
-        st.error("メモ帳を保存するにはDropbox API設定が必要です。")
-        st.stop()
-
-    access_token = get_dropbox_access_token()
-    ensure_notes_folder(access_token)
-
-    path = str(NOTES_FILE_PATH or "/業務アプリ/notes.json").strip()
-    if not path.startswith("/"):
-        path = "/" + path
-
-    url = "https://content.dropboxapi.com/2/files/upload"
-    api_arg = {
-        "path": path,
-        "mode": "overwrite",
-        "autorename": False,
-        "mute": True,
-        "strict_conflict": False,
-    }
-    headers = {
-        "Authorization": f"Bearer {access_token}",
-        "Dropbox-API-Arg": json.dumps(api_arg, ensure_ascii=True).encode("utf-8").decode("latin1"),
-        "Content-Type": "application/octet-stream",
-    }
-    body = json.dumps(notes, ensure_ascii=False, indent=2).encode("utf-8")
+def insert_note_to_supabase(note):
+    """Supabaseのnotesテーブルへメモを1件追加する"""
+    if not has_supabase_config():
+        show_supabase_config_error()
 
     try:
-        response = requests.post(url, headers=headers, data=body, timeout=30)
+        response = requests.post(
+            get_supabase_notes_url(),
+            headers=get_supabase_headers(prefer="return=minimal"),
+            json=note,
+            timeout=30,
+        )
     except Exception as e:
-        st.error("メモ帳の保存中にDropbox APIへの接続に失敗しました。")
+        st.error("メモ帳の保存中にSupabaseへの接続に失敗しました。")
         st.exception(e)
         st.stop()
 
     if response.status_code not in (200, 201):
-        st.error("メモ帳をDropboxに保存できませんでした。")
-        st.write(f"Dropboxからの応答コード：{response.status_code}")
-        try:
-            st.code(json.dumps(response.json(), ensure_ascii=False, indent=2))
-        except Exception:
-            st.code(response.text)
-        st.stop()
+        show_supabase_response_error("保存", response)
 
 
 def make_note_id():
@@ -761,31 +783,20 @@ def add_note(customer_name, body):
         st.warning("メモ本文を入力してください。")
         return False
 
-    notes = load_notes_from_dropbox()
     now = get_jst_now().isoformat()
+    note = {
+        "id": make_note_id(),
+        "customer_name": clean_value(customer_name, blank_text=""),
+        "body": note_text,
+        "created_at": now,
+    }
 
-    notes.append(
-        {
-            "id": make_note_id(),
-            "customer_name": clean_value(customer_name, blank_text=""),
-            "body": note_text,
-            "created_at": now,
-        }
-    )
-
-    notes = sorted(notes, key=lambda note: note.get("created_at", ""), reverse=True)
-    save_notes_to_dropbox(notes)
+    insert_note_to_supabase(note)
     return True
 
 
 def get_notes_for_customer(customer_name):
-    target = clean_value(customer_name, blank_text="")
-    notes = load_notes_from_dropbox()
-    customer_notes = [
-        note for note in notes
-        if clean_value(note.get("customer_name"), blank_text="") == target
-    ]
-    return sorted(customer_notes, key=lambda note: note.get("created_at", ""), reverse=True)
+    return load_notes_from_supabase(customer_name=customer_name)
 
 
 def render_note_card(note, show_customer=True):
@@ -847,8 +858,7 @@ def show_notes_page(df):
     st.header("📝 メモ帳")
     st.caption("全顧客のメモを新しい順で表示します。")
 
-    notes = load_notes_from_dropbox()
-    notes = sorted(notes, key=lambda note: note.get("created_at", ""), reverse=True)
+    notes = load_notes_from_supabase()
 
     if not notes:
         st.info("メモはまだありません。顧客詳細画面から保存できます。")
