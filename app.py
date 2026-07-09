@@ -659,47 +659,30 @@ def show_customer_search(df):
 def show_region_search(df):
     st.subheader("📍 地域検索")
 
-    regions = (
-        df["地域"]
-        .dropna()
-        .astype(str)
-        .str.strip()
-    )
-    regions = sorted([region for region in regions.unique() if region and region.lower() != "nan"])
-
     keyword = st.text_input(
         "地域名で検索",
         placeholder="例：帯広、芽室、釧路",
     ).strip()
 
-    selected_region = None
-    if regions:
-        filtered_regions = [region for region in regions if keyword in region] if keyword else regions
-        if filtered_regions:
-            selected_region = st.selectbox(
-                "地域を選択",
-                filtered_regions,
-                index=0,
-            )
-        else:
-            st.warning("該当する地域がありません。")
-            return
-    else:
-        st.warning("地域データが見つかりません。")
+    if not keyword:
+        st.info("地域名を入力してください。")
         return
 
-    if not selected_region:
-        st.info("地域名を入力または選択してください。")
-        return
-
-    hit = df[df["地域"].astype(str).str.strip() == selected_region]
+    region_text = df["地域"].fillna("").astype(str).str.strip()
+    hit = df[region_text.str.contains(keyword, na=False)]
 
     if hit.empty:
-        st.warning("この地域の顧客が見つかりません。")
+        st.warning("該当する地域の顧客が見つかりません。")
         return
 
-    customers = hit[["顧客名", "地域"]].drop_duplicates().sort_values("顧客名").reset_index(drop=True)
-    st.write(f"{selected_region}：{len(customers)}件")
+    customers = (
+        hit[["顧客名", "地域"]]
+        .drop_duplicates()
+        .sort_values(["地域", "顧客名"])
+        .reset_index(drop=True)
+    )
+
+    st.write(f"候補：{len(customers)}件")
 
     for i, row in customers.iterrows():
         name = clean_value(row["顧客名"])
@@ -1301,6 +1284,35 @@ def show_dispatch_calendar(df):
         show_month_dispatch_calendar(rows_by_day, month_start)
 
 
+
+# =========================
+# ホームメニュー
+# =========================
+def show_home_menu():
+    st.subheader("メニュー")
+
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("🔍 顧客検索", use_container_width=True, key="home_menu_customer"):
+            set_page("home")
+            st.rerun()
+    with col2:
+        if st.button("📍 地域検索", use_container_width=True, key="home_menu_region"):
+            set_page("region")
+            st.rerun()
+
+    col3, col4 = st.columns(2)
+    with col3:
+        if st.button("🗓 配車カレンダー", use_container_width=True, key="home_menu_calendar"):
+            set_page("calendar")
+            st.rerun()
+    with col4:
+        if st.button("📅 配達予定一覧", use_container_width=True, key="home_menu_delivery"):
+            set_page("delivery")
+            st.rerun()
+
+    st.markdown("---")
+
 # =========================
 # メイン
 # =========================
@@ -1382,6 +1394,7 @@ except Exception as e:
     st.stop()
 
 if st.session_state["page"] == "home":
+    show_home_menu()
     show_customer_search(df)
 
 elif st.session_state["page"] == "region":
