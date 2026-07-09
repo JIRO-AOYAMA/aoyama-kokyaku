@@ -1,8 +1,6 @@
 import calendar
-import html
 import json
 import math
-import urllib.parse
 from datetime import date, timedelta
 from io import BytesIO
 from pathlib import Path
@@ -16,14 +14,6 @@ import streamlit as st
 # 基本設定
 # =========================
 APP_TITLE = "青山商店 業務アプリ"
-
-# Streamlitでは、st.set_page_config は他の st.* 呼び出しより先に実行する
-st.set_page_config(
-    page_title=APP_TITLE,
-    page_icon="🚚",
-    layout="wide",
-)
-
 EXCEL_FILE = "配車予定 次郎.xlsm"
 SHEET_NAME = "Sheet1"
 
@@ -61,18 +51,19 @@ REQUIRED_COLUMN_CANDIDATES = {
 
 
 # =========================
+# Streamlit設定
+# =========================
+st.set_page_config(
+    page_title=APP_TITLE,
+    page_icon="🚚",
+    layout="centered",
+)
+
+# =========================
 # ログイン認証
 # =========================
 if "authenticated" not in st.session_state:
     st.session_state.authenticated = False
-
-# HTMLリンクで画面遷移するとStreamlitのセッションが切れる場合があるため、
-# ログアウトするまではURLパラメータでもログイン状態を保持する。
-try:
-    if st.query_params.get("logged_in", "") == "1":
-        st.session_state.authenticated = True
-except Exception:
-    pass
 
 if not st.session_state.authenticated:
     st.title("🔒 青山商店")
@@ -89,170 +80,12 @@ if not st.session_state.authenticated:
             st.session_state.authenticated = True
             st.session_state.page = "home"
             st.session_state.selected_customer = None
-            try:
-                st.query_params["logged_in"] = "1"
-                st.query_params["page"] = "home"
-            except Exception:
-                pass
             st.rerun()
         else:
             st.error("パスワードが違います。")
 
     st.stop()
 
-
-
-# =========================
-# 共通CSS
-# =========================
-st.markdown(
-    """
-    <style>
-    :root {
-        --aoyama-bg: #f6f7fb;
-        --aoyama-card: rgba(255, 255, 255, 0.92);
-        --aoyama-line: rgba(15, 23, 42, 0.10);
-        --aoyama-text: #172033;
-        --aoyama-muted: #667085;
-        --aoyama-blue: #2563eb;
-        --aoyama-green: #0f766e;
-        --aoyama-shadow: 0 12px 32px rgba(15, 23, 42, 0.08);
-    }
-
-    .stApp {
-        background:
-            radial-gradient(circle at top left, rgba(37, 99, 235, 0.13), transparent 28rem),
-            radial-gradient(circle at top right, rgba(15, 118, 110, 0.11), transparent 24rem),
-            linear-gradient(180deg, #f8fafc 0%, #eef2f7 100%);
-        color: var(--aoyama-text);
-    }
-
-    [data-testid="stHeader"] {
-        background: rgba(255, 255, 255, 0.72);
-        backdrop-filter: blur(12px);
-        border-bottom: 1px solid rgba(15, 23, 42, 0.06);
-    }
-
-    [data-testid="stSidebar"] {
-        background: linear-gradient(180deg, #0f172a 0%, #1e293b 100%);
-    }
-    [data-testid="stSidebar"] * {
-        color: #f8fafc !important;
-    }
-    [data-testid="stSidebar"] hr {
-        border-color: rgba(255, 255, 255, 0.15);
-    }
-
-    .block-container {
-        padding-top: 2.2rem;
-        padding-bottom: 3rem;
-        max-width: 1120px;
-    }
-
-    h1, h2, h3 {
-        letter-spacing: -0.03em;
-    }
-
-    div[data-testid="stVerticalBlockBorderWrapper"] {
-        border: 1px solid var(--aoyama-line) !important;
-        border-radius: 18px !important;
-        background: var(--aoyama-card) !important;
-        box-shadow: var(--aoyama-shadow);
-    }
-
-    .app-nav-link {
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        width: 100%;
-        min-height: 3.4rem;
-        box-sizing: border-box;
-        text-align: center;
-        text-decoration: none !important;
-        padding: 0.75rem 0.9rem;
-        margin: 0.32rem 0;
-        border: 1px solid rgba(15, 23, 42, 0.08);
-        border-radius: 16px;
-        color: #172033 !important;
-        background: linear-gradient(180deg, #ffffff 0%, #f8fafc 100%);
-        font-weight: 800;
-        box-shadow: 0 8px 22px rgba(15, 23, 42, 0.07);
-        transition: transform 0.14s ease, box-shadow 0.14s ease, border-color 0.14s ease;
-    }
-    .app-nav-link:hover {
-        transform: translateY(-1px);
-        border-color: rgba(37, 99, 235, 0.32);
-        box-shadow: 0 14px 32px rgba(37, 99, 235, 0.13);
-        background: linear-gradient(180deg, #ffffff 0%, #eff6ff 100%);
-    }
-
-    [data-testid="stSidebar"] .app-nav-link {
-        justify-content: flex-start;
-        min-height: 2.9rem;
-        color: #f8fafc !important;
-        background: rgba(255, 255, 255, 0.08);
-        border-color: rgba(255, 255, 255, 0.12);
-        box-shadow: none;
-    }
-    [data-testid="stSidebar"] .app-nav-link:hover {
-        background: rgba(255, 255, 255, 0.16);
-        border-color: rgba(255, 255, 255, 0.28);
-        transform: none;
-    }
-
-    .stButton > button {
-        border-radius: 14px !important;
-        border: 1px solid rgba(15, 23, 42, 0.10) !important;
-        background: linear-gradient(180deg, #ffffff 0%, #f8fafc 100%) !important;
-        box-shadow: 0 6px 18px rgba(15, 23, 42, 0.07);
-        font-weight: 700 !important;
-    }
-    .stButton > button:hover {
-        border-color: rgba(37, 99, 235, 0.35) !important;
-        box-shadow: 0 10px 24px rgba(37, 99, 235, 0.12);
-    }
-
-    .stTextInput input {
-        border-radius: 14px !important;
-        border: 1px solid rgba(15, 23, 42, 0.13) !important;
-        background: rgba(255,255,255,0.92) !important;
-        padding: 0.72rem 0.9rem !important;
-    }
-
-    [data-testid="stMetricValue"], .stCaptionContainer {
-        color: var(--aoyama-muted);
-    }
-
-    hr {
-        margin: 1.4rem 0;
-        border-color: rgba(15, 23, 42, 0.08);
-    }
-
-    @media (max-width: 640px) {
-        .block-container {
-            padding-left: 0.8rem;
-            padding-right: 0.8rem;
-            padding-top: 1.4rem;
-        }
-        .app-nav-link {
-            min-height: 3.1rem;
-            border-radius: 14px;
-            font-size: 0.95rem;
-        }
-        h1 {
-            font-size: 1.55rem !important;
-        }
-        h2 {
-            font-size: 1.25rem !important;
-        }
-        h3 {
-            font-size: 1.08rem !important;
-        }
-    }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
 
 # =========================
 # 表示用の整形
@@ -334,42 +167,6 @@ def format_number(value, decimal=1, blank_text="未設定"):
         return f"{num:.{decimal}f}"
     except Exception:
         return text
-
-
-def is_blank_or_zero(value):
-    """空白・NaN・0ならTrue。使用数量/日を非表示にする判定用。
-
-    Excelから「0」「0.0」「０」「０．０」「0 kg」のような文字列で来ても
-    0として扱えるように少し広めに判定する。
-    """
-    if value is None:
-        return True
-
-    if isinstance(value, float) and math.isnan(value):
-        return True
-
-    text = str(value).strip()
-
-    if text == "" or text.lower() == "nan" or text.startswith("#"):
-        return True
-
-    # 全角数字・全角小数点・カンマを整理
-    normalized = text.translate(str.maketrans({
-        "０": "0", "１": "1", "２": "2", "３": "3", "４": "4",
-        "５": "5", "６": "6", "７": "7", "８": "8", "９": "9",
-        "．": ".", "，": ",",
-    })).replace(",", "")
-
-    # 単位などが付いていても、先頭の数値だけ取り出して判定
-    import re
-    match = re.match(r"^[-+]?\d+(?:\.\d+)?", normalized)
-    if not match:
-        return False
-
-    try:
-        return float(match.group(0)) == 0
-    except Exception:
-        return False
 
 
 def find_existing_column(df, candidates):
@@ -688,7 +485,7 @@ def normalize_excel_table(excel_source):
     return df
 
 
-@st.cache_data(ttl=60)
+@st.cache_data(ttl=300)
 def load_data():
     """
     Dropbox API設定があればDropbox上のExcelを読む。
@@ -705,100 +502,13 @@ def load_data():
 # =========================
 # 画面遷移
 # =========================
-def get_query_value(key, default=""):
-    """URLパラメータを安全に1つ取り出す"""
-    try:
-        value = st.query_params.get(key, default)
-    except Exception:
-        return default
-
-    if isinstance(value, list):
-        return value[0] if value else default
-
-    return value if value is not None else default
-
-
-def update_query_params(**params):
-    """ブラウザの戻るボタンで戻れるようにURLへ現在画面を残す"""
-    try:
-        # ログイン状態はURLにも残す。ログアウト時だけ消す。
-        st.query_params["logged_in"] = "1"
-
-        for key, value in params.items():
-            if value is None or value == "":
-                if key in st.query_params:
-                    del st.query_params[key]
-            else:
-                st.query_params[key] = str(value)
-    except Exception:
-        pass
-
-
-
-def make_app_url(page="home", customer=None, customer_search=None, region_search=None):
-    """ブラウザの戻るボタンで戻れるように、通常リンク用URLを作る。"""
-    params = {"logged_in": "1", "page": page}
-    if customer:
-        params["customer"] = str(customer)
-    if customer_search:
-        params["customer_search"] = str(customer_search)
-    if region_search:
-        params["region_search"] = str(region_search)
-    return "?" + urllib.parse.urlencode(params)
-
-
-def render_page_link(label, page="home", customer=None, customer_search=None, region_search=None, class_name="app-nav-link"):
-    """st.buttonではなくHTMLリンクで画面遷移する。これによりブラウザ戻るが効く。"""
-    url = make_app_url(
-        page=page,
-        customer=customer,
-        customer_search=customer_search,
-        region_search=region_search,
-    )
-    return f'<a class="{class_name}" href="{url}" target="_self">{html.escape(str(label))}</a>'
-
-def sync_page_from_query_params():
-    """URLのpage/customerを読んで、ブラウザ戻る・進むに追従する"""
-    page = str(get_query_value("page", "home")).strip() or "home"
-    customer = str(get_query_value("customer", "")).strip()
-
-    valid_pages = {"home", "region", "calendar", "delivery", "detail"}
-
-    raw_page = str(get_query_value("page", "")).strip()
-    if page not in valid_pages:
-        page = "home"
-    if customer and not raw_page:
-        page = "detail"
-
-    st.session_state["page"] = page
-
-    if page == "detail" and customer:
-        st.session_state["selected_customer"] = customer
-    elif page != "detail":
-        st.session_state["selected_customer"] = None
-
-
-def set_page(page_name, rerun=False):
+def set_page(page_name):
     st.session_state["page"] = page_name
-
-    if page_name != "detail":
-        st.session_state["selected_customer"] = None
-
-    update_query_params(page=page_name, customer=None)
-
-    if rerun:
-        st.rerun()
 
 
 def select_customer(customer_name, page_name="detail"):
     st.session_state["selected_customer"] = customer_name
     st.session_state["page"] = page_name
-    update_query_params(page=page_name, customer=customer_name)
-
-
-def show_back_home_button(key):
-    """各画面からホームへ戻るための共通リンク。ブラウザ履歴にも残る。"""
-    st.markdown(render_page_link("← ホームへ戻る", page="home"), unsafe_allow_html=True)
 
 
 # =========================
@@ -811,23 +521,18 @@ def show_customer_detail(df, customer_name):
         st.warning("選択した顧客の情報が見つかりません。")
         return
 
-    show_back_home_button("detail_back_home")
-
-    # 使用数量/日が0・空白・NaNの商品行は、商品名ごと表示しない。
-    visible_detail = detail[~detail["使用数量/日"].apply(is_blank_or_zero)].copy()
+    if st.button("← ホームへ戻る"):
+        set_page("home")
+        st.rerun()
 
     region = clean_value(detail.iloc[0]["地域"])
 
     st.markdown("---")
-    st.header(f"👤 {customer_name}")
+    st.markdown(f'<h1 style="font-size:2.2rem;margin-bottom:0.2rem;">👤 {customer_name}</h1>', unsafe_allow_html=True)
     st.write(f"**地域：** {region}")
-    st.write(f"**商品数：** {len(visible_detail)}件")
+    st.write(f"**商品数：** {len(detail)}件")
 
-    if visible_detail.empty:
-        st.info("表示対象の商品はありません。使用数量/日が0または空白の商品は非表示にしています。")
-        return
-
-    for _, row in visible_detail.iterrows():
+    for _, row in detail.iterrows():
         product_name = clean_value(row["商品名"])
         customer_id = clean_value(row["ID"])
         usage = format_number(row["使用数量/日"])
@@ -835,7 +540,7 @@ def show_customer_detail(df, customer_name):
         remaining = format_number(row["残数"])
 
         with st.container(border=True):
-            st.subheader(f"📦 {product_name}")
+            st.markdown(f'<h2 style="font-size:1.8rem;margin-bottom:0.5rem;">📦 {product_name}</h2>', unsafe_allow_html=True)
 
             col1, col2 = st.columns(2)
 
@@ -844,14 +549,14 @@ def show_customer_detail(df, customer_name):
                 st.markdown(f"**{customer_id}**")
 
                 st.caption("使用数量/日")
-                st.markdown(f"**{usage}**")
+                st.markdown(f'<div style="font-size:1.45rem;font-weight:700;">{usage}</div>', unsafe_allow_html=True)
 
             with col2:
                 st.caption("次回配達予定")
-                st.markdown(f"**{next_date}**")
+                st.markdown(f'<div style="font-size:1.45rem;font-weight:700;">{next_date}</div>', unsafe_allow_html=True)
 
                 st.caption("残数")
-                st.markdown(f"**{remaining}**")
+                st.markdown(f'<div style="font-size:1.45rem;font-weight:700;">{remaining}</div>', unsafe_allow_html=True)
 
 
 # =========================
@@ -860,18 +565,10 @@ def show_customer_detail(df, customer_name):
 def show_customer_search(df):
     st.subheader("🔍 顧客検索")
 
-    default_keyword = str(get_query_value("customer_search", "")).strip()
     keyword = st.text_input(
         "ひらがなで検索",
-        value=default_keyword,
         placeholder="例：こ、こも、むら",
-        key="customer_search_input",
     ).strip()
-
-    if keyword:
-        update_query_params(page="home", customer_search=keyword)
-    else:
-        update_query_params(page="home", customer_search=None)
 
     if not keyword:
         st.info("顧客名のひらがなを入力してください。")
@@ -895,64 +592,9 @@ def show_customer_search(df):
             st.markdown(f"### 👤 {name}")
             st.write(f"地域：{region}")
 
-            st.markdown(
-                render_page_link("この顧客を見る", page="detail", customer=name, customer_search=keyword),
-                unsafe_allow_html=True,
-            )
-
-
-# =========================
-# 地域検索
-# =========================
-def show_region_search(df):
-    st.subheader("📍 地域検索")
-    show_back_home_button("region_back_home")
-
-    default_keyword = str(get_query_value("region_search", "")).strip()
-    keyword = st.text_input(
-        "地域名で検索",
-        value=default_keyword,
-        placeholder="例：帯広、芽室、釧路",
-        key="region_search_input",
-    ).strip()
-
-    if keyword:
-        update_query_params(page="region", region_search=keyword)
-    else:
-        update_query_params(page="region", region_search=None)
-
-    if not keyword:
-        st.info("地域名を入力してください。")
-        return
-
-    region_text = df["地域"].fillna("").astype(str).str.strip()
-    hit = df[region_text.str.contains(keyword, na=False)]
-
-    if hit.empty:
-        st.warning("該当する地域の顧客が見つかりません。")
-        return
-
-    customers = (
-        hit[["顧客名", "地域"]]
-        .drop_duplicates()
-        .sort_values(["地域", "顧客名"])
-        .reset_index(drop=True)
-    )
-
-    st.write(f"候補：{len(customers)}件")
-
-    for i, row in customers.iterrows():
-        name = clean_value(row["顧客名"])
-        region = clean_value(row["地域"])
-
-        with st.container(border=True):
-            st.markdown(f"### 👤 {name}")
-            st.write(f"地域：{region}")
-
-            st.markdown(
-                render_page_link("この顧客を見る", page="detail", customer=name, region_search=keyword),
-                unsafe_allow_html=True,
-            )
+            if st.button("この顧客を見る", key=f"search_select_{i}_{name}"):
+                select_customer(name)
+                st.rerun()
 
 
 # =========================
@@ -996,7 +638,9 @@ def make_delivery_list(df):
 
 
 def show_delivery_list(df):
-    show_back_home_button("delivery_back_home")
+    if st.button("← ホームへ戻る"):
+        set_page("home")
+        st.rerun()
 
     st.markdown("---")
     st.header("📅 配達予定一覧")
@@ -1023,10 +667,9 @@ def show_delivery_list(df):
             with col2:
                 st.markdown(f"**{next_date}**")
 
-            st.markdown(
-                render_page_link("詳細を見る", page="detail", customer=customer_name),
-                unsafe_allow_html=True,
-            )
+            if st.button("詳細を見る", key=f"delivery_select_{i}_{customer_name}"):
+                select_customer(customer_name)
+                st.rerun()
 
 
 # =========================
@@ -1192,19 +835,18 @@ def inject_dispatch_calendar_css():
         }
         .dispatch-day-panel {
             border: 1px solid rgba(49, 51, 63, 0.18);
-            border-radius: 16px;
+            border-radius: 8px;
             color: #111827 !important;
             overflow: visible;
-            padding: 0.8rem;
-            background: linear-gradient(180deg, #ffffff 0%, #f8fafc 100%);
-            box-shadow: 0 8px 22px rgba(15, 23, 42, 0.07);
+            padding: 0.75rem;
+            background: #ffffff;
             min-width: 0;
         }
         .dispatch-day-title {
             display: block;
             color: #111827 !important;
-            background: linear-gradient(135deg, #eff6ff 0%, #ecfdf5 100%);
-            border-radius: 12px;
+            background: #f3f4f6;
+            border-radius: 6px;
             font-size: 0.95rem;
             font-weight: 700;
             line-height: 1.35;
@@ -1234,21 +876,6 @@ def inject_dispatch_calendar_css():
             white-space: normal;
             word-break: normal;
         }
-        .dispatch-name a,
-        .dispatch-month-link {
-            color: #2563eb !important;
-            font-weight: 700;
-            text-decoration: none;
-        }
-        .dispatch-name a:hover,
-        .dispatch-month-link:hover {
-            text-decoration: underline;
-        }
-        .dispatch-month-product {
-            color: #374151 !important;
-            font-size: 0.82rem;
-            white-space: normal;
-        }
         .dispatch-line,
         .dispatch-empty {
             color: #374151 !important;
@@ -1258,50 +885,6 @@ def inject_dispatch_calendar_css():
             overflow-wrap: anywhere;
             white-space: normal;
             word-break: normal;
-        }
-        .dispatch-month-scroll {
-            width: 100%;
-            overflow-x: auto;
-            -webkit-overflow-scrolling: touch;
-            border: 1px solid rgba(15, 23, 42, 0.10);
-            border-radius: 16px;
-            background: #ffffff;
-            box-shadow: 0 10px 26px rgba(15, 23, 42, 0.08);
-        }
-        .dispatch-month-table {
-            border-collapse: collapse;
-            min-width: 760px;
-            width: max-content;
-            color: #111827 !important;
-            table-layout: auto;
-        }
-        .dispatch-month-table th,
-        .dispatch-month-table td {
-            border-bottom: 1px solid rgba(49, 51, 63, 0.12);
-            border-right: 1px solid rgba(49, 51, 63, 0.08);
-            padding: 0.45rem 0.6rem;
-            text-align: left;
-            vertical-align: top;
-            white-space: nowrap;
-            min-width: 130px;
-            font-size: 0.9rem;
-            position: static !important;
-        }
-        .dispatch-month-table th:first-child,
-        .dispatch-month-table td:first-child {
-            min-width: 86px;
-            position: sticky !important;
-            left: 0;
-            z-index: 3;
-            background: #ffffff;
-        }
-        .dispatch-month-table th:first-child {
-            z-index: 4;
-            background: #f3f4f6;
-        }
-        .dispatch-month-table th {
-            background: #eff6ff;
-            font-weight: 800;
         }
         @media (max-width: 420px) {
             .dispatch-two-day-row {
@@ -1327,46 +910,21 @@ def inject_dispatch_calendar_css():
     )
 
 
-def escape_html(value):
-    return html.escape(clean_value(value), quote=True)
-
-
-def build_customer_detail_link(customer_name, label=None, class_name="dispatch-month-link"):
-    """配車カレンダーから顧客詳細へ移動するリンクを作る"""
-    customer = clean_value(customer_name, blank_text="").strip()
-
-    if not customer:
-        return escape_html(label or customer_name)
-
-    link_label = label or customer
-    url = make_app_url(page="detail", customer=customer)
-    return f'<a class="{class_name}" href="{url}" target="_self">{escape_html(link_label)}</a>'
-
-
-def handle_customer_query_param():
-    """旧リンク互換用。URLの顧客名を消さず、ブラウザ戻るに使えるよう保持する。"""
-    sync_page_from_query_params()
-
-
-def build_two_day_panel_html(target_day, items):
-    parts = [
-        '<div class="dispatch-day-panel">',
-        f'<div class="dispatch-day-title">{html.escape(format_month_day(target_day))}</div>',
-    ]
+def render_two_day_column(target_day, items):
+    st.markdown(f"**{format_month_day(target_day)}**")
 
     if not items:
-        parts.append('<div class="dispatch-empty">予定なし</div>')
-    else:
-        for item in items:
-            customer_link = build_customer_detail_link(item.get("顧客名"), class_name="dispatch-month-link")
-            parts.append('<div class="dispatch-item">')
-            parts.append(f'<div class="dispatch-name">👤 {customer_link}</div>')
-            parts.append(f'<div class="dispatch-line">地域：{escape_html(item.get("地域"))}</div>')
-            parts.append(f'<div class="dispatch-line">商品：{escape_html(item.get("商品名"))}</div>')
-            parts.append('</div>')
+        st.caption("予定なし")
+        return
 
-    parts.append('</div>')
-    return "".join(parts)
+    for item_index, item in enumerate(items):
+        with st.container(border=True):
+            st.markdown(f"**👤 {clean_value(item.get('顧客名'))}**")
+            st.write(f"地域：{clean_value(item.get('地域'))}")
+            st.write(f"商品：{clean_value(item.get('商品名'))}")
+
+        if item_index < len(items) - 1:
+            st.write("")
 
 
 def show_dispatch_month_switcher(month_start):
@@ -1391,7 +949,6 @@ def show_dispatch_month_switcher(month_start):
 
 def show_two_day_dispatch_calendar(rows_by_day, month_start):
     st.subheader("📱 2日表示")
-    st.caption("スマホでも2日分を横並びで表示します。")
 
     last_day = calendar.monthrange(month_start.year, month_start.month)[1]
 
@@ -1399,23 +956,28 @@ def show_two_day_dispatch_calendar(rows_by_day, month_start):
         day1 = date(month_start.year, month_start.month, day_num)
         day2 = date(month_start.year, month_start.month, day_num + 1) if day_num + 1 <= last_day else None
 
-        left_panel = build_two_day_panel_html(day1, rows_by_day.get(day1, []))
-        right_panel = build_two_day_panel_html(day2, rows_by_day.get(day2, [])) if day2 else '<div></div>'
+        col1, col2 = st.columns(2)
 
-        st.markdown(
-            f'<div class="dispatch-two-day-row">{left_panel}{right_panel}</div>',
-            unsafe_allow_html=True,
-        )
+        with col1:
+            render_two_day_column(day1, rows_by_day.get(day1, []))
+
+        with col2:
+            if day2:
+                render_two_day_column(day2, rows_by_day.get(day2, []))
+            else:
+                st.write("")
+
+        st.markdown("---")
+
 
 def format_month_cell_item(item):
     customer_name = clean_value(item.get("顧客名"))
     product_name = clean_value(item.get("商品名"))
-    customer_link = build_customer_detail_link(customer_name, class_name="dispatch-month-link")
 
     if product_name == "未設定":
-        return customer_link
+        return customer_name
 
-    return f'{customer_link}<br><span class="dispatch-month-product">{escape_html(product_name)}</span>'
+    return f"{customer_name}/{product_name}"
 
 
 def make_month_dispatch_table(rows_by_day, month_start):
@@ -1442,46 +1004,29 @@ def make_month_dispatch_table(rows_by_day, month_start):
 
 def show_month_dispatch_calendar(rows_by_day, month_start):
     st.subheader("🗓 月表示")
-    st.caption("横スクロールで1か月分を確認できます。日付列は固定表示します。")
+    st.caption("横スクロールで1か月分を確認できます。")
 
     month_df = make_month_dispatch_table(rows_by_day, month_start)
+    column_config = {
+        "月/日": st.column_config.TextColumn("月/日", width="small"),
+    }
 
-    header_cells = "".join(
-        f'<th>{html.escape(str(column))}</th>'
-        for column in month_df.columns
+    for column_name in month_df.columns:
+        if column_name != "月/日":
+            column_config[column_name] = st.column_config.TextColumn(column_name, width="medium")
+
+    st.dataframe(
+        month_df,
+        hide_index=True,
+        use_container_width=True,
+        height=min(760, 38 * (len(month_df) + 1)),
+        column_config=column_config,
     )
 
-    body_rows = []
-    for _, row in month_df.iterrows():
-        row_cells = []
-        for column in month_df.columns:
-            value = row[column]
-            if str(value) == "nan":
-                cell_value = ""
-            elif column == "月/日":
-                cell_value = html.escape(str(value))
-            else:
-                cell_value = str(value)
-            row_cells.append(f"<td>{cell_value}</td>")
-        cells = "".join(row_cells)
-        body_rows.append(f"<tr>{cells}</tr>")
-
-    table_html = f"""
-    <div class="dispatch-month-scroll">
-      <table class="dispatch-month-table">
-        <thead><tr>{header_cells}</tr></thead>
-        <tbody>{''.join(body_rows)}</tbody>
-      </table>
-    </div>
-    """
-
-    st.markdown(table_html, unsafe_allow_html=True)
 
 def show_dispatch_calendar(df):
     st.markdown("---")
     st.header("🗓 配車カレンダー")
-    show_back_home_button("calendar_back_home")
-
     inject_dispatch_calendar_css()
 
     if df.empty:
@@ -1519,27 +1064,6 @@ def show_dispatch_calendar(df):
         show_month_dispatch_calendar(rows_by_day, month_start)
 
 
-
-# =========================
-# ホームメニュー
-# =========================
-def show_home_menu():
-    st.subheader("メニュー")
-
-    col1, col2 = st.columns(2)
-    with col1:
-        st.markdown(render_page_link("🔍 顧客検索", page="home"), unsafe_allow_html=True)
-    with col2:
-        st.markdown(render_page_link("📍 地域検索", page="region"), unsafe_allow_html=True)
-
-    col3, col4 = st.columns(2)
-    with col3:
-        st.markdown(render_page_link("🗓 配車カレンダー", page="calendar"), unsafe_allow_html=True)
-    with col4:
-        st.markdown(render_page_link("📅 配達予定一覧", page="delivery"), unsafe_allow_html=True)
-
-    st.markdown("---")
-
 # =========================
 # メイン
 # =========================
@@ -1549,39 +1073,48 @@ if "page" not in st.session_state:
 if "selected_customer" not in st.session_state:
     st.session_state["selected_customer"] = None
 
-# URLにpage/customerがある場合は、ブラウザの戻る・進むに合わせて画面を復元する。
-handle_customer_query_param()
-
 
 MENU_OPTIONS = {
     "🔍 顧客検索": "home",
-    "📍 地域検索": "region",
-    "🗓 配車カレンダー": "calendar",
     "📅 配達予定一覧": "delivery",
+    "🗓 配車カレンダー": "calendar",
 }
 
 current_page = st.session_state.get("page", "home")
+menu_pages = list(MENU_OPTIONS.values())
+menu_labels = list(MENU_OPTIONS.keys())
+
+if current_page in menu_pages:
+    current_menu_index = menu_pages.index(current_page)
+else:
+    current_menu_index = 0
 
 with st.sidebar:
     st.title("🚚 青山商店")
     st.caption("業務アプリ")
-    st.markdown("### メニュー")
-    st.markdown(render_page_link("🔍 顧客検索", page="home"), unsafe_allow_html=True)
-    st.markdown(render_page_link("📍 地域検索", page="region"), unsafe_allow_html=True)
-    st.markdown(render_page_link("🗓 配車カレンダー", page="calendar"), unsafe_allow_html=True)
-    st.markdown(render_page_link("📅 配達予定一覧", page="delivery"), unsafe_allow_html=True)
 
-    st.markdown("---")
-    if st.button("🔄 データ更新", use_container_width=True):
-        st.cache_data.clear()
+    selected_menu = st.radio(
+        "メニュー",
+        menu_labels,
+        index=current_menu_index,
+    )
+
+selected_page = MENU_OPTIONS[selected_menu]
+
+if st.session_state["page"] == "detail":
+    if selected_page != "home":
+        st.session_state["page"] = selected_page
+        st.session_state["selected_customer"] = None
         st.rerun()
+else:
+    st.session_state["page"] = selected_page
 
 
 col_title, col_logout = st.columns([3, 1])
 
 with col_title:
     st.title(f"🚚 {APP_TITLE}")
-    st.caption("顧客検索・地域検索・配車カレンダー・配達予定")
+    st.caption("顧客検索・配達予定・配車カレンダー")
 
 with col_logout:
     st.write("")
@@ -1589,32 +1122,34 @@ with col_logout:
         st.session_state.authenticated = False
         st.session_state.page = "home"
         st.session_state.selected_customer = None
-        try:
-            st.query_params.clear()
-        except Exception:
-            pass
         st.rerun()
 
-try:
-    df = load_data()
-except Exception as e:
-    st.error("ログイン後のデータ読み込み中にエラーが発生しました。")
-    st.write("白画面になる原因を確認するため、エラー内容を表示しています。")
-    st.exception(e)
-    st.stop()
+df = load_data()
 
 if st.session_state["page"] == "home":
-    show_home_menu()
     show_customer_search(df)
 
-elif st.session_state["page"] == "region":
-    show_region_search(df)
+    st.markdown("---")
+    st.subheader("📅 配達予定一覧")
+    st.caption("過去7日 ～ 1か月後")
 
-elif st.session_state["page"] == "calendar":
-    show_dispatch_calendar(df)
+    if st.button("配達予定一覧を見る"):
+        set_page("delivery")
+        st.rerun()
+
+    st.markdown("---")
+    st.subheader("🗓 配車カレンダー")
+    st.caption("2日表示 / 月表示で配車予定を確認できます。")
+
+    if st.button("配車カレンダーを見る"):
+        set_page("calendar")
+        st.rerun()
 
 elif st.session_state["page"] == "delivery":
     show_delivery_list(df)
+
+elif st.session_state["page"] == "calendar":
+    show_dispatch_calendar(df)
 
 elif st.session_state["page"] == "detail":
     selected = st.session_state.get("selected_customer")
