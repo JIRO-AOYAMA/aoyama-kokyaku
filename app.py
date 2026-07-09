@@ -2,7 +2,6 @@ import calendar
 import json
 import math
 from datetime import date, timedelta
-from html import escape
 from io import BytesIO
 from pathlib import Path
 
@@ -15,6 +14,14 @@ import streamlit as st
 # 基本設定
 # =========================
 APP_TITLE = "青山商店 業務アプリ"
+
+# Streamlitでは、st.set_page_config は他の st.* 呼び出しより先に実行する
+st.set_page_config(
+    page_title=APP_TITLE,
+    page_icon="🚚",
+    layout="centered",
+)
+
 EXCEL_FILE = "配車予定 次郎.xlsm"
 SHEET_NAME = "Sheet1"
 
@@ -52,15 +59,6 @@ REQUIRED_COLUMN_CANDIDATES = {
 
 
 # =========================
-# Streamlit設定
-# =========================
-st.set_page_config(
-    page_title=APP_TITLE,
-    page_icon="🚚",
-    layout="centered",
-)
-
-# =========================
 # ログイン認証
 # =========================
 if "authenticated" not in st.session_state:
@@ -79,6 +77,8 @@ if not st.session_state.authenticated:
     if st.button("ログイン"):
         if password == APP_PASSWORD:
             st.session_state.authenticated = True
+            st.session_state.page = "home"
+            st.session_state.selected_customer = None
             st.rerun()
         else:
             st.error("パスワードが違います。")
@@ -909,48 +909,21 @@ def inject_dispatch_calendar_css():
     )
 
 
-def render_two_day_cell(target_day, items):
-    cell_style = (
-        "width:50%;vertical-align:top;border:1px solid rgba(49,51,63,0.18);"
-        "border-radius:8px;background:#ffffff;color:#111827!important;"
-        "padding:8px;overflow:visible;"
-    )
-    title_style = (
-        "display:block;color:#111827!important;background:#f3f4f6;"
-        "border-radius:6px;font-size:13px;font-weight:700;line-height:1.35;"
-        "margin-bottom:8px;padding:4px;text-align:center;"
-        "white-space:normal;overflow-wrap:anywhere;"
-    )
-    name_style = (
-        "display:block;color:#111827!important;font-size:13px;font-weight:700;"
-        "line-height:1.35;white-space:normal;overflow-wrap:anywhere;"
-    )
-    line_style = (
-        "display:block;color:#374151!important;font-size:12px;line-height:1.45;"
-        "white-space:normal;overflow-wrap:anywhere;"
-    )
-
-    html_parts = [
-        f'<td style="{cell_style}">',
-        f'<div class="dispatch-day-title" style="{title_style}">{escape(format_month_day(target_day))}</div>',
-    ]
+def render_two_day_column(target_day, items):
+    st.markdown(f"**{format_month_day(target_day)}**")
 
     if not items:
-        html_parts.append('<div class="dispatch-empty">予定なし</div>')
-    else:
-        for item in items:
-            html_parts.extend(
-                [
-                    '<div class="dispatch-item">',
-                    f'<div class="dispatch-name" style="{name_style}">👤 顧客：{escape(item["顧客名"])}</div>',
-                    f'<div class="dispatch-line" style="{line_style}">地域：{escape(item["地域"])}</div>',
-                    f'<div class="dispatch-line" style="{line_style}">商品：{escape(item["商品名"])}</div>',
-                    '</div>',
-                ]
-            )
+        st.caption("予定なし")
+        return
 
-    html_parts.append("</td>")
-    return "\n".join(html_parts)
+    for item_index, item in enumerate(items):
+        with st.container(border=True):
+            st.markdown(f"**👤 {clean_value(item.get('顧客名'))}**")
+            st.write(f"地域：{clean_value(item.get('地域'))}")
+            st.write(f"商品：{clean_value(item.get('商品名'))}")
+
+        if item_index < len(items) - 1:
+            st.write("")
 
 
 def show_dispatch_month_switcher(month_start):
@@ -982,24 +955,18 @@ def show_two_day_dispatch_calendar(rows_by_day, month_start):
         day1 = date(month_start.year, month_start.month, day_num)
         day2 = date(month_start.year, month_start.month, day_num + 1) if day_num + 1 <= last_day else None
 
-        left_panel = render_two_day_cell(day1, rows_by_day.get(day1, []))
-        if day2:
-            right_panel = render_two_day_cell(day2, rows_by_day.get(day2, []))
-        else:
-            right_panel = (
-                '<td style="width:50%;vertical-align:top;border:1px solid rgba(49,51,63,0.18);'
-                'border-radius:8px;background:#ffffff;padding:8px;">&nbsp;</td>'
-            )
+        col1, col2 = st.columns(2)
 
-        st.markdown(
-            (
-                '<table style="width:100%;table-layout:fixed;border-collapse:separate;'
-                'border-spacing:6px 0;margin:8px 0 14px;">'
-                f'<tr>{left_panel}{right_panel}</tr>'
-                '</table>'
-            ),
-            unsafe_allow_html=True,
-        )
+        with col1:
+            render_two_day_column(day1, rows_by_day.get(day1, []))
+
+        with col2:
+            if day2:
+                render_two_day_column(day2, rows_by_day.get(day2, []))
+            else:
+                st.write("")
+
+        st.markdown("---")
 
 
 def format_month_cell_item(item):
@@ -1093,4 +1060,108 @@ def show_dispatch_calendar(df):
     if view == "📱 2日表示":
         show_two_day_dispatch_calendar(rows_by_day, month_start)
     else:
-        show_mont
+        show_month_dispatch_calendar(rows_by_day, month_start)
+
+
+# =========================
+# メイン
+# =========================
+if "page" not in st.session_state:
+    st.session_state["page"] = "home"
+
+if "selected_customer" not in st.session_state:
+    st.session_state["selected_customer"] = None
+
+
+MENU_OPTIONS = {
+    "🔍 顧客検索": "home",
+    "📅 配達予定一覧": "delivery",
+    "🗓 配車カレンダー": "calendar",
+}
+
+current_page = st.session_state.get("page", "home")
+menu_pages = list(MENU_OPTIONS.values())
+menu_labels = list(MENU_OPTIONS.keys())
+
+if current_page in menu_pages:
+    current_menu_index = menu_pages.index(current_page)
+else:
+    current_menu_index = 0
+
+with st.sidebar:
+    st.title("🚚 青山商店")
+    st.caption("業務アプリ")
+
+    selected_menu = st.radio(
+        "メニュー",
+        menu_labels,
+        index=current_menu_index,
+    )
+
+selected_page = MENU_OPTIONS[selected_menu]
+
+if st.session_state["page"] == "detail":
+    if selected_page != "home":
+        st.session_state["page"] = selected_page
+        st.session_state["selected_customer"] = None
+        st.rerun()
+else:
+    st.session_state["page"] = selected_page
+
+
+col_title, col_logout = st.columns([3, 1])
+
+with col_title:
+    st.title(f"🚚 {APP_TITLE}")
+    st.caption("顧客検索・配達予定・配車カレンダー")
+
+with col_logout:
+    st.write("")
+    if st.button("ログアウト"):
+        st.session_state.authenticated = False
+        st.session_state.page = "home"
+        st.session_state.selected_customer = None
+        st.rerun()
+
+try:
+    df = load_data()
+except Exception as e:
+    st.error("ログイン後のデータ読み込み中にエラーが発生しました。")
+    st.write("白画面になる原因を確認するため、エラー内容を表示しています。")
+    st.exception(e)
+    st.stop()
+
+if st.session_state["page"] == "home":
+    show_customer_search(df)
+
+    st.markdown("---")
+    st.subheader("📅 配達予定一覧")
+    st.caption("過去7日 ～ 1か月後")
+
+    if st.button("配達予定一覧を見る"):
+        set_page("delivery")
+        st.rerun()
+
+    st.markdown("---")
+    st.subheader("🗓 配車カレンダー")
+    st.caption("2日表示 / 月表示で配車予定を確認できます。")
+
+    if st.button("配車カレンダーを見る"):
+        set_page("calendar")
+        st.rerun()
+
+elif st.session_state["page"] == "delivery":
+    show_delivery_list(df)
+
+elif st.session_state["page"] == "calendar":
+    show_dispatch_calendar(df)
+
+elif st.session_state["page"] == "detail":
+    selected = st.session_state.get("selected_customer")
+    if selected:
+        show_customer_detail(df, selected)
+    else:
+        set_page("home")
+        st.rerun()
+
+st.caption("※ このアプリはExcelのSheet1を読み込んで表示しています。Dropbox API設定がある場合はDropbox上のExcelを読み込みます。")
