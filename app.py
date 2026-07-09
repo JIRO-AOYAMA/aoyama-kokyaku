@@ -66,6 +66,14 @@ REQUIRED_COLUMN_CANDIDATES = {
 if "authenticated" not in st.session_state:
     st.session_state.authenticated = False
 
+# HTMLリンクで画面遷移するとStreamlitのセッションが切れる場合があるため、
+# ログアウトするまではURLパラメータでもログイン状態を保持する。
+try:
+    if st.query_params.get("logged_in", "") == "1":
+        st.session_state.authenticated = True
+except Exception:
+    pass
+
 if not st.session_state.authenticated:
     st.title("🔒 青山商店")
     st.caption("業務アプリ")
@@ -81,6 +89,10 @@ if not st.session_state.authenticated:
             st.session_state.authenticated = True
             st.session_state.page = "home"
             st.session_state.selected_customer = None
+            try:
+                st.query_params["logged_in"] = "1"
+            except Exception:
+                pass
             st.rerun()
         else:
             st.error("パスワードが違います。")
@@ -1044,7 +1056,8 @@ def handle_customer_query_param():
         st.session_state["selected_customer"] = customer
         st.session_state["page"] = "detail"
         try:
-            st.query_params.clear()
+            if "customer" in st.query_params:
+                del st.query_params["customer"]
         except Exception:
             pass
 
@@ -1181,6 +1194,12 @@ def show_month_dispatch_calendar(rows_by_day, month_start):
 def show_dispatch_calendar(df):
     st.markdown("---")
     st.header("🗓 配車カレンダー")
+
+    if st.button("← ホームへ戻る", key="calendar_back_home"):
+        set_page("home")
+        st.session_state["selected_customer"] = None
+        st.rerun()
+
     inject_dispatch_calendar_css()
 
     if df.empty:
@@ -1283,6 +1302,10 @@ with col_logout:
         st.session_state.authenticated = False
         st.session_state.page = "home"
         st.session_state.selected_customer = None
+        try:
+            st.query_params.clear()
+        except Exception:
+            pass
         st.rerun()
 
 try:
