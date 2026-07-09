@@ -91,6 +91,7 @@ if not st.session_state.authenticated:
             st.session_state.selected_customer = None
             try:
                 st.query_params["logged_in"] = "1"
+                st.query_params["page"] = "home"
             except Exception:
                 pass
             st.rerun()
@@ -551,25 +552,72 @@ def load_data():
 # =========================
 # 画面遷移
 # =========================
-def set_page(page_name):
+def get_query_value(key, default=""):
+    """URLパラメータを安全に1つ取り出す"""
+    try:
+        value = st.query_params.get(key, default)
+    except Exception:
+        return default
+
+    if isinstance(value, list):
+        return value[0] if value else default
+
+    return value if value is not None else default
+
+
+def update_query_params(**params):
+    """ブラウザの戻るボタンで戻れるようにURLへ現在画面を残す"""
+    try:
+        # ログイン状態はURLにも残す。ログアウト時だけ消す。
+        st.query_params["logged_in"] = "1"
+
+        for key, value in params.items():
+            if value is None or value == "":
+                if key in st.query_params:
+                    del st.query_params[key]
+            else:
+                st.query_params[key] = str(value)
+    except Exception:
+        pass
+
+
+def sync_page_from_query_params():
+    """URLのpage/customerを読んで、ブラウザ戻る・進むに追従する"""
+    page = str(get_query_value("page", "")).strip()
+    customer = str(get_query_value("customer", "")).strip()
+
+    valid_pages = {"home", "region", "calendar", "delivery", "detail"}
+
+    if page in valid_pages:
+        st.session_state["page"] = page
+
+    if customer:
+        st.session_state["selected_customer"] = customer
+        st.session_state["page"] = "detail"
+
+
+def set_page(page_name, rerun=False):
     st.session_state["page"] = page_name
+
+    if page_name != "detail":
+        st.session_state["selected_customer"] = None
+
+    update_query_params(page=page_name, customer=None)
+
+    if rerun:
+        st.rerun()
 
 
 def select_customer(customer_name, page_name="detail"):
     st.session_state["selected_customer"] = customer_name
     st.session_state["page"] = page_name
+    update_query_params(page=page_name, customer=customer_name)
 
 
 def show_back_home_button(key):
     """各画面からホームへ戻るための共通ボタン"""
     if st.button("← ホームへ戻る", key=key):
-        set_page("home")
-        st.session_state["selected_customer"] = None
-        try:
-            st.query_params.clear()
-        except Exception:
-            pass
-        st.rerun()
+        set_page("home", rerun=True)
 
 
 # =========================
@@ -633,10 +681,18 @@ def show_customer_detail(df, customer_name):
 def show_customer_search(df):
     st.subheader("🔍 顧客検索")
 
+    default_keyword = str(get_query_value("customer_search", "")).strip()
     keyword = st.text_input(
         "ひらがなで検索",
+        value=default_keyword,
         placeholder="例：こ、こも、むら",
+        key="customer_search_input",
     ).strip()
+
+    if keyword:
+        update_query_params(page="home", customer_search=keyword)
+    else:
+        update_query_params(page="home", customer_search=None)
 
     if not keyword:
         st.info("顧客名のひらがなを入力してください。")
@@ -672,10 +728,18 @@ def show_region_search(df):
     st.subheader("📍 地域検索")
     show_back_home_button("region_back_home")
 
+    default_keyword = str(get_query_value("region_search", "")).strip()
     keyword = st.text_input(
         "地域名で検索",
+        value=default_keyword,
         placeholder="例：帯広、芽室、釧路",
+        key="region_search_input",
     ).strip()
+
+    if keyword:
+        update_query_params(page="region", region_search=keyword)
+    else:
+        update_query_params(page="region", region_search=None)
 
     if not keyword:
         st.info("地域名を入力してください。")
@@ -1099,25 +1163,8 @@ def build_customer_detail_link(customer_name, label=None, class_name="dispatch-m
 
 
 def handle_customer_query_param():
-    """HTMLリンクで指定された顧客名を受け取り、顧客詳細画面へ移動する"""
-    try:
-        customer = st.query_params.get("customer", "")
-    except Exception:
-        customer = ""
-
-    if isinstance(customer, list):
-        customer = customer[0] if customer else ""
-
-    customer = str(customer).strip()
-
-    if customer:
-        st.session_state["selected_customer"] = customer
-        st.session_state["page"] = "detail"
-        try:
-            if "customer" in st.query_params:
-                del st.query_params["customer"]
-        except Exception:
-            pass
+    """旧リンク互換用。URLの顧客名を消さず、ブラウザ戻るに使えるよう保持する。"""
+    sync_page_from_query_params()
 
 
 def build_two_day_panel_html(target_day, items):
@@ -1329,6 +1376,7 @@ if "page" not in st.session_state:
 if "selected_customer" not in st.session_state:
     st.session_state["selected_customer"] = None
 
+# URLにpage/customerがある場合は、ブラウザの戻る・進むに合わせて画面を復元する。
 handle_customer_query_param()
 
 
@@ -1367,11 +1415,9 @@ selected_page = MENU_OPTIONS[selected_menu]
 
 if st.session_state["page"] == "detail":
     if selected_page != "home":
-        st.session_state["page"] = selected_page
-        st.session_state["selected_customer"] = None
-        st.rerun()
-else:
-    st.session_state["page"] = selected_page
+        set_page(selected_page, rerun=True)
+elif st.session_state["page"] != selected_page:
+    set_page(selected_page)
 
 
 col_title, col_logout = st.columns([3, 1])
