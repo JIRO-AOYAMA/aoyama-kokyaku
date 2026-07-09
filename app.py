@@ -1036,7 +1036,10 @@ def build_customer_detail_link(customer_name, label=None, class_name="dispatch-m
         return escape_html(label or customer_name)
 
     link_label = label or customer
-    url = f"?customer={urllib.parse.quote(customer)}"
+    # HTMLの<a>リンクで移動するとStreamlitのセッションが切れることがある。
+    # そのため、ログイン済みフラグもURLに残して、ログアウトするまでは再ログイン不要にする。
+    query = urllib.parse.urlencode({"logged_in": "1", "customer": customer})
+    url = f"?{query}"
     return f'<a class="{class_name}" href="{url}" target="_self">{escape_html(link_label)}</a>'
 
 
