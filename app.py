@@ -773,6 +773,34 @@ def insert_note_to_supabase(note):
         show_supabase_response_error("保存", response)
 
 
+def delete_note_from_supabase(note_id):
+    """Supabaseのnotesテーブルからメモを1件削除する"""
+    target_id = clean_value(note_id, blank_text="")
+    if not target_id:
+        st.warning("削除するメモが見つかりません。")
+        return False
+
+    if not has_supabase_config():
+        show_supabase_config_error()
+
+    try:
+        response = requests.delete(
+            get_supabase_notes_url(),
+            headers=get_supabase_headers(prefer="return=minimal"),
+            params={"id": f"eq.{target_id}"},
+            timeout=30,
+        )
+    except Exception as e:
+        st.error("メモ帳の削除中にSupabaseへの接続に失敗しました。")
+        st.exception(e)
+        st.stop()
+
+    if response.status_code not in (200, 204):
+        show_supabase_response_error("削除", response)
+
+    return True
+
+
 def make_note_id():
     return get_jst_now().strftime("%Y%m%d%H%M%S%f")
 
@@ -822,6 +850,34 @@ def render_note_card(note, show_customer=True):
     )
 
 
+def render_note_delete_controls(note):
+    note_id = clean_value(note.get("id"), blank_text="")
+    if not note_id:
+        return
+
+    confirm_key = f"confirm_delete_note_{note_id}"
+
+    if st.session_state.get(confirm_key):
+        st.warning("このメモを削除しますか？")
+        col1, col2 = st.columns(2)
+
+        with col1:
+            if st.button("本当に削除", key=f"delete_note_confirm_{note_id}"):
+                if delete_note_from_supabase(note_id):
+                    st.session_state.pop(confirm_key, None)
+                    st.success("メモを削除しました。")
+                    st.rerun()
+
+        with col2:
+            if st.button("キャンセル", key=f"delete_note_cancel_{note_id}"):
+                st.session_state.pop(confirm_key, None)
+                st.rerun()
+    else:
+        if st.button("削除", key=f"delete_note_start_{note_id}"):
+            st.session_state[confirm_key] = True
+            st.rerun()
+
+
 def show_customer_notes(customer_name):
     st.markdown("---")
     st.subheader("📝 この顧客のメモ")
@@ -850,6 +906,7 @@ def show_customer_notes(customer_name):
     st.markdown("#### メモ履歴")
     for note in customer_notes:
         render_note_card(note, show_customer=False)
+        render_note_delete_controls(note)
 
 
 def show_notes_page(df):
@@ -867,6 +924,7 @@ def show_notes_page(df):
 
     for note in notes:
         render_note_card(note, show_customer=True)
+        render_note_delete_controls(note)
 
 
 
