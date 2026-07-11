@@ -541,9 +541,16 @@ def get_customer_map_info(detail):
         return None
 
 
-def render_google_maps_link(url):
-    safe_url = html.escape(str(url), quote=True)
-    return f'<a class="app-nav-link" href="{safe_url}" target="_blank" rel="noopener noreferrer">📍 Googleマップ</a>'
+def show_google_maps_button(url):
+    """Googleマップを開くボタンを表示する"""
+    safe_url = clean_value(url, blank_text="")
+    if not safe_url:
+        return
+
+    try:
+        st.link_button("📍 Googleマップ", safe_url)
+    except Exception:
+        st.markdown(f"[📍 Googleマップ]({safe_url})")
 
 
 def find_date_column(df):
@@ -1281,7 +1288,7 @@ def show_customer_detail(df, customer_name):
         if map_info:
             st.write(f"**{map_info['display_label']}：** {map_info['display_value']}")
             if map_info["map_url"]:
-                st.markdown(render_google_maps_link(map_info["map_url"]), unsafe_allow_html=True)
+                show_google_maps_button(map_info["map_url"])
     except Exception:
         pass
 
@@ -2071,28 +2078,34 @@ except Exception as e:
     st.exception(e)
     st.stop()
 
-if st.session_state["page"] == "home":
-    show_home_menu()
-    show_customer_search(df)
+try:
+    if st.session_state["page"] == "home":
+        show_home_menu()
+        show_customer_search(df)
 
-elif st.session_state["page"] == "region":
-    show_region_search(df)
+    elif st.session_state["page"] == "region":
+        show_region_search(df)
 
-elif st.session_state["page"] == "calendar":
-    show_dispatch_calendar(df)
+    elif st.session_state["page"] == "calendar":
+        show_dispatch_calendar(df)
 
-elif st.session_state["page"] == "delivery":
-    show_delivery_list(df)
+    elif st.session_state["page"] == "delivery":
+        show_delivery_list(df)
 
-elif st.session_state["page"] == "notes":
-    show_notes_page(df)
+    elif st.session_state["page"] == "notes":
+        show_notes_page(df)
 
-elif st.session_state["page"] == "detail":
-    selected = st.session_state.get("selected_customer")
-    if selected:
-        show_customer_detail(df, selected)
-    else:
-        set_page("home")
-        st.rerun()
+    elif st.session_state["page"] == "detail":
+        selected = st.session_state.get("selected_customer")
+        if selected:
+            show_customer_detail(df, selected)
+        else:
+            set_page("home")
+            st.rerun()
+except Exception as e:
+    st.error("画面表示中にエラーが発生しました。")
+    st.write("原因確認のため、エラー内容を表示しています。")
+    st.exception(e)
+    st.stop()
 
 st.caption("※ このアプリはExcelのSheet1を読み込んで表示しています。Dropbox API設定がある場合はDropbox上のExcelを読み込みます。")
