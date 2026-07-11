@@ -2049,7 +2049,7 @@ with st.sidebar:
     st.markdown(render_page_link("📝 メモ帳", page="notes"), unsafe_allow_html=True)
 
     st.markdown("---")
-    if st.button("🔄 データ更新", use_container_width=True):
+    if st.button("🔄 更新", use_container_width=True):
         st.cache_data.clear()
         st.rerun()
 
