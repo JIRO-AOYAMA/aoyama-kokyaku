@@ -15,7 +15,7 @@ import streamlit as st
 # =========================
 # 基本設定
 # =========================
-APP_TITLE = "青山商店 業務アプリ"
+APP_TITLE = "顧客カルテ"
 
 # Streamlitでは、st.set_page_config は他の st.* 呼び出しより先に実行する
 st.set_page_config(
@@ -105,8 +105,7 @@ except Exception:
     pass
 
 if not st.session_state.authenticated:
-    st.title("🔒 青山商店")
-    st.caption("業務アプリ")
+    st.title("🔒 顧客カルテ")
 
     if not APP_PASSWORD:
         st.error("APP_PASSWORD が設定されていません。Streamlit Cloud の Secrets に APP_PASSWORD を追加してください。")
@@ -2037,8 +2036,7 @@ MENU_OPTIONS = {
 current_page = st.session_state.get("page", "home")
 
 with st.sidebar:
-    st.title("🚚 青山商店")
-    st.caption("業務アプリ")
+    st.title(f"🚚 {APP_TITLE}")
     st.markdown("### メニュー")
     st.markdown(render_page_link("🔍 顧客検索", page="home"), unsafe_allow_html=True)
     st.markdown(render_page_link("📍 地域検索", page="region"), unsafe_allow_html=True)
