@@ -463,26 +463,29 @@ def parse_lat_lng(value):
     """「緯度,経度」形式なら緯度経度を返す"""
     import re
 
-    text = clean_value(value, blank_text="")
-    if not text:
+    try:
+        text = clean_value(value, blank_text="")
+        if not text:
+            return None
+
+        normalized = text.translate(str.maketrans({
+            "０": "0", "１": "1", "２": "2", "３": "3", "４": "4",
+            "５": "5", "６": "6", "７": "7", "８": "8", "９": "9",
+            "．": ".", "，": ",",
+        }))
+        normalized = normalized.replace("、", ",")
+
+        match = re.match(
+            r"^\s*(?:緯度\s*[:：]?\s*)?([-+]?\d+(?:\.\d+)?)\s*[, ]\s*(?:経度\s*[:：]?\s*)?([-+]?\d+(?:\.\d+)?)\s*$",
+            normalized,
+        )
+        if not match:
+            return None
+
+        lat = float(match.group(1))
+        lng = float(match.group(2))
+    except Exception:
         return None
-
-    normalized = text.translate(str.maketrans({
-        "０": "0", "１": "1", "２": "2", "３": "3", "４": "4",
-        "５": "5", "６": "6", "７": "7", "８": "8", "９": "9",
-        "．": ".", "，": ",",
-    }))
-    normalized = normalized.replace("、", ",")
-
-    match = re.match(
-        r"^\s*(?:緯度\s*[:：]?\s*)?([-+]?\d+(?:\.\d+)?)\s*[, ]\s*(?:経度\s*[:：]?\s*)?([-+]?\d+(?:\.\d+)?)\s*$",
-        normalized,
-    )
-    if not match:
-        return None
-
-    lat = float(match.group(1))
-    lng = float(match.group(2))
 
     if -90 <= lat <= 90 and -180 <= lng <= 180:
         return lat, lng
@@ -492,44 +495,50 @@ def parse_lat_lng(value):
 
 def build_google_maps_url(value):
     """住所・緯度経度・URLからGoogleマップで開くURLを作る"""
-    text = clean_value(value, blank_text="")
-    if not text:
+    try:
+        text = clean_value(value, blank_text="")
+        if not text:
+            return ""
+
+        parsed = urllib.parse.urlparse(text)
+        if parsed.scheme in ("http", "https") and parsed.netloc:
+            return text
+
+        lat_lng = parse_lat_lng(text)
+        if lat_lng:
+            lat, lng = lat_lng
+            return f"https://www.google.com/maps/search/?api=1&query={lat},{lng}"
+
+        query = urllib.parse.quote(text)
+        return f"https://www.google.com/maps/search/?api=1&query={query}"
+    except Exception:
         return ""
-
-    parsed = urllib.parse.urlparse(text)
-    if parsed.scheme in ("http", "https") and parsed.netloc:
-        return text
-
-    lat_lng = parse_lat_lng(text)
-    if lat_lng:
-        lat, lng = lat_lng
-        return f"https://www.google.com/maps/search/?api=1&query={lat},{lng}"
-
-    query = urllib.parse.quote(text)
-    return f"https://www.google.com/maps/search/?api=1&query={query}"
 
 
 def get_customer_map_info(detail):
     """顧客詳細で使う住所・地図情報を取り出す"""
-    map_column = find_existing_column(detail, MAP_LOCATION_COLUMN_CANDIDATES)
-    address_column = find_existing_column(detail, ADDRESS_COLUMN_CANDIDATES)
-    map_value = get_first_nonblank_column_value(detail, map_column)
-    address_value = get_first_nonblank_column_value(detail, address_column)
-    target_value = map_value or address_value
+    try:
+        map_column = find_existing_column(detail, MAP_LOCATION_COLUMN_CANDIDATES)
+        address_column = find_existing_column(detail, ADDRESS_COLUMN_CANDIDATES)
+        map_value = get_first_nonblank_column_value(detail, map_column)
+        address_value = get_first_nonblank_column_value(detail, address_column)
+        target_value = map_value or address_value
 
-    if not target_value:
+        if not target_value:
+            return None
+
+        display_value = address_value or map_value
+        display_label = "住所" if address_value else "マップ位置"
+        target_column = map_column if map_value else address_column
+
+        return {
+            "display_label": display_label,
+            "display_value": display_value,
+            "target_column": target_column,
+            "map_url": build_google_maps_url(target_value),
+        }
+    except Exception:
         return None
-
-    display_value = address_value or map_value
-    display_label = "住所" if address_value else "マップ位置"
-    target_column = map_column if map_value else address_column
-
-    return {
-        "display_label": display_label,
-        "display_value": display_value,
-        "target_column": target_column,
-        "map_url": build_google_maps_url(target_value),
-    }
 
 
 def render_google_maps_link(url):
@@ -1267,11 +1276,14 @@ def show_customer_detail(df, customer_name):
     st.write(f"**地域：** {region}")
     st.write(f"**商品数：** {len(visible_detail)}件")
 
-    map_info = get_customer_map_info(detail)
-    if map_info:
-        st.write(f"**{map_info['display_label']}：** {map_info['display_value']}")
-        if map_info["map_url"]:
-            st.markdown(render_google_maps_link(map_info["map_url"]), unsafe_allow_html=True)
+    try:
+        map_info = get_customer_map_info(detail)
+        if map_info:
+            st.write(f"**{map_info['display_label']}：** {map_info['display_value']}")
+            if map_info["map_url"]:
+                st.markdown(render_google_maps_link(map_info["map_url"]), unsafe_allow_html=True)
+    except Exception:
+        pass
 
     if visible_detail.empty:
         st.info("表示対象の商品はありません。使用数量/日が0または空白の商品は非表示にしています。")
