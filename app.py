@@ -182,13 +182,6 @@ st.markdown(
         letter-spacing: -0.03em;
     }
 
-    div[data-testid="stVerticalBlockBorderWrapper"] {
-        border: 1px solid var(--aoyama-line) !important;
-        border-radius: 18px !important;
-        background: var(--aoyama-card) !important;
-        box-shadow: var(--aoyama-shadow);
-    }
-
     .app-nav-link {
         display: flex;
         align-items: center;
@@ -285,6 +278,17 @@ st.markdown(
             padding-right: 0.8rem;
             padding-top: 1.4rem;
         }
+
+        /* Streamlit 1.38で列が縦に崩れないようにする */
+        [data-testid="stHorizontalBlock"] {
+            flex-wrap: nowrap !important;
+            align-items: center !important;
+            gap: 0.6rem !important;
+        }
+        [data-testid="stHorizontalBlock"] > div {
+            min-width: 0 !important;
+        }
+
         .app-nav-link {
             min-height: 3.1rem;
             border-radius: 14px;
