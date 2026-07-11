@@ -1,7 +1,9 @@
 import calendar
+import html
 import json
 import math
-from datetime import date, timedelta
+import urllib.parse
+from datetime import date, datetime, timedelta, timezone
 from io import BytesIO
 from pathlib import Path
 
@@ -13,13 +15,13 @@ import streamlit as st
 # =========================
 # 基本設定
 # =========================
-APP_TITLE = "青山商店 業務アプリ"
+APP_TITLE = "顧客カルテ"
 
 # Streamlitでは、st.set_page_config は他の st.* 呼び出しより先に実行する
 st.set_page_config(
     page_title=APP_TITLE,
     page_icon="🚚",
-    layout="centered",
+    layout="wide",
 )
 
 EXCEL_FILE = "配車予定 次郎.xlsm"
@@ -34,6 +36,11 @@ DROPBOX_ACCESS_TOKEN = st.secrets.get("DROPBOX_ACCESS_TOKEN", "")
 DROPBOX_DEFAULT_FILE_PATH = "/1共有　青山商店　本社/配車表-北海道-/配車予定 次郎.xlsm"
 DROPBOX_FILE_PATH = st.secrets.get("DROPBOX_FILE_PATH", DROPBOX_DEFAULT_FILE_PATH)
 APP_PASSWORD = st.secrets.get("APP_PASSWORD", "")
+SUPABASE_URL = st.secrets.get("SUPABASE_URL", "")
+SUPABASE_SECRET_KEY = st.secrets.get("SUPABASE_SECRET_KEY", "")
+SUPABASE_SERVICE_ROLE_KEY = st.secrets.get("SUPABASE_SERVICE_ROLE_KEY", "")
+SUPABASE_ANON_KEY = st.secrets.get("SUPABASE_ANON_KEY", "")
+SUPABASE_NOTES_TABLE = st.secrets.get("SUPABASE_NOTES_TABLE", "notes")
 
 REQUIRED_COLUMNS = [
     "ID",
@@ -57,6 +64,31 @@ REQUIRED_COLUMN_CANDIDATES = {
     "ひらがな": ["ひらがな", "ふりがな", "フリガナ", "かな", "カナ", "よみがな", "読み仮名"],
 }
 
+ADDRESS_COLUMN_CANDIDATES = [
+    "住所",
+    "所在地",
+    "配達先住所",
+    "配送先住所",
+    "納品先住所",
+    "顧客住所",
+    "牧場住所",
+]
+
+MAP_LOCATION_COLUMN_CANDIDATES = [
+    "マップ位置",
+    "地図位置",
+    "Googleマップ",
+    "GoogleマップURL",
+    "Google Maps",
+    "Google Map",
+    "マップURL",
+    "地図URL",
+    "位置情報",
+    "緯度経度",
+    "緯度・経度",
+    "座標",
+]
+
 
 # =========================
 # ログイン認証
@@ -64,9 +96,16 @@ REQUIRED_COLUMN_CANDIDATES = {
 if "authenticated" not in st.session_state:
     st.session_state.authenticated = False
 
+# HTMLリンクで画面遷移するとStreamlitのセッションが切れる場合があるため、
+# ログアウトするまではURLパラメータでもログイン状態を保持する。
+try:
+    if st.query_params.get("logged_in", "") == "1":
+        st.session_state.authenticated = True
+except Exception:
+    pass
+
 if not st.session_state.authenticated:
-    st.title("🔒 青山商店")
-    st.caption("業務アプリ")
+    st.title("🔒 顧客カルテ")
 
     if not APP_PASSWORD:
         st.error("APP_PASSWORD が設定されていません。Streamlit Cloud の Secrets に APP_PASSWORD を追加してください。")
@@ -79,12 +118,192 @@ if not st.session_state.authenticated:
             st.session_state.authenticated = True
             st.session_state.page = "home"
             st.session_state.selected_customer = None
+            try:
+                st.query_params["logged_in"] = "1"
+                st.query_params["page"] = "home"
+            except Exception:
+                pass
             st.rerun()
         else:
             st.error("パスワードが違います。")
 
     st.stop()
 
+
+
+# =========================
+# 共通CSS
+# =========================
+st.markdown(
+    """
+    <style>
+    :root {
+        --aoyama-bg: #f6f7fb;
+        --aoyama-card: rgba(255, 255, 255, 0.92);
+        --aoyama-line: rgba(15, 23, 42, 0.10);
+        --aoyama-text: #172033;
+        --aoyama-muted: #667085;
+        --aoyama-blue: #2563eb;
+        --aoyama-green: #0f766e;
+        --aoyama-shadow: 0 12px 32px rgba(15, 23, 42, 0.08);
+    }
+
+    .stApp {
+        background:
+            radial-gradient(circle at top left, rgba(37, 99, 235, 0.13), transparent 28rem),
+            radial-gradient(circle at top right, rgba(15, 118, 110, 0.11), transparent 24rem),
+            linear-gradient(180deg, #f8fafc 0%, #eef2f7 100%);
+        color: var(--aoyama-text);
+    }
+
+    [data-testid="stHeader"] {
+        background: rgba(255, 255, 255, 0.72);
+        backdrop-filter: blur(12px);
+        border-bottom: 1px solid rgba(15, 23, 42, 0.06);
+    }
+
+    [data-testid="stSidebar"] {
+        background: linear-gradient(180deg, #0f172a 0%, #1e293b 100%);
+    }
+    [data-testid="stSidebar"] * {
+        color: #f8fafc !important;
+    }
+    [data-testid="stSidebar"] hr {
+        border-color: rgba(255, 255, 255, 0.15);
+    }
+
+    .block-container {
+        padding-top: 2.2rem;
+        padding-bottom: 3rem;
+        max-width: 1120px;
+    }
+
+    h1, h2, h3 {
+        letter-spacing: -0.03em;
+    }
+
+    div[data-testid="stVerticalBlockBorderWrapper"] {
+        border: 1px solid var(--aoyama-line) !important;
+        border-radius: 18px !important;
+        background: var(--aoyama-card) !important;
+        box-shadow: var(--aoyama-shadow);
+    }
+
+    .app-nav-link {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        width: 100%;
+        min-height: 3.4rem;
+        box-sizing: border-box;
+        text-align: center;
+        text-decoration: none !important;
+        padding: 0.75rem 0.9rem;
+        margin: 0.32rem 0;
+        border: 1px solid rgba(15, 23, 42, 0.08);
+        border-radius: 16px;
+        color: #172033 !important;
+        background: linear-gradient(180deg, #ffffff 0%, #f8fafc 100%);
+        font-weight: 800;
+        box-shadow: 0 8px 22px rgba(15, 23, 42, 0.07);
+        transition: transform 0.14s ease, box-shadow 0.14s ease, border-color 0.14s ease;
+    }
+    .app-nav-link:hover {
+        transform: translateY(-1px);
+        border-color: rgba(37, 99, 235, 0.32);
+        box-shadow: 0 14px 32px rgba(37, 99, 235, 0.13);
+        background: linear-gradient(180deg, #ffffff 0%, #eff6ff 100%);
+    }
+
+    [data-testid="stSidebar"] .app-nav-link {
+        justify-content: flex-start;
+        min-height: 2.9rem;
+        color: #f8fafc !important;
+        background: rgba(255, 255, 255, 0.08);
+        border-color: rgba(255, 255, 255, 0.12);
+        box-shadow: none;
+    }
+    [data-testid="stSidebar"] .app-nav-link:hover {
+        background: rgba(255, 255, 255, 0.16);
+        border-color: rgba(255, 255, 255, 0.28);
+        transform: none;
+    }
+
+    .stButton > button {
+        border-radius: 14px !important;
+        border: 1px solid rgba(15, 23, 42, 0.10) !important;
+        background: linear-gradient(180deg, #ffffff 0%, #f8fafc 100%) !important;
+        box-shadow: 0 6px 18px rgba(15, 23, 42, 0.07);
+        font-weight: 700 !important;
+    }
+    .stButton > button:hover {
+        border-color: rgba(37, 99, 235, 0.35) !important;
+        box-shadow: 0 10px 24px rgba(37, 99, 235, 0.12);
+    }
+
+    .stTextInput input {
+        border-radius: 14px !important;
+        border: 1px solid rgba(15, 23, 42, 0.13) !important;
+        background: rgba(255,255,255,0.92) !important;
+        padding: 0.72rem 0.9rem !important;
+    }
+
+    [data-testid="stMetricValue"], .stCaptionContainer {
+        color: var(--aoyama-muted);
+    }
+
+    hr {
+        margin: 1.4rem 0;
+        border-color: rgba(15, 23, 42, 0.08);
+    }
+
+    .note-card {
+        border: 1px solid rgba(15, 23, 42, 0.10);
+        border-radius: 16px;
+        background: rgba(255, 255, 255, 0.92);
+        box-shadow: 0 8px 22px rgba(15, 23, 42, 0.06);
+        padding: 0.9rem 1rem;
+        margin: 0.65rem 0;
+    }
+    .note-meta {
+        color: #667085;
+        font-size: 0.86rem;
+        margin-bottom: 0.35rem;
+    }
+    .note-body {
+        color: #172033;
+        font-size: 1rem;
+        line-height: 1.65;
+        white-space: pre-wrap;
+        word-break: break-word;
+    }
+
+
+    @media (max-width: 640px) {
+        .block-container {
+            padding-left: 0.8rem;
+            padding-right: 0.8rem;
+            padding-top: 1.4rem;
+        }
+        .app-nav-link {
+            min-height: 3.1rem;
+            border-radius: 14px;
+            font-size: 0.95rem;
+        }
+        h1 {
+            font-size: 1.55rem !important;
+        }
+        h2 {
+            font-size: 1.25rem !important;
+        }
+        h3 {
+            font-size: 1.08rem !important;
+        }
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
 # =========================
 # 表示用の整形
@@ -168,6 +387,42 @@ def format_number(value, decimal=1, blank_text="未設定"):
         return text
 
 
+def is_blank_or_zero(value):
+    """空白・NaN・0ならTrue。使用数量/日を非表示にする判定用。
+
+    Excelから「0」「0.0」「０」「０．０」「0 kg」のような文字列で来ても
+    0として扱えるように少し広めに判定する。
+    """
+    if value is None:
+        return True
+
+    if isinstance(value, float) and math.isnan(value):
+        return True
+
+    text = str(value).strip()
+
+    if text == "" or text.lower() == "nan" or text.startswith("#"):
+        return True
+
+    # 全角数字・全角小数点・カンマを整理
+    normalized = text.translate(str.maketrans({
+        "０": "0", "１": "1", "２": "2", "３": "3", "４": "4",
+        "５": "5", "６": "6", "７": "7", "８": "8", "９": "9",
+        "．": ".", "，": ",",
+    })).replace(",", "")
+
+    # 単位などが付いていても、先頭の数値だけ取り出して判定
+    import re
+    match = re.match(r"^[-+]?\d+(?:\.\d+)?", normalized)
+    if not match:
+        return False
+
+    try:
+        return float(match.group(0)) == 0
+    except Exception:
+        return False
+
+
 def find_existing_column(df, candidates):
     """候補名の中から、Excelに存在する列名を1つ探す"""
     for candidate in candidates:
@@ -188,6 +443,113 @@ def find_required_column_mapping(column_names):
                 break
 
     return mapping
+
+
+def get_first_nonblank_column_value(df, column_name):
+    """指定列から最初の空でない値を取り出す"""
+    if not column_name or column_name not in df.columns:
+        return ""
+
+    for value in df[column_name].tolist():
+        text = clean_value(value, blank_text="")
+        if text:
+            return text
+
+    return ""
+
+
+def parse_lat_lng(value):
+    """「緯度,経度」形式なら緯度経度を返す"""
+    import re
+
+    try:
+        text = clean_value(value, blank_text="")
+        if not text:
+            return None
+
+        normalized = text.translate(str.maketrans({
+            "０": "0", "１": "1", "２": "2", "３": "3", "４": "4",
+            "５": "5", "６": "6", "７": "7", "８": "8", "９": "9",
+            "．": ".", "，": ",",
+        }))
+        normalized = normalized.replace("、", ",")
+
+        match = re.match(
+            r"^\s*(?:緯度\s*[:：]?\s*)?([-+]?\d+(?:\.\d+)?)\s*[, ]\s*(?:経度\s*[:：]?\s*)?([-+]?\d+(?:\.\d+)?)\s*$",
+            normalized,
+        )
+        if not match:
+            return None
+
+        lat = float(match.group(1))
+        lng = float(match.group(2))
+    except Exception:
+        return None
+
+    if -90 <= lat <= 90 and -180 <= lng <= 180:
+        return lat, lng
+
+    return None
+
+
+def build_google_maps_url(value):
+    """住所・緯度経度・URLからGoogleマップで開くURLを作る"""
+    try:
+        text = clean_value(value, blank_text="")
+        if not text:
+            return ""
+
+        parsed = urllib.parse.urlparse(text)
+        if parsed.scheme in ("http", "https") and parsed.netloc:
+            return text
+
+        lat_lng = parse_lat_lng(text)
+        if lat_lng:
+            lat, lng = lat_lng
+            return f"https://www.google.com/maps/search/?api=1&query={lat},{lng}"
+
+        query = urllib.parse.quote(text)
+        return f"https://www.google.com/maps/search/?api=1&query={query}"
+    except Exception:
+        return ""
+
+
+def get_customer_map_info(detail):
+    """顧客詳細で使う住所・地図情報を取り出す"""
+    try:
+        map_column = find_existing_column(detail, MAP_LOCATION_COLUMN_CANDIDATES)
+        address_column = find_existing_column(detail, ADDRESS_COLUMN_CANDIDATES)
+        map_value = get_first_nonblank_column_value(detail, map_column)
+        address_value = get_first_nonblank_column_value(detail, address_column)
+        target_value = map_value or address_value
+
+        if not target_value:
+            return None
+
+        display_value = address_value or map_value
+        display_label = "住所" if address_value else "マップ位置"
+        target_column = map_column if map_value else address_column
+
+        return {
+            "display_label": display_label,
+            "display_value": display_value,
+            "target_column": target_column,
+            "map_url": build_google_maps_url(target_value),
+        }
+    except Exception:
+        return None
+
+
+def show_google_maps_button(url):
+    """Googleマップを開くボタンを表示する"""
+    safe_url = clean_value(url, blank_text="")
+    if not safe_url:
+        return
+
+    try:
+        st.link_button("📍 Googleマップ", safe_url)
+    except Exception:
+        st.markdown(f"[📍 Googleマップ]({safe_url})")
 
 
 def find_date_column(df):
@@ -395,6 +757,307 @@ def read_excel_local():
 
     return excel_path
 
+# =========================
+# メモ帳（Supabase保存）
+# =========================
+def get_jst_now():
+    """日本時間の現在日時を返す"""
+    return datetime.now(timezone(timedelta(hours=9)))
+
+
+def format_note_datetime(value):
+    """ISO形式の日時を見やすく表示する"""
+    try:
+        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if dt.tzinfo is not None:
+            dt = dt.astimezone(timezone(timedelta(hours=9)))
+        return dt.strftime("%Y/%m/%d %H:%M")
+    except Exception:
+        return clean_value(value, blank_text="")
+
+
+def get_supabase_key():
+    """Supabaseへ接続するキーを返す。StreamlitではSecrets内だけに置く。"""
+    return str(SUPABASE_SECRET_KEY or SUPABASE_SERVICE_ROLE_KEY or SUPABASE_ANON_KEY or "").strip()
+
+
+def has_supabase_config():
+    return bool(str(SUPABASE_URL or "").strip() and get_supabase_key())
+
+
+def get_supabase_notes_table():
+    table_name = str(SUPABASE_NOTES_TABLE or "notes").strip()
+
+    if not table_name.replace("_", "").isalnum():
+        st.error("Supabaseのメモ帳テーブル名が正しくありません。")
+        st.write("SUPABASE_NOTES_TABLE は英数字とアンダースコアだけで指定してください。")
+        st.stop()
+
+    return table_name
+
+
+def get_supabase_notes_url():
+    base_url = str(SUPABASE_URL or "").strip().rstrip("/")
+    table_name = urllib.parse.quote(get_supabase_notes_table(), safe="")
+    return f"{base_url}/rest/v1/{table_name}"
+
+
+def get_supabase_headers(prefer=None):
+    key = get_supabase_key()
+    headers = {
+        "apikey": key,
+        "Authorization": f"Bearer {key}",
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+    }
+    if prefer:
+        headers["Prefer"] = prefer
+    return headers
+
+
+def show_supabase_config_error():
+    st.error("メモ帳を使うにはSupabase設定が必要です。")
+    st.write("Streamlit Cloud の Secrets に以下を追加してください。")
+    st.code(
+        '\n'.join(
+            [
+                'SUPABASE_URL = "https://xxxx.supabase.co"',
+                'SUPABASE_SECRET_KEY = "SupabaseのSecret key"',
+                'SUPABASE_NOTES_TABLE = "notes"',
+            ]
+        )
+    )
+    st.stop()
+
+
+def show_supabase_response_error(action, response):
+    st.error(f"メモ帳をSupabaseに{action}できませんでした。")
+    if response is not None:
+        st.write(f"Supabaseからの応答コード：{response.status_code}")
+        try:
+            st.code(json.dumps(response.json(), ensure_ascii=False, indent=2))
+        except Exception:
+            st.code(response.text)
+    st.stop()
+
+
+def load_notes_from_supabase(customer_name=None, limit=500):
+    """Supabaseのnotesテーブルからメモを新しい順で読み込む"""
+    if not has_supabase_config():
+        show_supabase_config_error()
+
+    params = {
+        "select": "id,customer_name,body,created_at",
+        "order": "created_at.desc",
+        "limit": str(limit),
+    }
+
+    if customer_name is not None:
+        target = clean_value(customer_name, blank_text="")
+        params["customer_name"] = f"eq.{target}"
+
+    try:
+        response = requests.get(
+            get_supabase_notes_url(),
+            headers=get_supabase_headers(),
+            params=params,
+            timeout=30,
+        )
+    except Exception as e:
+        st.error("メモ帳の読み込み中にSupabaseへの接続に失敗しました。")
+        st.exception(e)
+        st.stop()
+
+    if response.status_code != 200:
+        show_supabase_response_error("読み込み", response)
+
+    try:
+        notes = response.json()
+    except Exception:
+        st.error("Supabaseから返ったメモ帳データの形式が正しくありません。")
+        st.stop()
+
+    if not isinstance(notes, list):
+        return []
+
+    return notes
+
+
+def insert_note_to_supabase(note):
+    """Supabaseのnotesテーブルへメモを1件追加する"""
+    if not has_supabase_config():
+        show_supabase_config_error()
+
+    try:
+        response = requests.post(
+            get_supabase_notes_url(),
+            headers=get_supabase_headers(prefer="return=minimal"),
+            json=note,
+            timeout=30,
+        )
+    except Exception as e:
+        st.error("メモ帳の保存中にSupabaseへの接続に失敗しました。")
+        st.exception(e)
+        st.stop()
+
+    if response.status_code not in (200, 201):
+        show_supabase_response_error("保存", response)
+
+
+def delete_note_from_supabase(note_id):
+    """Supabaseのnotesテーブルからメモを1件削除する"""
+    target_id = clean_value(note_id, blank_text="")
+    if not target_id:
+        st.warning("削除するメモが見つかりません。")
+        return False
+
+    if not has_supabase_config():
+        show_supabase_config_error()
+
+    try:
+        response = requests.delete(
+            get_supabase_notes_url(),
+            headers=get_supabase_headers(prefer="return=minimal"),
+            params={"id": f"eq.{target_id}"},
+            timeout=30,
+        )
+    except Exception as e:
+        st.error("メモ帳の削除中にSupabaseへの接続に失敗しました。")
+        st.exception(e)
+        st.stop()
+
+    if response.status_code not in (200, 204):
+        show_supabase_response_error("削除", response)
+
+    return True
+
+
+def make_note_id():
+    return get_jst_now().strftime("%Y%m%d%H%M%S%f")
+
+
+def add_note(customer_name, body):
+    """顧客名に紐づくメモを1件追加する"""
+    note_text = str(body or "").strip()
+    if not note_text:
+        st.warning("メモ本文を入力してください。")
+        return False
+
+    now = get_jst_now().isoformat()
+    note = {
+        "id": make_note_id(),
+        "customer_name": clean_value(customer_name, blank_text=""),
+        "body": note_text,
+        "created_at": now,
+    }
+
+    insert_note_to_supabase(note)
+    return True
+
+
+def get_notes_for_customer(customer_name):
+    return load_notes_from_supabase(customer_name=customer_name)
+
+
+def render_note_card(note, show_customer=True):
+    customer_name = clean_value(note.get("customer_name"), blank_text="未設定")
+    created_at = format_note_datetime(note.get("created_at", ""))
+    body = html.escape(clean_value(note.get("body"), blank_text="")).replace("\n", "<br>")
+
+    if show_customer:
+        customer_link = build_customer_detail_link(customer_name, class_name="dispatch-month-link")
+        meta = f"{html.escape(created_at)}　{customer_link}"
+    else:
+        meta = html.escape(created_at)
+
+    st.markdown(
+        f"""
+        <div class="note-card">
+            <div class="note-meta">{meta}</div>
+            <div class="note-body">{body}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_note_delete_controls(note):
+    note_id = clean_value(note.get("id"), blank_text="")
+    if not note_id:
+        return
+
+    confirm_key = f"confirm_delete_note_{note_id}"
+
+    if st.session_state.get(confirm_key):
+        st.warning("このメモを削除しますか？")
+        col1, col2 = st.columns(2)
+
+        with col1:
+            if st.button("本当に削除", key=f"delete_note_confirm_{note_id}"):
+                if delete_note_from_supabase(note_id):
+                    st.session_state.pop(confirm_key, None)
+                    st.success("メモを削除しました。")
+                    st.rerun()
+
+        with col2:
+            if st.button("キャンセル", key=f"delete_note_cancel_{note_id}"):
+                st.session_state.pop(confirm_key, None)
+                st.rerun()
+    else:
+        if st.button("削除", key=f"delete_note_start_{note_id}"):
+            st.session_state[confirm_key] = True
+            st.rerun()
+
+
+def show_customer_notes(customer_name):
+    st.markdown("---")
+    st.subheader("📝 この顧客のメモ")
+    st.caption("スマホではキーボードのマイクから音声入力できます。")
+
+    note_key = f"customer_note_input_{customer_name}"
+    note_text = st.text_area(
+        "メモ本文",
+        key=note_key,
+        height=120,
+        placeholder="例：次回は午前中希望。サンプル持参。など",
+    )
+
+    if st.button("メモを保存", key=f"save_customer_note_{customer_name}"):
+        if add_note(customer_name, note_text):
+            st.session_state[note_key] = ""
+            st.success("メモを保存しました。")
+            st.rerun()
+
+    customer_notes = get_notes_for_customer(customer_name)
+
+    if not customer_notes:
+        st.info("この顧客のメモはまだありません。")
+        return
+
+    st.markdown("#### メモ履歴")
+    for note in customer_notes:
+        render_note_card(note, show_customer=False)
+        render_note_delete_controls(note)
+
+
+def show_notes_page(df):
+    show_back_home_button("notes_back_home")
+
+    st.markdown("---")
+    st.header("📝 メモ帳")
+    st.caption("全顧客のメモを新しい順で表示します。")
+
+    notes = load_notes_from_supabase()
+
+    if not notes:
+        st.info("メモはまだありません。顧客詳細画面から保存できます。")
+        return
+
+    for note in notes:
+        render_note_card(note, show_customer=True)
+        render_note_delete_controls(note)
+
+
 
 # =========================
 # Excel読み込み・整形
@@ -484,7 +1147,7 @@ def normalize_excel_table(excel_source):
     return df
 
 
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=60)
 def load_data():
     """
     Dropbox API設定があればDropbox上のExcelを読む。
@@ -501,13 +1164,100 @@ def load_data():
 # =========================
 # 画面遷移
 # =========================
-def set_page(page_name):
+def get_query_value(key, default=""):
+    """URLパラメータを安全に1つ取り出す"""
+    try:
+        value = st.query_params.get(key, default)
+    except Exception:
+        return default
+
+    if isinstance(value, list):
+        return value[0] if value else default
+
+    return value if value is not None else default
+
+
+def update_query_params(**params):
+    """ブラウザの戻るボタンで戻れるようにURLへ現在画面を残す"""
+    try:
+        # ログイン状態はURLにも残す。ログアウト時だけ消す。
+        st.query_params["logged_in"] = "1"
+
+        for key, value in params.items():
+            if value is None or value == "":
+                if key in st.query_params:
+                    del st.query_params[key]
+            else:
+                st.query_params[key] = str(value)
+    except Exception:
+        pass
+
+
+
+def make_app_url(page="home", customer=None, customer_search=None, region_search=None):
+    """ブラウザの戻るボタンで戻れるように、通常リンク用URLを作る。"""
+    params = {"logged_in": "1", "page": page}
+    if customer:
+        params["customer"] = str(customer)
+    if customer_search:
+        params["customer_search"] = str(customer_search)
+    if region_search:
+        params["region_search"] = str(region_search)
+    return "?" + urllib.parse.urlencode(params)
+
+
+def render_page_link(label, page="home", customer=None, customer_search=None, region_search=None, class_name="app-nav-link"):
+    """st.buttonではなくHTMLリンクで画面遷移する。これによりブラウザ戻るが効く。"""
+    url = make_app_url(
+        page=page,
+        customer=customer,
+        customer_search=customer_search,
+        region_search=region_search,
+    )
+    return f'<a class="{class_name}" href="{url}" target="_self">{html.escape(str(label))}</a>'
+
+def sync_page_from_query_params():
+    """URLのpage/customerを読んで、ブラウザ戻る・進むに追従する"""
+    page = str(get_query_value("page", "home")).strip() or "home"
+    customer = str(get_query_value("customer", "")).strip()
+
+    valid_pages = {"home", "region", "calendar", "delivery", "notes", "detail"}
+
+    raw_page = str(get_query_value("page", "")).strip()
+    if page not in valid_pages:
+        page = "home"
+    if customer and not raw_page:
+        page = "detail"
+
+    st.session_state["page"] = page
+
+    if page == "detail" and customer:
+        st.session_state["selected_customer"] = customer
+    elif page != "detail":
+        st.session_state["selected_customer"] = None
+
+
+def set_page(page_name, rerun=False):
     st.session_state["page"] = page_name
+
+    if page_name != "detail":
+        st.session_state["selected_customer"] = None
+
+    update_query_params(page=page_name, customer=None)
+
+    if rerun:
+        st.rerun()
 
 
 def select_customer(customer_name, page_name="detail"):
     st.session_state["selected_customer"] = customer_name
     st.session_state["page"] = page_name
+    update_query_params(page=page_name, customer=customer_name)
+
+
+def show_back_home_button(key):
+    """各画面からホームへ戻るための共通リンク。ブラウザ履歴にも残る。"""
+    st.markdown(render_page_link("← ホームへ戻る", page="home"), unsafe_allow_html=True)
 
 
 # =========================
@@ -520,18 +1270,32 @@ def show_customer_detail(df, customer_name):
         st.warning("選択した顧客の情報が見つかりません。")
         return
 
-    if st.button("← ホームへ戻る"):
-        set_page("home")
-        st.rerun()
+    show_back_home_button("detail_back_home")
+
+    # 使用数量/日が0・空白・NaNの商品行は、商品名ごと表示しない。
+    visible_detail = detail[~detail["使用数量/日"].apply(is_blank_or_zero)].copy()
 
     region = clean_value(detail.iloc[0]["地域"])
 
     st.markdown("---")
     st.header(f"👤 {customer_name}")
     st.write(f"**地域：** {region}")
-    st.write(f"**商品数：** {len(detail)}件")
+    st.write(f"**商品数：** {len(visible_detail)}件")
 
-    for _, row in detail.iterrows():
+    try:
+        map_info = get_customer_map_info(detail)
+        if map_info:
+            st.write(f"**{map_info['display_label']}：** {map_info['display_value']}")
+            if map_info["map_url"]:
+                show_google_maps_button(map_info["map_url"])
+    except Exception:
+        pass
+
+    if visible_detail.empty:
+        st.info("表示対象の商品はありません。使用数量/日が0または空白の商品は非表示にしています。")
+        return
+
+    for _, row in visible_detail.iterrows():
         product_name = clean_value(row["商品名"])
         customer_id = clean_value(row["ID"])
         usage = format_number(row["使用数量/日"])
@@ -558,16 +1322,26 @@ def show_customer_detail(df, customer_name):
                 st.markdown(f"**{remaining}**")
 
 
+    show_customer_notes(customer_name)
+
 # =========================
 # 顧客検索
 # =========================
 def show_customer_search(df):
     st.subheader("🔍 顧客検索")
 
+    default_keyword = str(get_query_value("customer_search", "")).strip()
     keyword = st.text_input(
         "ひらがなで検索",
+        value=default_keyword,
         placeholder="例：こ、こも、むら",
+        key="customer_search_input",
     ).strip()
+
+    if keyword:
+        update_query_params(page="home", customer_search=keyword)
+    else:
+        update_query_params(page="home", customer_search=None)
 
     if not keyword:
         st.info("顧客名のひらがなを入力してください。")
@@ -591,9 +1365,64 @@ def show_customer_search(df):
             st.markdown(f"### 👤 {name}")
             st.write(f"地域：{region}")
 
-            if st.button("この顧客を見る", key=f"search_select_{i}_{name}"):
-                select_customer(name)
-                st.rerun()
+            st.markdown(
+                render_page_link("この顧客を見る", page="detail", customer=name, customer_search=keyword),
+                unsafe_allow_html=True,
+            )
+
+
+# =========================
+# 地域検索
+# =========================
+def show_region_search(df):
+    st.subheader("📍 地域検索")
+    show_back_home_button("region_back_home")
+
+    default_keyword = str(get_query_value("region_search", "")).strip()
+    keyword = st.text_input(
+        "地域名で検索",
+        value=default_keyword,
+        placeholder="例：帯広、芽室、釧路",
+        key="region_search_input",
+    ).strip()
+
+    if keyword:
+        update_query_params(page="region", region_search=keyword)
+    else:
+        update_query_params(page="region", region_search=None)
+
+    if not keyword:
+        st.info("地域名を入力してください。")
+        return
+
+    region_text = df["地域"].fillna("").astype(str).str.strip()
+    hit = df[region_text.str.contains(keyword, na=False)]
+
+    if hit.empty:
+        st.warning("該当する地域の顧客が見つかりません。")
+        return
+
+    customers = (
+        hit[["顧客名", "地域"]]
+        .drop_duplicates()
+        .sort_values(["地域", "顧客名"])
+        .reset_index(drop=True)
+    )
+
+    st.write(f"候補：{len(customers)}件")
+
+    for i, row in customers.iterrows():
+        name = clean_value(row["顧客名"])
+        region = clean_value(row["地域"])
+
+        with st.container(border=True):
+            st.markdown(f"### 👤 {name}")
+            st.write(f"地域：{region}")
+
+            st.markdown(
+                render_page_link("この顧客を見る", page="detail", customer=name, region_search=keyword),
+                unsafe_allow_html=True,
+            )
 
 
 # =========================
@@ -637,9 +1466,7 @@ def make_delivery_list(df):
 
 
 def show_delivery_list(df):
-    if st.button("← ホームへ戻る"):
-        set_page("home")
-        st.rerun()
+    show_back_home_button("delivery_back_home")
 
     st.markdown("---")
     st.header("📅 配達予定一覧")
@@ -666,9 +1493,10 @@ def show_delivery_list(df):
             with col2:
                 st.markdown(f"**{next_date}**")
 
-            if st.button("詳細を見る", key=f"delivery_select_{i}_{customer_name}"):
-                select_customer(customer_name)
-                st.rerun()
+            st.markdown(
+                render_page_link("詳細を見る", page="detail", customer=customer_name),
+                unsafe_allow_html=True,
+            )
 
 
 # =========================
@@ -834,18 +1662,19 @@ def inject_dispatch_calendar_css():
         }
         .dispatch-day-panel {
             border: 1px solid rgba(49, 51, 63, 0.18);
-            border-radius: 8px;
+            border-radius: 16px;
             color: #111827 !important;
             overflow: visible;
-            padding: 0.75rem;
-            background: #ffffff;
+            padding: 0.8rem;
+            background: linear-gradient(180deg, #ffffff 0%, #f8fafc 100%);
+            box-shadow: 0 8px 22px rgba(15, 23, 42, 0.07);
             min-width: 0;
         }
         .dispatch-day-title {
             display: block;
             color: #111827 !important;
-            background: #f3f4f6;
-            border-radius: 6px;
+            background: linear-gradient(135deg, #eff6ff 0%, #ecfdf5 100%);
+            border-radius: 12px;
             font-size: 0.95rem;
             font-weight: 700;
             line-height: 1.35;
@@ -875,6 +1704,21 @@ def inject_dispatch_calendar_css():
             white-space: normal;
             word-break: normal;
         }
+        .dispatch-name a,
+        .dispatch-month-link {
+            color: #2563eb !important;
+            font-weight: 700;
+            text-decoration: none;
+        }
+        .dispatch-name a:hover,
+        .dispatch-month-link:hover {
+            text-decoration: underline;
+        }
+        .dispatch-month-product {
+            color: #374151 !important;
+            font-size: 0.82rem;
+            white-space: normal;
+        }
         .dispatch-line,
         .dispatch-empty {
             color: #374151 !important;
@@ -884,6 +1728,50 @@ def inject_dispatch_calendar_css():
             overflow-wrap: anywhere;
             white-space: normal;
             word-break: normal;
+        }
+        .dispatch-month-scroll {
+            width: 100%;
+            overflow-x: auto;
+            -webkit-overflow-scrolling: touch;
+            border: 1px solid rgba(15, 23, 42, 0.10);
+            border-radius: 16px;
+            background: #ffffff;
+            box-shadow: 0 10px 26px rgba(15, 23, 42, 0.08);
+        }
+        .dispatch-month-table {
+            border-collapse: collapse;
+            min-width: 760px;
+            width: max-content;
+            color: #111827 !important;
+            table-layout: auto;
+        }
+        .dispatch-month-table th,
+        .dispatch-month-table td {
+            border-bottom: 1px solid rgba(49, 51, 63, 0.12);
+            border-right: 1px solid rgba(49, 51, 63, 0.08);
+            padding: 0.45rem 0.6rem;
+            text-align: left;
+            vertical-align: top;
+            white-space: nowrap;
+            min-width: 130px;
+            font-size: 0.9rem;
+            position: static !important;
+        }
+        .dispatch-month-table th:first-child,
+        .dispatch-month-table td:first-child {
+            min-width: 86px;
+            position: sticky !important;
+            left: 0;
+            z-index: 3;
+            background: #ffffff;
+        }
+        .dispatch-month-table th:first-child {
+            z-index: 4;
+            background: #f3f4f6;
+        }
+        .dispatch-month-table th {
+            background: #eff6ff;
+            font-weight: 800;
         }
         @media (max-width: 420px) {
             .dispatch-two-day-row {
@@ -909,21 +1797,46 @@ def inject_dispatch_calendar_css():
     )
 
 
-def render_two_day_column(target_day, items):
-    st.markdown(f"**{format_month_day(target_day)}**")
+def escape_html(value):
+    return html.escape(clean_value(value), quote=True)
+
+
+def build_customer_detail_link(customer_name, label=None, class_name="dispatch-month-link"):
+    """配車カレンダーから顧客詳細へ移動するリンクを作る"""
+    customer = clean_value(customer_name, blank_text="").strip()
+
+    if not customer:
+        return escape_html(label or customer_name)
+
+    link_label = label or customer
+    url = make_app_url(page="detail", customer=customer)
+    return f'<a class="{class_name}" href="{url}" target="_self">{escape_html(link_label)}</a>'
+
+
+def handle_customer_query_param():
+    """旧リンク互換用。URLの顧客名を消さず、ブラウザ戻るに使えるよう保持する。"""
+    sync_page_from_query_params()
+
+
+def build_two_day_panel_html(target_day, items):
+    parts = [
+        '<div class="dispatch-day-panel">',
+        f'<div class="dispatch-day-title">{html.escape(format_month_day(target_day))}</div>',
+    ]
 
     if not items:
-        st.caption("予定なし")
-        return
+        parts.append('<div class="dispatch-empty">予定なし</div>')
+    else:
+        for item in items:
+            customer_link = build_customer_detail_link(item.get("顧客名"), class_name="dispatch-month-link")
+            parts.append('<div class="dispatch-item">')
+            parts.append(f'<div class="dispatch-name">👤 {customer_link}</div>')
+            parts.append(f'<div class="dispatch-line">地域：{escape_html(item.get("地域"))}</div>')
+            parts.append(f'<div class="dispatch-line">商品：{escape_html(item.get("商品名"))}</div>')
+            parts.append('</div>')
 
-    for item_index, item in enumerate(items):
-        with st.container(border=True):
-            st.markdown(f"**👤 {clean_value(item.get('顧客名'))}**")
-            st.write(f"地域：{clean_value(item.get('地域'))}")
-            st.write(f"商品：{clean_value(item.get('商品名'))}")
-
-        if item_index < len(items) - 1:
-            st.write("")
+    parts.append('</div>')
+    return "".join(parts)
 
 
 def show_dispatch_month_switcher(month_start):
@@ -948,6 +1861,7 @@ def show_dispatch_month_switcher(month_start):
 
 def show_two_day_dispatch_calendar(rows_by_day, month_start):
     st.subheader("📱 2日表示")
+    st.caption("スマホでも2日分を横並びで表示します。")
 
     last_day = calendar.monthrange(month_start.year, month_start.month)[1]
 
@@ -955,28 +1869,23 @@ def show_two_day_dispatch_calendar(rows_by_day, month_start):
         day1 = date(month_start.year, month_start.month, day_num)
         day2 = date(month_start.year, month_start.month, day_num + 1) if day_num + 1 <= last_day else None
 
-        col1, col2 = st.columns(2)
+        left_panel = build_two_day_panel_html(day1, rows_by_day.get(day1, []))
+        right_panel = build_two_day_panel_html(day2, rows_by_day.get(day2, [])) if day2 else '<div></div>'
 
-        with col1:
-            render_two_day_column(day1, rows_by_day.get(day1, []))
-
-        with col2:
-            if day2:
-                render_two_day_column(day2, rows_by_day.get(day2, []))
-            else:
-                st.write("")
-
-        st.markdown("---")
-
+        st.markdown(
+            f'<div class="dispatch-two-day-row">{left_panel}{right_panel}</div>',
+            unsafe_allow_html=True,
+        )
 
 def format_month_cell_item(item):
     customer_name = clean_value(item.get("顧客名"))
     product_name = clean_value(item.get("商品名"))
+    customer_link = build_customer_detail_link(customer_name, class_name="dispatch-month-link")
 
     if product_name == "未設定":
-        return customer_name
+        return customer_link
 
-    return f"{customer_name}/{product_name}"
+    return f'{customer_link}<br><span class="dispatch-month-product">{escape_html(product_name)}</span>'
 
 
 def make_month_dispatch_table(rows_by_day, month_start):
@@ -1003,29 +1912,46 @@ def make_month_dispatch_table(rows_by_day, month_start):
 
 def show_month_dispatch_calendar(rows_by_day, month_start):
     st.subheader("🗓 月表示")
-    st.caption("横スクロールで1か月分を確認できます。")
+    st.caption("横スクロールで1か月分を確認できます。日付列は固定表示します。")
 
     month_df = make_month_dispatch_table(rows_by_day, month_start)
-    column_config = {
-        "月/日": st.column_config.TextColumn("月/日", width="small"),
-    }
 
-    for column_name in month_df.columns:
-        if column_name != "月/日":
-            column_config[column_name] = st.column_config.TextColumn(column_name, width="medium")
-
-    st.dataframe(
-        month_df,
-        hide_index=True,
-        use_container_width=True,
-        height=min(760, 38 * (len(month_df) + 1)),
-        column_config=column_config,
+    header_cells = "".join(
+        f'<th>{html.escape(str(column))}</th>'
+        for column in month_df.columns
     )
 
+    body_rows = []
+    for _, row in month_df.iterrows():
+        row_cells = []
+        for column in month_df.columns:
+            value = row[column]
+            if str(value) == "nan":
+                cell_value = ""
+            elif column == "月/日":
+                cell_value = html.escape(str(value))
+            else:
+                cell_value = str(value)
+            row_cells.append(f"<td>{cell_value}</td>")
+        cells = "".join(row_cells)
+        body_rows.append(f"<tr>{cells}</tr>")
+
+    table_html = f"""
+    <div class="dispatch-month-scroll">
+      <table class="dispatch-month-table">
+        <thead><tr>{header_cells}</tr></thead>
+        <tbody>{''.join(body_rows)}</tbody>
+      </table>
+    </div>
+    """
+
+    st.markdown(table_html, unsafe_allow_html=True)
 
 def show_dispatch_calendar(df):
     st.markdown("---")
     st.header("🗓 配車カレンダー")
+    show_back_home_button("calendar_back_home")
+
     inject_dispatch_calendar_css()
 
     if df.empty:
@@ -1063,6 +1989,29 @@ def show_dispatch_calendar(df):
         show_month_dispatch_calendar(rows_by_day, month_start)
 
 
+
+# =========================
+# ホームメニュー
+# =========================
+def show_home_menu():
+    st.subheader("メニュー")
+
+    col1, col2 = st.columns(2)
+    with col1:
+        st.markdown(render_page_link("🔍 顧客検索", page="home"), unsafe_allow_html=True)
+    with col2:
+        st.markdown(render_page_link("📍 地域検索", page="region"), unsafe_allow_html=True)
+
+    col3, col4 = st.columns(2)
+    with col3:
+        st.markdown(render_page_link("🗓 配車カレンダー", page="calendar"), unsafe_allow_html=True)
+    with col4:
+        st.markdown(render_page_link("📅 配達予定一覧", page="delivery"), unsafe_allow_html=True)
+
+    st.markdown(render_page_link("📝 メモ帳", page="notes"), unsafe_allow_html=True)
+
+    st.markdown("---")
+
 # =========================
 # メイン
 # =========================
@@ -1072,48 +2021,40 @@ if "page" not in st.session_state:
 if "selected_customer" not in st.session_state:
     st.session_state["selected_customer"] = None
 
+# URLにpage/customerがある場合は、ブラウザの戻る・進むに合わせて画面を復元する。
+handle_customer_query_param()
+
 
 MENU_OPTIONS = {
     "🔍 顧客検索": "home",
-    "📅 配達予定一覧": "delivery",
+    "📍 地域検索": "region",
     "🗓 配車カレンダー": "calendar",
+    "📅 配達予定一覧": "delivery",
+    "📝 メモ帳": "notes",
 }
 
 current_page = st.session_state.get("page", "home")
-menu_pages = list(MENU_OPTIONS.values())
-menu_labels = list(MENU_OPTIONS.keys())
-
-if current_page in menu_pages:
-    current_menu_index = menu_pages.index(current_page)
-else:
-    current_menu_index = 0
 
 with st.sidebar:
-    st.title("🚚 青山商店")
-    st.caption("業務アプリ")
+    st.title(f"🚚 {APP_TITLE}")
+    st.markdown("### メニュー")
+    st.markdown(render_page_link("🔍 顧客検索", page="home"), unsafe_allow_html=True)
+    st.markdown(render_page_link("📍 地域検索", page="region"), unsafe_allow_html=True)
+    st.markdown(render_page_link("🗓 配車カレンダー", page="calendar"), unsafe_allow_html=True)
+    st.markdown(render_page_link("📅 配達予定一覧", page="delivery"), unsafe_allow_html=True)
+    st.markdown(render_page_link("📝 メモ帳", page="notes"), unsafe_allow_html=True)
 
-    selected_menu = st.radio(
-        "メニュー",
-        menu_labels,
-        index=current_menu_index,
-    )
-
-selected_page = MENU_OPTIONS[selected_menu]
-
-if st.session_state["page"] == "detail":
-    if selected_page != "home":
-        st.session_state["page"] = selected_page
-        st.session_state["selected_customer"] = None
+    st.markdown("---")
+    if st.button("🔄 データ更新", use_container_width=True):
+        st.cache_data.clear()
         st.rerun()
-else:
-    st.session_state["page"] = selected_page
 
 
 col_title, col_logout = st.columns([3, 1])
 
 with col_title:
     st.title(f"🚚 {APP_TITLE}")
-    st.caption("顧客検索・配達予定・配車カレンダー")
+    st.caption("顧客検索・地域検索・配車カレンダー・配達予定・メモ帳")
 
 with col_logout:
     st.write("")
@@ -1121,6 +2062,10 @@ with col_logout:
         st.session_state.authenticated = False
         st.session_state.page = "home"
         st.session_state.selected_customer = None
+        try:
+            st.query_params.clear()
+        except Exception:
+            pass
         st.rerun()
 
 try:
@@ -1131,37 +2076,34 @@ except Exception as e:
     st.exception(e)
     st.stop()
 
-if st.session_state["page"] == "home":
-    show_customer_search(df)
+try:
+    if st.session_state["page"] == "home":
+        show_home_menu()
+        show_customer_search(df)
 
-    st.markdown("---")
-    st.subheader("📅 配達予定一覧")
-    st.caption("過去7日 ～ 1か月後")
+    elif st.session_state["page"] == "region":
+        show_region_search(df)
 
-    if st.button("配達予定一覧を見る"):
-        set_page("delivery")
-        st.rerun()
+    elif st.session_state["page"] == "calendar":
+        show_dispatch_calendar(df)
 
-    st.markdown("---")
-    st.subheader("🗓 配車カレンダー")
-    st.caption("2日表示 / 月表示で配車予定を確認できます。")
+    elif st.session_state["page"] == "delivery":
+        show_delivery_list(df)
 
-    if st.button("配車カレンダーを見る"):
-        set_page("calendar")
-        st.rerun()
+    elif st.session_state["page"] == "notes":
+        show_notes_page(df)
 
-elif st.session_state["page"] == "delivery":
-    show_delivery_list(df)
-
-elif st.session_state["page"] == "calendar":
-    show_dispatch_calendar(df)
-
-elif st.session_state["page"] == "detail":
-    selected = st.session_state.get("selected_customer")
-    if selected:
-        show_customer_detail(df, selected)
-    else:
-        set_page("home")
-        st.rerun()
+    elif st.session_state["page"] == "detail":
+        selected = st.session_state.get("selected_customer")
+        if selected:
+            show_customer_detail(df, selected)
+        else:
+            set_page("home")
+            st.rerun()
+except Exception as e:
+    st.error("画面表示中にエラーが発生しました。")
+    st.write("原因確認のため、エラー内容を表示しています。")
+    st.exception(e)
+    st.stop()
 
 st.caption("※ このアプリはExcelのSheet1を読み込んで表示しています。Dropbox API設定がある場合はDropbox上のExcelを読み込みます。")
