@@ -304,7 +304,18 @@ st.markdown(
             font-size: 1.08rem !important;
         }
     }
-    </style>
+    
+    /* サイドバーの更新ボタン文字を白背景でも見える色に固定 */
+    [data-testid="stSidebar"] .stButton > button,
+    [data-testid="stSidebar"] .stButton > button *,
+    [data-testid="stSidebar"] button[kind] *,
+    [data-testid="stSidebar"] button[kind] {
+        color: #1f2937 !important;
+        -webkit-text-fill-color: #1f2937 !important;
+        opacity: 1 !important;
+    }
+
+</style>
     """,
     unsafe_allow_html=True,
 )
