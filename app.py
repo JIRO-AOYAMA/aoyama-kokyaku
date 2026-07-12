@@ -777,6 +777,30 @@ def call_dropbox_rpc(endpoint, payload, access_token):
         raise RuntimeError(f"Dropbox APIへの接続に失敗しました: {exc}") from exc
 
 
+def ensure_dropbox_backup_folder(access_token):
+    """Backupsフォルダがなければ作成する。既に存在する場合は成功扱いにする。"""
+    response = call_dropbox_rpc(
+        "files/create_folder_v2",
+        {"path": DROPBOX_BACKUP_FOLDER, "autorename": False},
+        access_token,
+    )
+    if response.status_code == 200:
+        return
+    if response.status_code == 409:
+        try:
+            error_data = response.json()
+            summary = str(error_data.get("error_summary", ""))
+            # path/conflict/folder/ は「同名フォルダが既にある」という正常状態。
+            if "conflict" in summary and "folder" in summary:
+                return
+        except Exception:
+            pass
+    raise RuntimeError(
+        "Dropboxにバックアップフォルダを作成できませんでした。\n"
+        + dropbox_error_text(response)
+    )
+
+
 def trim_old_dropbox_backups(access_token, keep=30):
     """対象ブックのバックアップを新しい順にkeep件だけ残す。"""
     entries = []
@@ -1102,7 +1126,8 @@ def save_customer_excel_changes(customer_name, product_name, proposed):
     if not revision:
         raise RuntimeError("Dropboxのrevを取得できないため、安全のため更新を中止しました。")
 
-    timestamp = get_jst_now().strftime("%Y%m%d_%H%M%S")
+    ensure_dropbox_backup_folder(access_token)
+    timestamp = get_jst_now().strftime("%Y%m%d_%H%M%S_%f")
     backup_path = f"{DROPBOX_BACKUP_FOLDER}/配車予定 次郎_{timestamp}.xlsm"
     backup_response = upload_dropbox_file(backup_path, original_content, access_token, mode="add")
     if backup_response.status_code != 200:
@@ -1234,7 +1259,8 @@ def save_customer_map_changes(customer_name, address, map_location):
     if not revision:
         raise RuntimeError("Dropboxのrevを取得できないため、安全のため更新を中止しました。")
 
-    timestamp = get_jst_now().strftime("%Y%m%d_%H%M%S")
+    ensure_dropbox_backup_folder(access_token)
+    timestamp = get_jst_now().strftime("%Y%m%d_%H%M%S_%f")
     backup_path = f"{DROPBOX_BACKUP_FOLDER}/配車予定 次郎_{timestamp}.xlsm"
     backup_response = upload_dropbox_file(
         backup_path,
