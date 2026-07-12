@@ -59,7 +59,7 @@ REQUIRED_COLUMNS = [
 
 REQUIRED_COLUMN_CANDIDATES = {
     "ID": ["ID", "id", "顧客ID", "顧客コード", "コード", "No", "NO", "番号"],
-    "顧客名": ["顧客名", "牧場名", "取引先名", "得意先名", "お客様名", "名前", "名称"],
+    "顧客名": ["顧客名", "売上先名", "牧場名", "取引先名", "得意先名", "お客様名", "名前", "名称"],
     "地域": ["地域", "地区", "エリア", "住所", "市町村"],
     "商品名": ["商品名", "商品", "品名", "製品名"],
     "使用数量/日": ["使用数量/日", "使用数量", "使用量/日", "一日使用量", "数量/日", "日量"],
@@ -809,14 +809,48 @@ def normalize_match_value(value):
     return clean_value(value, blank_text="").strip()
 
 
-def find_header_column_in_worksheet(ws, candidates, max_rows=50):
-    """見出し行を走査し、候補名に完全一致する列番号を返す。"""
-    candidate_set = {str(item).strip() for item in candidates}
+def normalize_header_text(value):
+    """見出し比較用。空白・改行・全角空白を除去する。"""
+    text = normalize_match_value(value)
+    return re.sub(r"[\\s　]+", "", text)
+
+
+def find_header_column_in_worksheet(ws, candidates, max_rows=200):
+    """見出し行を走査し、候補名に一致する列番号を返す。"""
+    candidate_set = {normalize_header_text(item) for item in candidates}
     for row in ws.iter_rows(min_row=1, max_row=min(ws.max_row, max_rows)):
         for cell in row:
-            if normalize_match_value(cell.value) in candidate_set:
+            if normalize_header_text(cell.value) in candidate_set:
                 return cell.column
     return None
+
+
+def find_customer_column_in_worksheet(ws, customer_name):
+    """
+    Sheet1の顧客名列を特定する。
+    まず見出し名で探し、見つからない場合は表示中の顧客名が実際に入っている列から推定する。
+    """
+    customer_col = find_header_column_in_worksheet(
+        ws,
+        REQUIRED_COLUMN_CANDIDATES["顧客名"],
+    )
+    if customer_col is not None:
+        return customer_col
+
+    target = normalize_match_value(customer_name)
+    if not target:
+        return None
+
+    match_counts = {}
+    for row in ws.iter_rows(min_row=1, max_row=ws.max_row):
+        for cell in row:
+            if normalize_match_value(cell.value) == target:
+                match_counts[cell.column] = match_counts.get(cell.column, 0) + 1
+
+    if not match_counts:
+        return None
+
+    return max(match_counts, key=match_counts.get)
 
 
 def read_edit_values_from_bytes(content, customer_name, product_name):
@@ -842,9 +876,9 @@ def read_edit_values_from_bytes(content, customer_name, product_name):
             }
 
         customer_ws = workbook[SHEET_NAME]
-        customer_col = find_header_column_in_worksheet(customer_ws, REQUIRED_COLUMN_CANDIDATES["顧客名"])
+        customer_col = find_customer_column_in_worksheet(customer_ws, customer_name)
         if customer_col is None:
-            raise ValueError("Sheet1の見出し行から顧客名列を特定できません。")
+            raise ValueError("Sheet1で顧客名の列または対象顧客を特定できません。")
         customer_rows = [
             row for row in range(1, customer_ws.max_row + 1)
             if normalize_match_value(customer_ws.cell(row, customer_col).value) == customer_name
@@ -928,9 +962,9 @@ def update_workbook_bytes(original_content, customer_name, product_name, propose
                 changed_cells.append((DELIVERY_SHEET_NAME, product_row, column, new_value))
 
         customer_ws = workbook[SHEET_NAME]
-        customer_col = find_header_column_in_worksheet(customer_ws, REQUIRED_COLUMN_CANDIDATES["顧客名"])
+        customer_col = find_customer_column_in_worksheet(customer_ws, customer_name)
         if customer_col is None:
-            raise ValueError("Sheet1の見出し行から顧客名列を特定できません。")
+            raise ValueError("Sheet1で顧客名の列または対象顧客を特定できません。")
         customer_rows = [
             row for row in range(1, customer_ws.max_row + 1)
             if normalize_match_value(customer_ws.cell(row, customer_col).value) == customer_name
