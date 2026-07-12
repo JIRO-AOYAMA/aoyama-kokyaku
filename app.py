@@ -2,6 +2,7 @@ import calendar
 import html
 import json
 import math
+import re
 import urllib.parse
 from datetime import date, datetime, timedelta, timezone
 from io import BytesIO
@@ -10,6 +11,7 @@ from pathlib import Path
 import pandas as pd
 import requests
 import streamlit as st
+from openpyxl import load_workbook
 
 
 # =========================
@@ -35,6 +37,8 @@ DROPBOX_REFRESH_TOKEN = st.secrets.get("DROPBOX_REFRESH_TOKEN", "")
 DROPBOX_ACCESS_TOKEN = st.secrets.get("DROPBOX_ACCESS_TOKEN", "")
 DROPBOX_DEFAULT_FILE_PATH = "/1共有　青山商店　本社/配車表-北海道-/配車予定 次郎.xlsm"
 DROPBOX_FILE_PATH = st.secrets.get("DROPBOX_FILE_PATH", DROPBOX_DEFAULT_FILE_PATH)
+DROPBOX_BACKUP_FOLDER = "/1共有　青山商店　本社/配車表-北海道-/Backups"
+DELIVERY_SHEET_NAME = "次回配達日"
 APP_PASSWORD = st.secrets.get("APP_PASSWORD", "")
 SUPABASE_URL = st.secrets.get("SUPABASE_URL", "")
 SUPABASE_SECRET_KEY = st.secrets.get("SUPABASE_SECRET_KEY", "")
@@ -711,6 +715,295 @@ def download_dropbox_file(path_or_id, access_token):
     return response.content, response
 
 
+def dropbox_error_text(response):
+    """Dropboxのエラーを画面表示できる文字列にする。"""
+    if response is None:
+        return "Dropboxから応答がありませんでした。"
+    try:
+        body = json.dumps(response.json(), ensure_ascii=False, indent=2)
+    except Exception:
+        body = response.text
+    return f"HTTP {response.status_code}\n{body}"
+
+
+def get_download_revision(response):
+    """download応答に含まれるファイルrevを取り出す。"""
+    try:
+        metadata = json.loads(response.headers.get("Dropbox-API-Result", "{}"))
+        return metadata.get("rev", "")
+    except Exception:
+        return ""
+
+
+def upload_dropbox_file(path, content, access_token, mode="add", rev=""):
+    """競合ファイルを作らずDropboxへファイルをアップロードする。"""
+    mode_arg = {".tag": "update", "update": rev} if mode == "update" else mode
+    api_arg = {
+        "path": path,
+        "mode": mode_arg,
+        "autorename": False,
+        "mute": False,
+        "strict_conflict": True,
+    }
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/octet-stream",
+        "Dropbox-API-Arg": json.dumps(api_arg, ensure_ascii=True).encode("utf-8").decode("latin1"),
+    }
+    try:
+        return requests.post(
+            "https://content.dropboxapi.com/2/files/upload",
+            headers=headers,
+            data=content,
+            timeout=120,
+        )
+    except Exception as exc:
+        raise RuntimeError(f"Dropboxへのアップロードに失敗しました: {exc}") from exc
+
+
+def call_dropbox_rpc(endpoint, payload, access_token):
+    """DropboxのメタデータAPIを呼び出す。"""
+    try:
+        return requests.post(
+            f"https://api.dropboxapi.com/2/{endpoint}",
+            headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
+            json=payload,
+            timeout=30,
+        )
+    except Exception as exc:
+        raise RuntimeError(f"Dropbox APIへの接続に失敗しました: {exc}") from exc
+
+
+def trim_old_dropbox_backups(access_token, keep=30):
+    """対象ブックのバックアップを新しい順にkeep件だけ残す。"""
+    entries = []
+    response = call_dropbox_rpc(
+        "files/list_folder",
+        {"path": DROPBOX_BACKUP_FOLDER, "recursive": False, "include_deleted": False},
+        access_token,
+    )
+    if response.status_code != 200:
+        return f"バックアップ一覧を取得できませんでした。\n{dropbox_error_text(response)}"
+
+    data = response.json()
+    entries.extend(data.get("entries", []))
+    while data.get("has_more"):
+        response = call_dropbox_rpc("files/list_folder/continue", {"cursor": data["cursor"]}, access_token)
+        if response.status_code != 200:
+            return f"バックアップ一覧の続きが取得できませんでした。\n{dropbox_error_text(response)}"
+        data = response.json()
+        entries.extend(data.get("entries", []))
+
+    pattern = re.compile(r"^配車予定 次郎_\d{8}_\d{6}(?:_\d+)?\.xlsm$")
+    backups = [item for item in entries if item.get(".tag") == "file" and pattern.match(item.get("name", ""))]
+    backups.sort(key=lambda item: (item.get("server_modified", ""), item.get("name", "")), reverse=True)
+    warnings = []
+    for item in backups[keep:]:
+        delete_response = call_dropbox_rpc("files/delete_v2", {"path": item["path_lower"]}, access_token)
+        if delete_response.status_code != 200:
+            warnings.append(item.get("name", "不明なファイル"))
+    return "削除できなかった古いバックアップ: " + ", ".join(warnings) if warnings else ""
+
+
+def normalize_match_value(value):
+    return clean_value(value, blank_text="").strip()
+
+
+def find_header_column_in_worksheet(ws, candidates, max_rows=50):
+    """見出し行を走査し、候補名に完全一致する列番号を返す。"""
+    candidate_set = {str(item).strip() for item in candidates}
+    for row in ws.iter_rows(min_row=1, max_row=min(ws.max_row, max_rows)):
+        for cell in row:
+            if normalize_match_value(cell.value) in candidate_set:
+                return cell.column
+    return None
+
+
+def read_edit_values_from_bytes(content, customer_name, product_name):
+    """最新ブックから編集欄の現在値を取得する。"""
+    workbook = load_workbook(BytesIO(content), keep_vba=True, data_only=False, read_only=False)
+    try:
+        if DELIVERY_SHEET_NAME not in workbook.sheetnames or SHEET_NAME not in workbook.sheetnames:
+            raise ValueError("必要なシート（次回配達日 または Sheet1）が見つかりません。")
+        delivery_ws = workbook[DELIVERY_SHEET_NAME]
+        matches = [
+            row for row in range(1, delivery_ws.max_row + 1)
+            if normalize_match_value(delivery_ws.cell(row, 2).value) == customer_name
+            and normalize_match_value(delivery_ws.cell(row, 5).value) == product_name
+        ]
+        product_values = {}
+        if len(matches) == 1:
+            row = matches[0]
+            product_values = {
+                "メーカー": delivery_ws.cell(row, 6).value,
+                "本数": delivery_ws.cell(row, 8).value,
+                "kg/本": delivery_ws.cell(row, 9).value,
+                "配達日": delivery_ws.cell(row, 10).value,
+            }
+
+        customer_ws = workbook[SHEET_NAME]
+        customer_col = find_header_column_in_worksheet(customer_ws, REQUIRED_COLUMN_CANDIDATES["顧客名"])
+        if customer_col is None:
+            raise ValueError("Sheet1の見出し行から顧客名列を特定できません。")
+        customer_rows = [
+            row for row in range(1, customer_ws.max_row + 1)
+            if normalize_match_value(customer_ws.cell(row, customer_col).value) == customer_name
+        ]
+        first_row = customer_rows[0] if customer_rows else None
+        return {
+            **product_values,
+            "住所": customer_ws.cell(first_row, 9).value if first_row else None,
+            "マップ位置": customer_ws.cell(first_row, 10).value if first_row else None,
+            "商品一致件数": len(matches),
+            "顧客一致件数": len(customer_rows),
+        }
+    finally:
+        workbook.close()
+
+
+def parse_optional_nonnegative_number(text, integer=False):
+    value = str(text).strip()
+    if value == "":
+        return None
+    try:
+        number = float(value)
+    except Exception as exc:
+        raise ValueError("数値で入力してください。") from exc
+    if not math.isfinite(number) or number < 0:
+        raise ValueError("0以上の数値で入力してください。")
+    if integer and not number.is_integer():
+        raise ValueError("整数で入力してください。")
+    return int(number) if integer else number
+
+
+def validate_map_location(value):
+    text = str(value).strip()
+    if not text:
+        return ""
+    parsed = urllib.parse.urlparse(text)
+    if parsed.scheme or "://" in text:
+        if parsed.scheme not in ("http", "https") or not parsed.netloc:
+            raise ValueError("マップ位置のURLが正しくありません。")
+    # 数字と区切りだけで座標らしく見える入力に限って、緯度経度として検証する。
+    # 通常の住所・施設名にカンマが含まれていても許可する。
+    coordinate_like = bool(re.match(r"^[\s+\-\d０-９.,，．、:：緯度経]+$", text))
+    if coordinate_like and not parse_lat_lng(text):
+        raise ValueError("緯度,経度は例のように入力してください（43.123456, 143.123456）。")
+    return text
+
+
+def same_excel_value(old, new):
+    if old is None and new in (None, ""):
+        return True
+    if isinstance(old, (datetime, date)) and isinstance(new, (datetime, date)):
+        return old.date() == new.date() if isinstance(old, datetime) else old == (new.date() if isinstance(new, datetime) else new)
+    return old == new
+
+
+def update_workbook_bytes(original_content, customer_name, product_name, proposed):
+    """指定された6列の値だけ変更し、再オープン検証したbytesを返す。"""
+    workbook = load_workbook(BytesIO(original_content), keep_vba=True, data_only=False, read_only=False)
+    original_sheets = list(workbook.sheetnames)
+    changed_cells = []
+    try:
+        if DELIVERY_SHEET_NAME not in workbook.sheetnames or SHEET_NAME not in workbook.sheetnames:
+            raise ValueError("必要なシート（次回配達日 または Sheet1）が見つかりません。")
+        delivery_ws = workbook[DELIVERY_SHEET_NAME]
+        product_rows = [
+            row for row in range(1, delivery_ws.max_row + 1)
+            if normalize_match_value(delivery_ws.cell(row, 2).value) == customer_name
+            and normalize_match_value(delivery_ws.cell(row, 5).value) == product_name
+        ]
+        if not product_rows:
+            raise ValueError("顧客名・商品名が一致する行が見つかりません。")
+        if len(product_rows) > 1:
+            raise ValueError("同じ顧客名・商品名の行が複数見つかりました。")
+
+        product_row = product_rows[0]
+        for label, column in {"メーカー": 6, "本数": 8, "kg/本": 9, "配達日": 10}.items():
+            cell = delivery_ws.cell(product_row, column)
+            new_value = proposed[label]
+            if not same_excel_value(cell.value, new_value):
+                cell.value = new_value
+                changed_cells.append((DELIVERY_SHEET_NAME, product_row, column, new_value))
+
+        customer_ws = workbook[SHEET_NAME]
+        customer_col = find_header_column_in_worksheet(customer_ws, REQUIRED_COLUMN_CANDIDATES["顧客名"])
+        if customer_col is None:
+            raise ValueError("Sheet1の見出し行から顧客名列を特定できません。")
+        customer_rows = [
+            row for row in range(1, customer_ws.max_row + 1)
+            if normalize_match_value(customer_ws.cell(row, customer_col).value) == customer_name
+        ]
+        if not customer_rows:
+            raise ValueError("Sheet1に顧客名が一致する行が見つかりません。")
+        for row in customer_rows:
+            for label, column in {"住所": 9, "マップ位置": 10}.items():
+                cell = customer_ws.cell(row, column)
+                new_value = proposed[label]
+                if not same_excel_value(cell.value, new_value):
+                    cell.value = new_value
+                    changed_cells.append((SHEET_NAME, row, column, new_value))
+
+        if not changed_cells:
+            raise ValueError("変更された項目がありません。")
+        output = BytesIO()
+        workbook.save(output)
+    finally:
+        workbook.close()
+
+    saved_content = output.getvalue()
+    verified = load_workbook(BytesIO(saved_content), keep_vba=True, data_only=False, read_only=False)
+    try:
+        if list(verified.sheetnames) != original_sheets:
+            raise ValueError("保存後にシート構成が変わったため、更新を中止しました。")
+        if DELIVERY_SHEET_NAME not in verified.sheetnames or SHEET_NAME not in verified.sheetnames:
+            raise ValueError("保存後の検証で必要なシートが見つかりません。")
+        if verified.vba_archive is None:
+            raise ValueError("保存後の検証でVBAプロジェクトを確認できません。")
+        for sheet, row, column, expected in changed_cells:
+            actual = verified[sheet].cell(row, column).value
+            if not same_excel_value(actual, expected):
+                raise ValueError(f"保存後の検証で{sheet}!{verified[sheet].cell(row, column).coordinate}の値が一致しません。")
+    finally:
+        verified.close()
+    return saved_content, changed_cells
+
+
+def save_customer_excel_changes(customer_name, product_name, proposed):
+    """バックアップ、検証、rev競合防止を含む一連の保存処理。"""
+    access_token = get_dropbox_access_token()
+    target_path = get_dropbox_file_path()
+    original_content, download_response = download_dropbox_file(target_path, access_token)
+    if original_content is None:
+        raise RuntimeError("最新のExcelを取得できませんでした。\n" + dropbox_error_text(download_response))
+    revision = get_download_revision(download_response)
+    if not revision:
+        raise RuntimeError("Dropboxのrevを取得できないため、安全のため更新を中止しました。")
+
+    timestamp = get_jst_now().strftime("%Y%m%d_%H%M%S")
+    backup_path = f"{DROPBOX_BACKUP_FOLDER}/配車予定 次郎_{timestamp}.xlsm"
+    backup_response = upload_dropbox_file(backup_path, original_content, access_token, mode="add")
+    if backup_response.status_code != 200:
+        raise RuntimeError("バックアップを作成できないため、本番ファイルは更新しません。\n" + dropbox_error_text(backup_response))
+
+    saved_content, changed_cells = update_workbook_bytes(original_content, customer_name, product_name, proposed)
+    upload_response = upload_dropbox_file(target_path, saved_content, access_token, mode="update", rev=revision)
+    if upload_response.status_code == 409:
+        raise RuntimeError("PCまたは別端末でExcelが更新されています。再読み込みしてからやり直してください")
+    if upload_response.status_code != 200:
+        raise RuntimeError("本番Excelを更新できませんでした。必要なDropbox権限は files.content.write です。\n" + dropbox_error_text(upload_response))
+
+    cleanup_warning = trim_old_dropbox_backups(access_token, keep=30)
+    st.cache_data.clear()
+    return {
+        "backup_path": backup_path,
+        "updated_at": get_jst_now(),
+        "changed_cells": changed_cells,
+        "cleanup_warning": cleanup_warning,
+    }
+
+
 def get_dropbox_file_path():
     """Dropboxから直接取得するファイルパスを返す"""
     path = str(DROPBOX_FILE_PATH or "").strip()
@@ -1278,6 +1571,140 @@ def show_back_home_button(key):
 # =========================
 # 顧客詳細
 # =========================
+def value_for_input(value):
+    if value is None:
+        return ""
+    if isinstance(value, float) and math.isnan(value):
+        return ""
+    return str(value)
+
+
+def date_for_input(value):
+    parsed = to_date(value)
+    return parsed.strftime("%Y/%m/%d") if parsed else ""
+
+
+def parse_optional_date(text):
+    value = str(text).strip()
+    if not value:
+        return None
+    try:
+        parsed = pd.to_datetime(value, errors="raise")
+        return parsed.to_pydatetime().replace(hour=0, minute=0, second=0, microsecond=0)
+    except Exception as exc:
+        raise ValueError("配達日は 2026/07/15 のように入力してください。") from exc
+
+
+def display_change_value(value):
+    if value is None or value == "":
+        return "（空欄）"
+    if isinstance(value, (datetime, date)):
+        return value.strftime("%Y/%m/%d")
+    return str(value)
+
+
+def render_customer_excel_editor(customer_name, product_name, current):
+    """商品カード内に、確認画面付きのExcel編集欄を追加する。"""
+    identity = f"{customer_name}|{product_name}"
+    key_suffix = str(abs(hash(identity)))
+    edit_key = f"excel_edit_{key_suffix}"
+    confirm_key = f"excel_confirm_{key_suffix}"
+
+    if current.get("商品一致件数") == 0:
+        st.error("顧客名・商品名が一致する行が見つからないため編集できません。")
+        return
+    if current.get("商品一致件数", 0) > 1:
+        st.error("同じ顧客名・商品名の行が複数見つかりました")
+        return
+
+    st.caption("メーカー")
+    st.markdown(f"**{clean_value(current.get('メーカー'))}**")
+    col_a, col_b, col_c = st.columns(3)
+    with col_a:
+        st.caption("本数")
+        st.markdown(f"**{format_number(current.get('本数'))}**")
+    with col_b:
+        st.caption("kg/本")
+        st.markdown(f"**{format_number(current.get('kg/本'))}**")
+    with col_c:
+        st.caption("配達日")
+        st.markdown(f"**{format_date(current.get('配達日'))}**")
+
+    if not st.session_state.get(edit_key) and not st.session_state.get(confirm_key):
+        if st.button("編集", key=f"edit_button_{key_suffix}"):
+            st.session_state[edit_key] = True
+            st.rerun()
+        return
+
+    if st.session_state.get(confirm_key):
+        pending = st.session_state[confirm_key]
+        st.markdown("**保存前の確認**")
+        for label, values in pending["changes"].items():
+            st.write(f"{label}：{display_change_value(values[0])} → {display_change_value(values[1])}")
+        save_col, cancel_col = st.columns(2)
+        with save_col:
+            if st.button("保存", key=f"save_confirm_{key_suffix}", type="primary", use_container_width=True):
+                try:
+                    with st.spinner("バックアップを作成して保存しています…"):
+                        result = save_customer_excel_changes(customer_name, product_name, pending["proposed"])
+                    st.session_state.pop(confirm_key, None)
+                    st.session_state.pop(edit_key, None)
+                    st.session_state["excel_save_success"] = {
+                        **result,
+                        "customer_name": customer_name,
+                        "product_name": product_name,
+                    }
+                    st.rerun()
+                except Exception as exc:
+                    st.error(str(exc))
+        with cancel_col:
+            if st.button("キャンセル", key=f"cancel_confirm_{key_suffix}", use_container_width=True):
+                st.session_state.pop(confirm_key, None)
+                st.session_state.pop(edit_key, None)
+                st.rerun()
+        return
+
+    with st.form(f"excel_edit_form_{key_suffix}"):
+        maker = st.text_input("メーカー", value=value_for_input(current.get("メーカー")))
+        bottles = st.text_input("本数", value=value_for_input(current.get("本数")))
+        kg_per_bottle = st.text_input("kg/本", value=value_for_input(current.get("kg/本")))
+        delivery_date = st.text_input("配達日", value=date_for_input(current.get("配達日")), placeholder="例：2026/07/15")
+        address = st.text_input("住所", value=value_for_input(current.get("住所")))
+        map_location = st.text_input("マップ位置", value=value_for_input(current.get("マップ位置")))
+        save_col, cancel_col = st.columns(2)
+        with save_col:
+            proceed = st.form_submit_button("保存", type="primary", use_container_width=True)
+        with cancel_col:
+            cancel = st.form_submit_button("キャンセル", use_container_width=True)
+
+    if cancel:
+        st.session_state.pop(edit_key, None)
+        st.rerun()
+    if proceed:
+        try:
+            proposed = {
+                "メーカー": str(maker),
+                "本数": parse_optional_nonnegative_number(bottles, integer=True),
+                "kg/本": parse_optional_nonnegative_number(kg_per_bottle, integer=False),
+                "配達日": parse_optional_date(delivery_date),
+                "住所": str(address),
+                "マップ位置": validate_map_location(map_location),
+            }
+            changes = {
+                label: (current.get(label), proposed[label])
+                for label in proposed
+                if not same_excel_value(current.get(label), proposed[label])
+            }
+            if not changes:
+                st.warning("変更された項目がありません。")
+            else:
+                st.session_state[confirm_key] = {"proposed": proposed, "changes": changes}
+                st.session_state.pop(edit_key, None)
+                st.rerun()
+        except ValueError as exc:
+            st.error(str(exc))
+
+
 def show_customer_detail(df, customer_name):
     detail = df[df["顧客名"] == customer_name].copy()
 
@@ -1297,6 +1724,16 @@ def show_customer_detail(df, customer_name):
     st.write(f"**地域：** {region}")
     st.write(f"**商品数：** {len(visible_detail)}件")
 
+    success = st.session_state.pop("excel_save_success", None)
+    if success:
+        st.success("保存しました")
+        st.success("バックアップを作成しました")
+        st.write(f"**更新日時：** {success['updated_at'].strftime('%Y/%m/%d %H:%M:%S')}")
+        st.write(f"**更新した顧客名：** {success['customer_name']}")
+        st.write(f"**更新した商品名：** {success['product_name']}")
+        if success.get("cleanup_warning"):
+            st.warning(success["cleanup_warning"])
+
     try:
         map_info = get_customer_map_info(detail)
         if map_info:
@@ -1309,6 +1746,17 @@ def show_customer_detail(df, customer_name):
     if visible_detail.empty:
         st.info("表示対象の商品はありません。使用数量/日が0または空白の商品は非表示にしています。")
         return
+
+    latest_excel_content = None
+    latest_excel_error = ""
+    if has_dropbox_auth_config():
+        try:
+            token = get_dropbox_access_token()
+            latest_excel_content, latest_response = download_dropbox_file(get_dropbox_file_path(), token)
+            if latest_excel_content is None:
+                latest_excel_error = dropbox_error_text(latest_response)
+        except Exception as exc:
+            latest_excel_error = str(exc)
 
     for _, row in visible_detail.iterrows():
         product_name = clean_value(row["商品名"])
@@ -1335,6 +1783,20 @@ def show_customer_detail(df, customer_name):
 
                 st.caption("残数")
                 st.markdown(f"**{remaining}**")
+
+            if latest_excel_content is not None:
+                try:
+                    current_edit_values = read_edit_values_from_bytes(
+                        latest_excel_content,
+                        customer_name,
+                        product_name,
+                    )
+                    render_customer_excel_editor(customer_name, product_name, current_edit_values)
+                except Exception as exc:
+                    st.error(f"編集用データを読み込めませんでした：{exc}")
+            elif latest_excel_error:
+                st.error("編集用Excelを取得できませんでした。")
+                st.code(latest_excel_error)
 
 
     show_customer_notes(customer_name)
