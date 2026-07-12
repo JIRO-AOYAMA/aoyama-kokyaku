@@ -1976,11 +1976,24 @@ def render_customer_excel_editor(customer_name, product_name, current):
             if not changes:
                 st.warning("変更された項目がありません。")
             else:
-                st.session_state[confirm_key] = {"proposed": proposed, "changes": changes}
+                with st.spinner("DropboxのExcelへ保存しています…"):
+                    result = save_customer_excel_changes(
+                        customer_name,
+                        product_name,
+                        proposed,
+                    )
+                st.session_state.pop(confirm_key, None)
                 st.session_state.pop(edit_key, None)
+                st.session_state["excel_save_success"] = {
+                    **result,
+                    "customer_name": customer_name,
+                    "product_name": product_name,
+                }
                 st.rerun()
         except ValueError as exc:
             st.error(str(exc))
+        except Exception as exc:
+            st.error(f"保存できませんでした：{exc}")
 
 
 
@@ -2059,7 +2072,7 @@ def render_customer_map_editor(customer_name, current):
         save_col, cancel_col = st.columns(2)
         with save_col:
             proceed = st.form_submit_button(
-                "確認へ",
+                "保存",
                 type="primary",
                 use_container_width=True,
             )
@@ -2089,15 +2102,24 @@ def render_customer_map_editor(customer_name, current):
             if not changes:
                 st.warning("変更された項目がありません。")
             else:
-                st.session_state[confirm_key] = {
-                    "住所": proposed_address,
-                    "マップ位置": proposed_map,
-                    "changes": changes,
-                }
+                with st.spinner("DropboxのExcelへ保存しています…"):
+                    result = save_customer_map_changes(
+                        customer_name,
+                        proposed_address,
+                        proposed_map,
+                    )
+                st.session_state.pop(confirm_key, None)
                 st.session_state.pop(edit_key, None)
+                st.session_state["excel_save_success"] = {
+                    **result,
+                    "customer_name": customer_name,
+                    "product_name": "住所・マップ位置",
+                }
                 st.rerun()
         except ValueError as exc:
             st.error(str(exc))
+        except Exception as exc:
+            st.error(f"保存できませんでした：{exc}")
 
 
 def show_customer_detail(df, customer_name):
