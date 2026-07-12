@@ -812,6 +812,46 @@ def normalize_match_value(value):
     return clean_value(value, blank_text="").strip()
 
 
+def find_sheet1_customer_rows(workbook, customer_name):
+    """
+    Sheet1のB列は顧客名の値ではなく、例: =次回配達日!B7 の数式。
+    数式の参照先（次回配達日シートB列）をたどって対象顧客の行を返す。
+    値が直接入っている場合にも対応する。
+    """
+    if SHEET_NAME not in workbook.sheetnames or DELIVERY_SHEET_NAME not in workbook.sheetnames:
+        return []
+
+    sheet1 = workbook[SHEET_NAME]
+    delivery_ws = workbook[DELIVERY_SHEET_NAME]
+    target = normalize_match_value(customer_name)
+    rows = []
+    formula_pattern = re.compile(
+        r"^=\s*(?:'次回配達日'|次回配達日)!\$?B\$?(\d+)\s*$",
+        re.IGNORECASE,
+    )
+
+    for row in range(2, sheet1.max_row + 1):
+        value = sheet1.cell(row, SHEET1_CUSTOMER_COLUMN).value
+
+        # 顧客名が直接入っている場合
+        if normalize_match_value(value) == target:
+            rows.append(row)
+            continue
+
+        # =次回配達日!B7 のような数式の場合
+        if isinstance(value, str):
+            match = formula_pattern.match(value.strip())
+            if match:
+                source_row = int(match.group(1))
+                source_customer = normalize_match_value(
+                    delivery_ws.cell(source_row, 2).value
+                )
+                if source_customer == target:
+                    rows.append(row)
+
+    return rows
+
+
 def find_header_column_in_worksheet(ws, candidates, max_rows=50):
     """見出し行を走査し、候補名に完全一致する列番号を返す。"""
     candidate_set = {str(item).strip() for item in candidates}
@@ -822,6 +862,7 @@ def find_header_column_in_worksheet(ws, candidates, max_rows=50):
     return None
 
 
+@st.cache_data(ttl=60, show_spinner=False)
 def read_edit_values_from_bytes(content, customer_name, product_name):
     """最新ブックから編集欄の現在値を取得する。"""
     workbook = load_workbook(BytesIO(content), keep_vba=True, data_only=False, read_only=False)
@@ -845,10 +886,7 @@ def read_edit_values_from_bytes(content, customer_name, product_name):
             }
 
         customer_ws = workbook[SHEET_NAME]
-        customer_rows = [
-            row for row in range(2, customer_ws.max_row + 1)
-            if normalize_match_value(customer_ws.cell(row, SHEET1_CUSTOMER_COLUMN).value) == customer_name
-        ]
+        customer_rows = find_sheet1_customer_rows(workbook, customer_name)
         first_row = customer_rows[0] if customer_rows else None
         return {
             **product_values,
@@ -928,12 +966,9 @@ def update_workbook_bytes(original_content, customer_name, product_name, propose
                 changed_cells.append((DELIVERY_SHEET_NAME, product_row, column, new_value))
 
         customer_ws = workbook[SHEET_NAME]
-        customer_rows = [
-            row for row in range(2, customer_ws.max_row + 1)
-            if normalize_match_value(customer_ws.cell(row, SHEET1_CUSTOMER_COLUMN).value) == customer_name
-        ]
+        customer_rows = find_sheet1_customer_rows(workbook, customer_name)
         if not customer_rows:
-            raise ValueError("Sheet1のB列に顧客名が一致する行が見つかりません。")
+            raise ValueError("Sheet1のB列数式が参照する顧客名に一致する行が見つかりません。")
         for row in customer_rows:
             for label, column in {"住所": SHEET1_ADDRESS_COLUMN, "マップ位置": SHEET1_MAP_COLUMN}.items():
                 cell = customer_ws.cell(row, column)
@@ -1002,19 +1037,23 @@ def save_customer_excel_changes(customer_name, product_name, proposed):
 
 
 
+@st.cache_data(ttl=60, show_spinner=False)
 def read_customer_map_values_from_bytes(content, customer_name):
-    """Sheet1のB列で顧客を探し、I列住所・J列マップ位置を返す。"""
+    """Sheet1の表示値で顧客を探し、I列住所・J列マップ位置を返す。"""
     workbook = load_workbook(BytesIO(content), keep_vba=True, data_only=False, read_only=False)
+    values_workbook = load_workbook(BytesIO(content), keep_vba=False, data_only=True, read_only=False)
     try:
-        if SHEET_NAME not in workbook.sheetnames:
+        if SHEET_NAME not in workbook.sheetnames or SHEET_NAME not in values_workbook.sheetnames:
             raise ValueError("Sheet1が見つかりません。")
         ws = workbook[SHEET_NAME]
+        values_ws = values_workbook[SHEET_NAME]
+        target = normalize_match_value(customer_name)
         rows = [
-            row for row in range(2, ws.max_row + 1)
-            if normalize_match_value(ws.cell(row, SHEET1_CUSTOMER_COLUMN).value) == customer_name
+            row for row in range(2, values_ws.max_row + 1)
+            if normalize_match_value(values_ws.cell(row, SHEET1_CUSTOMER_COLUMN).value) == target
         ]
         if not rows:
-            raise ValueError("Sheet1のB列に顧客名が一致する行が見つかりません。")
+            raise ValueError("Sheet1のB列に表示されている顧客名と一致する行が見つかりません。")
         first_row = rows[0]
         return {
             "住所": ws.cell(first_row, SHEET1_ADDRESS_COLUMN).value,
@@ -1023,23 +1062,27 @@ def read_customer_map_values_from_bytes(content, customer_name):
         }
     finally:
         workbook.close()
+        values_workbook.close()
 
 
 def update_customer_map_workbook_bytes(original_content, customer_name, address, map_location):
     """Sheet1のI列住所・J列マップ位置だけを更新する。"""
     workbook = load_workbook(BytesIO(original_content), keep_vba=True, data_only=False, read_only=False)
+    values_workbook = load_workbook(BytesIO(original_content), keep_vba=False, data_only=True, read_only=False)
     original_sheets = list(workbook.sheetnames)
     changed_cells = []
     try:
-        if SHEET_NAME not in workbook.sheetnames:
+        if SHEET_NAME not in workbook.sheetnames or SHEET_NAME not in values_workbook.sheetnames:
             raise ValueError("Sheet1が見つかりません。")
         ws = workbook[SHEET_NAME]
+        values_ws = values_workbook[SHEET_NAME]
+        target = normalize_match_value(customer_name)
         rows = [
-            row for row in range(2, ws.max_row + 1)
-            if normalize_match_value(ws.cell(row, SHEET1_CUSTOMER_COLUMN).value) == customer_name
+            row for row in range(2, values_ws.max_row + 1)
+            if normalize_match_value(values_ws.cell(row, SHEET1_CUSTOMER_COLUMN).value) == target
         ]
         if not rows:
-            raise ValueError("Sheet1のB列に顧客名が一致する行が見つかりません。")
+            raise ValueError("Sheet1のB列に表示されている顧客名と一致する行が見つかりません。")
 
         for row in rows:
             for label, column, new_value in (
@@ -1058,6 +1101,7 @@ def update_customer_map_workbook_bytes(original_content, customer_name, address,
         workbook.save(output)
     finally:
         workbook.close()
+        values_workbook.close()
 
     saved_content = output.getvalue()
     verified = load_workbook(BytesIO(saved_content), keep_vba=True, data_only=False, read_only=False)
@@ -1988,40 +2032,38 @@ def show_customer_detail(df, customer_name):
     except Exception:
         pass
 
-    # 住所・マップ位置は商品とは別に、顧客単位で編集する。
-    try:
-        if has_dropbox_auth_config():
-            token = get_dropbox_access_token()
-            map_excel_content, map_response = download_dropbox_file(
-                get_dropbox_file_path(),
-                token,
-            )
-            if map_excel_content is None:
-                st.error("住所・マップ位置の編集用Excelを取得できませんでした。")
-                st.code(dropbox_error_text(map_response))
-            else:
-                current_map_values = read_customer_map_values_from_bytes(
-                    map_excel_content,
-                    customer_name,
-                )
-                render_customer_map_editor(customer_name, current_map_values)
-    except Exception as exc:
-        st.error(f"住所・マップ位置を読み込めませんでした：{exc}")
-
-    if visible_detail.empty:
-        st.info("表示対象の商品はありません。使用数量/日が0または空白の商品は非表示にしています。")
-        return
-
+    # 編集用Excelは顧客詳細を開いたときに1回だけ取得して使い回す。
     latest_excel_content = None
     latest_excel_error = ""
     if has_dropbox_auth_config():
         try:
             token = get_dropbox_access_token()
-            latest_excel_content, latest_response = download_dropbox_file(get_dropbox_file_path(), token)
+            latest_excel_content, latest_response = download_dropbox_file(
+                get_dropbox_file_path(),
+                token,
+            )
             if latest_excel_content is None:
                 latest_excel_error = dropbox_error_text(latest_response)
         except Exception as exc:
             latest_excel_error = str(exc)
+
+    # 住所・マップ位置は商品とは別に、顧客単位で編集する。
+    if latest_excel_content is not None:
+        try:
+            current_map_values = read_customer_map_values_from_bytes(
+                latest_excel_content,
+                customer_name,
+            )
+            render_customer_map_editor(customer_name, current_map_values)
+        except Exception as exc:
+            st.error(f"住所・マップ位置を読み込めませんでした：{exc}")
+    elif latest_excel_error:
+        st.error("住所・マップ位置の編集用Excelを取得できませんでした。")
+        st.code(latest_excel_error)
+
+    if visible_detail.empty:
+        st.info("表示対象の商品はありません。使用数量/日が0または空白の商品は非表示にしています。")
+        return
 
     for _, row in visible_detail.iterrows():
         product_name = clean_value(row["商品名"])
