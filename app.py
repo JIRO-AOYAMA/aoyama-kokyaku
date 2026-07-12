@@ -938,6 +938,44 @@ def same_excel_value(old, new):
     return old == new
 
 
+def enable_excel_recalculation(workbook):
+    """Excelで開いたときに残数・次回配達予定などの数式を必ず再計算させる。"""
+    try:
+        workbook.calculation.fullCalcOnLoad = True
+        workbook.calculation.forceFullCalc = True
+        workbook.calculation.calcMode = "auto"
+    except Exception:
+        # openpyxlの版によって属性名が異なる場合でも、セル保存は続行する。
+        pass
+
+
+def verify_remote_workbook_changes(content, changed_cells):
+    """Dropboxから再取得したブックに、変更値が実在することを検証する。"""
+    workbook = load_workbook(BytesIO(content), keep_vba=True, data_only=False, read_only=False)
+    try:
+        for sheet, row, column, expected in changed_cells:
+            if sheet not in workbook.sheetnames:
+                raise RuntimeError(f"Dropbox保存後の確認でシート「{sheet}」が見つかりません。")
+            cell = workbook[sheet].cell(row, column)
+            if not same_excel_value(cell.value, expected):
+                raise RuntimeError(
+                    f"Dropbox保存後の確認で {sheet}!{cell.coordinate} が更新されていません。"
+                )
+    finally:
+        workbook.close()
+
+
+def confirm_dropbox_upload(target_path, access_token, changed_cells):
+    """アップロード後にDropbox本体を読み直し、保存完了を保証する。"""
+    uploaded_content, response = download_dropbox_file(target_path, access_token)
+    if uploaded_content is None:
+        raise RuntimeError(
+            "Dropboxへ送信後、更新済みExcelを再取得できませんでした。\n"
+            + dropbox_error_text(response)
+        )
+    verify_remote_workbook_changes(uploaded_content, changed_cells)
+
+
 def update_workbook_bytes(original_content, customer_name, product_name, proposed):
     """指定された6列の値だけ変更し、再オープン検証したbytesを返す。"""
     workbook = load_workbook(BytesIO(original_content), keep_vba=True, data_only=False, read_only=False)
@@ -979,6 +1017,7 @@ def update_workbook_bytes(original_content, customer_name, product_name, propose
 
         if not changed_cells:
             raise ValueError("変更された項目がありません。")
+        enable_excel_recalculation(workbook)
         output = BytesIO()
         workbook.save(output)
     finally:
@@ -1026,6 +1065,9 @@ def save_customer_excel_changes(customer_name, product_name, proposed):
     if upload_response.status_code != 200:
         raise RuntimeError("本番Excelを更新できませんでした。必要なDropbox権限は files.content.write です。\n" + dropbox_error_text(upload_response))
 
+    # 「APIが200を返した」だけで成功扱いにせず、Dropbox上の実ファイルを再確認する。
+    confirm_dropbox_upload(target_path, access_token, changed_cells)
+
     cleanup_warning = trim_old_dropbox_backups(access_token, keep=30)
     st.cache_data.clear()
     return {
@@ -1054,6 +1096,14 @@ def read_customer_map_values_from_bytes(content, customer_name):
         ]
         if not rows:
             raise ValueError("Sheet1のB列に表示されている顧客名と一致する行が見つかりません。")
+
+        # 元ブックに地図列がない場合も、Excel上で保存場所が分かるよう見出しを作る。
+        if not normalize_match_value(ws.cell(1, SHEET1_ADDRESS_COLUMN).value):
+            ws.cell(1, SHEET1_ADDRESS_COLUMN).value = "住所"
+            changed_cells.append((SHEET_NAME, 1, SHEET1_ADDRESS_COLUMN, "住所"))
+        if not normalize_match_value(ws.cell(1, SHEET1_MAP_COLUMN).value):
+            ws.cell(1, SHEET1_MAP_COLUMN).value = "マップ位置"
+            changed_cells.append((SHEET_NAME, 1, SHEET1_MAP_COLUMN, "マップ位置"))
         first_row = rows[0]
         return {
             "住所": ws.cell(first_row, SHEET1_ADDRESS_COLUMN).value,
@@ -1097,6 +1147,7 @@ def update_customer_map_workbook_bytes(original_content, customer_name, address,
         if not changed_cells:
             raise ValueError("変更された項目がありません。")
 
+        enable_excel_recalculation(workbook)
         output = BytesIO()
         workbook.save(output)
     finally:
@@ -1169,6 +1220,9 @@ def save_customer_map_changes(customer_name, address, map_location):
             "本番Excelを更新できませんでした。\n"
             + dropbox_error_text(upload_response)
         )
+
+    # Dropbox上のファイルを読み直し、住所・地図が正しいセルへ入ったことを確認する。
+    confirm_dropbox_upload(target_path, access_token, changed_cells)
 
     cleanup_warning = trim_old_dropbox_backups(access_token, keep=30)
     st.cache_data.clear()
