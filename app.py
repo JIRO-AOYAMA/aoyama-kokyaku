@@ -899,6 +899,56 @@ def read_edit_values_from_bytes(content, customer_name, product_name):
         workbook.close()
 
 
+@st.cache_data(ttl=60, show_spinner=False)
+def read_customer_edit_bundle_from_bytes(content, customer_name):
+    """顧客詳細に必要な地図と全商品の編集値を、Excelを1回開いてまとめて読む。"""
+    workbook = load_workbook(BytesIO(content), keep_vba=True, data_only=False, read_only=False)
+    values_workbook = load_workbook(BytesIO(content), keep_vba=False, data_only=True, read_only=False)
+    try:
+        if DELIVERY_SHEET_NAME not in workbook.sheetnames or SHEET_NAME not in workbook.sheetnames:
+            raise ValueError("必要なシート（次回配達日 または Sheet1）が見つかりません。")
+
+        delivery_ws = workbook[DELIVERY_SHEET_NAME]
+        target = normalize_match_value(customer_name)
+        product_rows = {}
+        for row in range(1, delivery_ws.max_row + 1):
+            if normalize_match_value(delivery_ws.cell(row, 2).value) != target:
+                continue
+            product = normalize_match_value(delivery_ws.cell(row, 5).value)
+            if product:
+                product_rows.setdefault(product, []).append(row)
+
+        products = {}
+        for product, rows in product_rows.items():
+            first_row = rows[0]
+            products[product] = {
+                "メーカー": delivery_ws.cell(first_row, 6).value,
+                "本数": delivery_ws.cell(first_row, 8).value,
+                "kg/本": delivery_ws.cell(first_row, 9).value,
+                "配達日": delivery_ws.cell(first_row, 10).value,
+                "商品一致件数": len(rows),
+            }
+
+        values_ws = values_workbook[SHEET_NAME]
+        customer_rows = [
+            row for row in range(2, values_ws.max_row + 1)
+            if normalize_match_value(values_ws.cell(row, SHEET1_CUSTOMER_COLUMN).value) == target
+        ]
+        first_customer_row = customer_rows[0] if customer_rows else None
+        ws = workbook[SHEET_NAME]
+        map_values = {
+            "住所": ws.cell(first_customer_row, SHEET1_ADDRESS_COLUMN).value if first_customer_row else None,
+            "マップ位置": ws.cell(first_customer_row, SHEET1_MAP_COLUMN).value if first_customer_row else None,
+            "顧客一致件数": len(customer_rows),
+        }
+        for values in products.values():
+            values.update(map_values)
+        return {"map": map_values, "products": products}
+    finally:
+        workbook.close()
+        values_workbook.close()
+
+
 def parse_optional_nonnegative_number(text, integer=False):
     value = str(text).strip()
     if value == "":
@@ -2089,6 +2139,7 @@ def show_customer_detail(df, customer_name):
     # 編集用Excelは顧客詳細を開いたときに1回だけ取得して使い回す。
     latest_excel_content = None
     latest_excel_error = ""
+    edit_bundle = None
     if has_dropbox_auth_config():
         try:
             token = get_dropbox_access_token()
@@ -2098,16 +2149,18 @@ def show_customer_detail(df, customer_name):
             )
             if latest_excel_content is None:
                 latest_excel_error = dropbox_error_text(latest_response)
+            else:
+                edit_bundle = read_customer_edit_bundle_from_bytes(
+                    latest_excel_content,
+                    customer_name,
+                )
         except Exception as exc:
             latest_excel_error = str(exc)
 
     # 住所・マップ位置は商品とは別に、顧客単位で編集する。
-    if latest_excel_content is not None:
+    if edit_bundle is not None:
         try:
-            current_map_values = read_customer_map_values_from_bytes(
-                latest_excel_content,
-                customer_name,
-            )
+            current_map_values = edit_bundle["map"]
             render_customer_map_editor(customer_name, current_map_values)
         except Exception as exc:
             st.error(f"住所・マップ位置を読み込めませんでした：{exc}")
@@ -2145,12 +2198,11 @@ def show_customer_detail(df, customer_name):
                 st.caption("残数")
                 st.markdown(f"**{remaining}**")
 
-            if latest_excel_content is not None:
+            if edit_bundle is not None:
                 try:
-                    current_edit_values = read_edit_values_from_bytes(
-                        latest_excel_content,
-                        customer_name,
+                    current_edit_values = edit_bundle["products"].get(
                         product_name,
+                        {"商品一致件数": 0},
                     )
                     render_customer_excel_editor(customer_name, product_name, current_edit_values)
                 except Exception as exc:
