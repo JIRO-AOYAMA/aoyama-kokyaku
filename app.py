@@ -38,6 +38,7 @@ DROPBOX_ACCESS_TOKEN = st.secrets.get("DROPBOX_ACCESS_TOKEN", "")
 DROPBOX_DEFAULT_FILE_PATH = "/1共有　青山商店　本社/配車表-北海道-/配車予定 次郎.xlsm"
 DROPBOX_FILE_PATH = st.secrets.get("DROPBOX_FILE_PATH", DROPBOX_DEFAULT_FILE_PATH)
 DROPBOX_BACKUP_FOLDER = "/1共有　青山商店　本社/配車表-北海道-/Backups"
+DROPBOX_FAST_CACHE_FILE = "/1共有　青山商店　本社/配車表-北海道-/顧客検索キャッシュ.json"
 DELIVERY_SHEET_NAME = "次回配達日"
 SHEET1_CUSTOMER_COLUMN = 2   # B列：顧客名
 SHEET1_ADDRESS_COLUMN = 9    # I列：住所
@@ -778,6 +779,14 @@ def call_dropbox_rpc(endpoint, payload, access_token):
         )
     except Exception as exc:
         raise RuntimeError(f"Dropbox APIへの接続に失敗しました: {exc}") from exc
+
+
+def get_dropbox_revision(path, access_token):
+    """Dropboxファイルの現在のrevだけを軽量に取得する。"""
+    response = call_dropbox_rpc("files/get_metadata", {"path": path}, access_token)
+    if response.status_code != 200:
+        raise RuntimeError("Dropboxのファイル情報を取得できませんでした。\n" + dropbox_error_text(response))
+    return str(response.json().get("rev", ""))
 
 
 def ensure_dropbox_backup_folder(access_token):
@@ -1768,6 +1777,10 @@ def rebuild_sheet1_from_formula_references(excel_source):
                 "ひらがな": sheet1.cell(sheet1_row, 8).value,
                 "住所": sheet1.cell(sheet1_row, SHEET1_ADDRESS_COLUMN).value,
                 "マップ位置": sheet1.cell(sheet1_row, SHEET1_MAP_COLUMN).value,
+                "メーカー": delivery.cell(source_row, 6).value,
+                "本数": delivery.cell(source_row, 8).value,
+                "kg/本": delivery.cell(source_row, 9).value,
+                "配達日": delivery.cell(source_row, 10).value,
             })
         return pd.DataFrame(rows)
     finally:
@@ -1870,6 +1883,50 @@ def normalize_excel_table(excel_source):
     return df
 
 
+@st.cache_data(ttl=60, show_spinner=False)
+def load_fast_dropbox_data():
+    """通常表示は小さなJSONを使い、Excelが変わった時だけ再生成する。"""
+    access_token = get_dropbox_access_token()
+    excel_path = get_dropbox_file_path()
+    excel_revision = get_dropbox_revision(excel_path, access_token)
+
+    cache_content, cache_response = download_dropbox_file(
+        DROPBOX_FAST_CACHE_FILE,
+        access_token,
+    )
+    if cache_content is not None:
+        try:
+            payload = json.loads(cache_content.decode("utf-8"))
+            if payload.get("excel_revision") == excel_revision:
+                records = payload.get("records", [])
+                if isinstance(records, list) and records:
+                    return pd.DataFrame(records)
+        except Exception:
+            pass
+
+    # Excelが更新された時だけ、1回だけ重い解析を行ってJSONを作り直す。
+    excel_content, response = download_dropbox_file(excel_path, access_token)
+    if excel_content is None:
+        raise RuntimeError("Excelを取得できませんでした。\n" + dropbox_error_text(response))
+    df = normalize_excel_table(BytesIO(excel_content))
+    records = json.loads(df.to_json(orient="records", date_format="iso", force_ascii=False))
+    payload = json.dumps(
+        {"excel_revision": excel_revision, "records": records},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    upload_response = upload_dropbox_file(
+        DROPBOX_FAST_CACHE_FILE,
+        payload,
+        access_token,
+        mode="overwrite",
+    )
+    if upload_response.status_code != 200:
+        # キャッシュ作成失敗でも、取得済みデータで画面表示は続ける。
+        return df
+    return df
+
+
 @st.cache_data(ttl=60)
 def load_data():
     """
@@ -1877,11 +1934,9 @@ def load_data():
     設定がなければ同じフォルダのローカルExcelを読む。
     """
     if has_dropbox_auth_config():
-        excel_source = read_excel_from_dropbox_api()
-    else:
-        excel_source = read_excel_local()
+        return load_fast_dropbox_data()
 
-    return normalize_excel_table(excel_source)
+    return normalize_excel_table(read_excel_local())
 
 
 # =========================
@@ -2332,30 +2387,14 @@ def show_customer_detail(df, customer_name):
     except Exception:
         pass
 
-    # 編集用Excelは顧客詳細を開いたときに1回だけ取得して使い回す。
-    latest_excel_content = None
-    latest_excel_error = ""
-    edit_bundle = None
-    if has_dropbox_auth_config():
-        try:
-            latest_excel_content = get_cached_dropbox_excel_content()
-            edit_bundle = read_customer_edit_bundle_from_bytes(
-                latest_excel_content,
-                customer_name,
-            )
-        except Exception as exc:
-            latest_excel_error = str(exc)
-
-    # 住所・マップ位置は商品とは別に、顧客単位で編集する。
-    if edit_bundle is not None:
-        try:
-            current_map_values = edit_bundle["map"]
-            render_customer_map_editor(customer_name, current_map_values)
-        except Exception as exc:
-            st.error(f"住所・マップ位置を読み込めませんでした：{exc}")
-    elif latest_excel_error:
-        st.error("住所・マップ位置の編集用Excelを取得できませんでした。")
-        st.code(latest_excel_error)
+    # 詳細表示では重いExcelを開かず、高速JSON内の現在値を使う。
+    first_detail = detail.iloc[0]
+    current_map_values = {
+        "住所": first_detail.get("住所"),
+        "マップ位置": first_detail.get("マップ位置"),
+        "顧客一致件数": len(detail),
+    }
+    render_customer_map_editor(customer_name, current_map_values)
 
     if visible_detail.empty:
         st.info("表示対象の商品はありません。使用数量/日が0または空白の商品は非表示にしています。")
@@ -2387,18 +2426,18 @@ def show_customer_detail(df, customer_name):
                 st.caption("残数")
                 st.markdown(f"**{remaining}**")
 
-            if edit_bundle is not None:
-                try:
-                    current_edit_values = edit_bundle["products"].get(
-                        product_name,
-                        {"商品一致件数": 0},
-                    )
-                    render_customer_excel_editor(customer_name, product_name, current_edit_values)
-                except Exception as exc:
-                    st.error(f"編集用データを読み込めませんでした：{exc}")
-            elif latest_excel_error:
-                st.error("編集用Excelを取得できませんでした。")
-                st.code(latest_excel_error)
+            product_match_count = int((detail["商品名"].astype(str).str.strip() == product_name).sum())
+            current_edit_values = {
+                "メーカー": row.get("メーカー"),
+                "本数": row.get("本数"),
+                "kg/本": row.get("kg/本"),
+                "配達日": row.get("配達日"),
+                "住所": current_map_values["住所"],
+                "マップ位置": current_map_values["マップ位置"],
+                "商品一致件数": product_match_count,
+                "顧客一致件数": len(detail),
+            }
+            render_customer_excel_editor(customer_name, product_name, current_edit_values)
 
 
     show_customer_notes(customer_name)
