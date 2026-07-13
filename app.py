@@ -48,6 +48,7 @@ SUPABASE_SECRET_KEY = st.secrets.get("SUPABASE_SECRET_KEY", "")
 SUPABASE_SERVICE_ROLE_KEY = st.secrets.get("SUPABASE_SERVICE_ROLE_KEY", "")
 SUPABASE_ANON_KEY = st.secrets.get("SUPABASE_ANON_KEY", "")
 SUPABASE_NOTES_TABLE = st.secrets.get("SUPABASE_NOTES_TABLE", "notes")
+VOICE_INPUT_HELP = "スマホではキーボードのマイクを押して音声入力できます。"
 
 REQUIRED_COLUMNS = [
     "ID",
@@ -970,7 +971,10 @@ def read_customer_edit_bundle_from_bytes(content, customer_name):
 
 
 def parse_optional_nonnegative_number(text, integer=False):
-    value = str(text).strip()
+    value = str(text).strip().translate(str.maketrans("０１２３４５６７８９．，", "0123456789.,"))
+    # 音声入力で付きやすい単位を許可する。
+    value = re.sub(r"\s*(?:本|kg|KG|ｋｇ|キロ|キログラム)\s*$", "", value, flags=re.IGNORECASE)
+    value = value.replace(",", "")
     if value == "":
         return None
     try:
@@ -1624,7 +1628,7 @@ def render_note_delete_controls(note):
 def show_customer_notes(customer_name):
     st.markdown("---")
     st.subheader("📝 この顧客のメモ")
-    st.caption("スマホではキーボードのマイクから音声入力できます。")
+    st.caption(f"🎤 {VOICE_INPUT_HELP}")
 
     note_key = f"customer_note_input_{customer_name}"
     clear_note_key = f"clear_{note_key}"
@@ -1639,6 +1643,7 @@ def show_customer_notes(customer_name):
         key=note_key,
         height=120,
         placeholder="例：次回は午前中希望。サンプル持参。など",
+        help=VOICE_INPUT_HELP,
     )
 
     if st.button("メモを保存", key=f"save_customer_note_{customer_name}"):
@@ -1999,6 +2004,12 @@ def parse_optional_date(text):
     if not value:
         return None
     try:
+        value = value.translate(str.maketrans("０１２３４５６７８９", "0123456789"))
+        # 「2026年7月15日」のような音声入力結果も受け付ける。
+        value = value.replace("年", "/").replace("月", "/").replace("日", "")
+        # 「7/14」「7月14日」のように年がなければ、現在の年を自動補完する。
+        if re.fullmatch(r"\d{1,2}\s*[/\-]\s*\d{1,2}", value):
+            value = f"{date.today().year}/{value}"
         parsed = pd.to_datetime(value, errors="raise")
         return parsed.to_pydatetime().replace(hour=0, minute=0, second=0, microsecond=0)
     except Exception as exc:
@@ -2075,10 +2086,31 @@ def render_customer_excel_editor(customer_name, product_name, current):
         return
 
     with st.form(f"excel_edit_form_{key_suffix}"):
-        maker = st.text_input("メーカー", value=value_for_input(current.get("メーカー")))
-        bottles = st.text_input("本数", value=value_for_input(current.get("本数")))
-        kg_per_bottle = st.text_input("kg/本", value=value_for_input(current.get("kg/本")))
-        delivery_date = st.text_input("配達日", value=date_for_input(current.get("配達日")), placeholder="例：2026/07/15")
+        st.caption(f"🎤 {VOICE_INPUT_HELP} 入力欄は毎回空白から始まります。")
+        maker = st.text_input(
+            "メーカー",
+            value="",
+            placeholder="メーカー名を入力",
+            help=VOICE_INPUT_HELP,
+        )
+        bottles = st.text_input(
+            "本数",
+            value="",
+            placeholder="例：44本",
+            help=VOICE_INPUT_HELP,
+        )
+        kg_per_bottle = st.text_input(
+            "kg/本",
+            value="",
+            placeholder="例：450キロ",
+            help=VOICE_INPUT_HELP,
+        )
+        delivery_date = st.text_input(
+            "配達日",
+            value="",
+            placeholder="例：2026年7月15日",
+            help=VOICE_INPUT_HELP,
+        )
         save_col, cancel_col = st.columns(2)
         with save_col:
             proceed = st.form_submit_button("保存", type="primary", use_container_width=True)
@@ -2091,10 +2123,20 @@ def render_customer_excel_editor(customer_name, product_name, current):
     if proceed:
         try:
             proposed = {
-                "メーカー": str(maker),
-                "本数": parse_optional_nonnegative_number(bottles, integer=True),
-                "kg/本": parse_optional_nonnegative_number(kg_per_bottle, integer=False),
-                "配達日": parse_optional_date(delivery_date),
+                # 空欄は既存値を維持し、入力された項目だけ更新する。
+                "メーカー": str(maker).strip() or current.get("メーカー"),
+                "本数": (
+                    parse_optional_nonnegative_number(bottles, integer=True)
+                    if str(bottles).strip() else current.get("本数")
+                ),
+                "kg/本": (
+                    parse_optional_nonnegative_number(kg_per_bottle, integer=False)
+                    if str(kg_per_bottle).strip() else current.get("kg/本")
+                ),
+                "配達日": (
+                    parse_optional_date(delivery_date)
+                    if str(delivery_date).strip() else current.get("配達日")
+                ),
                 "住所": current.get("住所"),
                 "マップ位置": current.get("マップ位置"),
             }
@@ -2190,14 +2232,16 @@ def render_customer_map_editor(customer_name, current):
         return
 
     with st.form(f"map_edit_form_{key_suffix}"):
+        st.caption(f"🎤 {VOICE_INPUT_HELP}")
         address = st.text_input(
             "住所",
             value=value_for_input(current.get("住所")),
+            help=VOICE_INPUT_HELP,
         )
         map_location = st.text_input(
             "マップ位置",
             value=value_for_input(current.get("マップ位置")),
-            help="緯度,経度／Googleマップ共有URL／文字列を入力できます。",
+            help=f"緯度,経度／Googleマップ共有URL／文字列を入力できます。{VOICE_INPUT_HELP}",
         )
         save_col, cancel_col = st.columns(2)
         with save_col:
@@ -2364,6 +2408,7 @@ def show_customer_detail(df, customer_name):
 # =========================
 def show_customer_search(df=None):
     st.subheader("🔍 顧客検索")
+    st.caption(f"🎤 {VOICE_INPUT_HELP} 漢字の顧客名でも検索できます。")
 
     default_keyword = str(get_query_value("customer_search", "")).strip()
     keyword = st.text_input(
@@ -2371,6 +2416,7 @@ def show_customer_search(df=None):
         value=default_keyword,
         placeholder="例：こ、こも、むら",
         key="customer_search_input",
+        help=VOICE_INPUT_HELP,
     ).strip()
 
     if keyword:
@@ -2387,7 +2433,10 @@ def show_customer_search(df=None):
         with st.spinner("顧客データを読み込んでいます…"):
             df = load_data()
 
-    hit = df[df["ひらがな"].str.startswith(keyword, na=False)]
+    hit = df[
+        df["ひらがな"].str.startswith(keyword, na=False)
+        | df["顧客名"].str.contains(keyword, na=False, regex=False)
+    ]
 
     if hit.empty:
         st.warning("該当する顧客がありません。")
@@ -2417,6 +2466,7 @@ def show_customer_search(df=None):
 def show_region_search(df):
     st.subheader("📍 地域検索")
     show_back_home_button("region_back_home")
+    st.caption(f"🎤 {VOICE_INPUT_HELP}")
 
     default_keyword = str(get_query_value("region_search", "")).strip()
     keyword = st.text_input(
@@ -2424,6 +2474,7 @@ def show_region_search(df):
         value=default_keyword,
         placeholder="例：帯広、芽室、釧路",
         key="region_search_input",
+        help=VOICE_INPUT_HELP,
     ).strip()
 
     if keyword:
