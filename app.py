@@ -13,6 +13,11 @@ import requests
 import streamlit as st
 from openpyxl import load_workbook
 
+try:
+    from st_keyup import st_keyup
+except ImportError:
+    st_keyup = None
+
 
 # =========================
 # 基本設定
@@ -128,6 +133,7 @@ if not st.session_state.authenticated:
             st.session_state.page = "home"
             st.session_state.selected_customer = None
             st.session_state.pop("customer_search_input", None)
+            st.session_state.pop("customer_search_live", None)
             try:
                 st.query_params.clear()
                 st.query_params["logged_in"] = "1"
@@ -2450,13 +2456,26 @@ def show_customer_search(df=None):
     st.caption(f"🎤 {VOICE_INPUT_HELP} 漢字の顧客名でも検索できます。")
 
     default_keyword = str(get_query_value("customer_search", "")).strip()
-    keyword = st.text_input(
-        "ひらがなで検索",
-        value=default_keyword,
-        placeholder="例：こ、こも、むら",
-        key="customer_search_input",
-        help=VOICE_INPUT_HELP,
-    ).strip()
+    if st_keyup is not None:
+        keyword = str(
+            st_keyup(
+                "ひらがな・漢字で検索",
+                value=default_keyword,
+                placeholder="入力すると候補がすぐ表示されます",
+                debounce=250,
+                key="customer_search_live",
+            )
+            or ""
+        ).strip()
+    else:
+        # 追加部品がまだインストールされていない環境でもアプリを止めない。
+        keyword = st.text_input(
+            "ひらがな・漢字で検索",
+            value=default_keyword,
+            placeholder="例：こ、こも、むら",
+            key="customer_search_input",
+            help=VOICE_INPUT_HELP,
+        ).strip()
 
     if keyword:
         update_query_params(page="home", customer_search=keyword)
