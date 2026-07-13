@@ -927,7 +927,6 @@ def read_edit_values_from_bytes(content, customer_name, product_name):
 def read_customer_edit_bundle_from_bytes(content, customer_name):
     """顧客詳細に必要な地図と全商品の編集値を、Excelを1回開いてまとめて読む。"""
     workbook = load_workbook(BytesIO(content), keep_vba=True, data_only=False, read_only=False)
-    values_workbook = load_workbook(BytesIO(content), keep_vba=False, data_only=True, read_only=False)
     try:
         if DELIVERY_SHEET_NAME not in workbook.sheetnames or SHEET_NAME not in workbook.sheetnames:
             raise ValueError("必要なシート（次回配達日 または Sheet1）が見つかりません。")
@@ -953,11 +952,7 @@ def read_customer_edit_bundle_from_bytes(content, customer_name):
                 "商品一致件数": len(rows),
             }
 
-        values_ws = values_workbook[SHEET_NAME]
-        customer_rows = [
-            row for row in range(2, values_ws.max_row + 1)
-            if normalize_match_value(values_ws.cell(row, SHEET1_CUSTOMER_COLUMN).value) == target
-        ]
+        customer_rows = find_sheet1_customer_rows(workbook, customer_name)
         first_customer_row = customer_rows[0] if customer_rows else None
         ws = workbook[SHEET_NAME]
         map_values = {
@@ -970,7 +965,6 @@ def read_customer_edit_bundle_from_bytes(content, customer_name):
         return {"map": map_values, "products": products}
     finally:
         workbook.close()
-        values_workbook.close()
 
 
 def parse_optional_nonnegative_number(text, integer=False):
@@ -1158,27 +1152,13 @@ def save_customer_excel_changes(customer_name, product_name, proposed):
 def read_customer_map_values_from_bytes(content, customer_name):
     """Sheet1の表示値で顧客を探し、I列住所・J列マップ位置を返す。"""
     workbook = load_workbook(BytesIO(content), keep_vba=True, data_only=False, read_only=False)
-    values_workbook = load_workbook(BytesIO(content), keep_vba=False, data_only=True, read_only=False)
     try:
-        if SHEET_NAME not in workbook.sheetnames or SHEET_NAME not in values_workbook.sheetnames:
+        if SHEET_NAME not in workbook.sheetnames:
             raise ValueError("Sheet1が見つかりません。")
         ws = workbook[SHEET_NAME]
-        values_ws = values_workbook[SHEET_NAME]
-        target = normalize_match_value(customer_name)
-        rows = [
-            row for row in range(2, values_ws.max_row + 1)
-            if normalize_match_value(values_ws.cell(row, SHEET1_CUSTOMER_COLUMN).value) == target
-        ]
+        rows = find_sheet1_customer_rows(workbook, customer_name)
         if not rows:
             raise ValueError("Sheet1のB列に表示されている顧客名と一致する行が見つかりません。")
-
-        # 元ブックに地図列がない場合も、Excel上で保存場所が分かるよう見出しを作る。
-        if not normalize_match_value(ws.cell(1, SHEET1_ADDRESS_COLUMN).value):
-            ws.cell(1, SHEET1_ADDRESS_COLUMN).value = "住所"
-            changed_cells.append((SHEET_NAME, 1, SHEET1_ADDRESS_COLUMN, "住所"))
-        if not normalize_match_value(ws.cell(1, SHEET1_MAP_COLUMN).value):
-            ws.cell(1, SHEET1_MAP_COLUMN).value = "マップ位置"
-            changed_cells.append((SHEET_NAME, 1, SHEET1_MAP_COLUMN, "マップ位置"))
         first_row = rows[0]
         return {
             "住所": ws.cell(first_row, SHEET1_ADDRESS_COLUMN).value,
@@ -1187,27 +1167,27 @@ def read_customer_map_values_from_bytes(content, customer_name):
         }
     finally:
         workbook.close()
-        values_workbook.close()
 
 
 def update_customer_map_workbook_bytes(original_content, customer_name, address, map_location):
     """Sheet1のI列住所・J列マップ位置だけを更新する。"""
     workbook = load_workbook(BytesIO(original_content), keep_vba=True, data_only=False, read_only=False)
-    values_workbook = load_workbook(BytesIO(original_content), keep_vba=False, data_only=True, read_only=False)
     original_sheets = list(workbook.sheetnames)
     changed_cells = []
     try:
-        if SHEET_NAME not in workbook.sheetnames or SHEET_NAME not in values_workbook.sheetnames:
+        if SHEET_NAME not in workbook.sheetnames:
             raise ValueError("Sheet1が見つかりません。")
         ws = workbook[SHEET_NAME]
-        values_ws = values_workbook[SHEET_NAME]
-        target = normalize_match_value(customer_name)
-        rows = [
-            row for row in range(2, values_ws.max_row + 1)
-            if normalize_match_value(values_ws.cell(row, SHEET1_CUSTOMER_COLUMN).value) == target
-        ]
+        rows = find_sheet1_customer_rows(workbook, customer_name)
         if not rows:
             raise ValueError("Sheet1のB列に表示されている顧客名と一致する行が見つかりません。")
+
+        if not normalize_match_value(ws.cell(1, SHEET1_ADDRESS_COLUMN).value):
+            ws.cell(1, SHEET1_ADDRESS_COLUMN).value = "住所"
+            changed_cells.append((SHEET_NAME, 1, SHEET1_ADDRESS_COLUMN, "住所"))
+        if not normalize_match_value(ws.cell(1, SHEET1_MAP_COLUMN).value):
+            ws.cell(1, SHEET1_MAP_COLUMN).value = "マップ位置"
+            changed_cells.append((SHEET_NAME, 1, SHEET1_MAP_COLUMN, "マップ位置"))
 
         for row in rows:
             for label, column, new_value in (
@@ -1227,7 +1207,6 @@ def update_customer_map_workbook_bytes(original_content, customer_name, address,
         workbook.save(output)
     finally:
         workbook.close()
-        values_workbook.close()
 
     saved_content = output.getvalue()
     verified = load_workbook(BytesIO(saved_content), keep_vba=True, data_only=False, read_only=False)
