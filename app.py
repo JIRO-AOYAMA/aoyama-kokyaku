@@ -125,7 +125,9 @@ if not st.session_state.authenticated:
             st.session_state.authenticated = True
             st.session_state.page = "home"
             st.session_state.selected_customer = None
+            st.session_state.pop("customer_search_input", None)
             try:
+                st.query_params.clear()
                 st.query_params["logged_in"] = "1"
                 st.query_params["page"] = "home"
             except Exception:
@@ -2360,7 +2362,7 @@ def show_customer_detail(df, customer_name):
 # =========================
 # 顧客検索
 # =========================
-def show_customer_search(df):
+def show_customer_search(df=None):
     st.subheader("🔍 顧客検索")
 
     default_keyword = str(get_query_value("customer_search", "")).strip()
@@ -2379,6 +2381,11 @@ def show_customer_search(df):
     if not keyword:
         st.info("顧客名のひらがなを入力してください。")
         return
+
+    # ログイン直後はExcelを読まず、実際に検索が始まった時だけ取得する。
+    if df is None:
+        with st.spinner("顧客データを読み込んでいます…"):
+            df = load_data()
 
     hit = df[df["ひらがな"].str.startswith(keyword, na=False)]
 
@@ -3102,33 +3109,29 @@ with col_logout:
         st.rerun()
 
 try:
-    df = load_data()
-except Exception as e:
-    st.error("ログイン後のデータ読み込み中にエラーが発生しました。")
-    st.write("白画面になる原因を確認するため、エラー内容を表示しています。")
-    st.exception(e)
-    st.stop()
-
-try:
     if st.session_state["page"] == "home":
         show_home_menu()
-        show_customer_search(df)
+        show_customer_search()
 
     elif st.session_state["page"] == "region":
+        df = load_data()
         show_region_search(df)
 
     elif st.session_state["page"] == "calendar":
+        df = load_data()
         show_dispatch_calendar(df)
 
     elif st.session_state["page"] == "delivery":
+        df = load_data()
         show_delivery_list(df)
 
     elif st.session_state["page"] == "notes":
-        show_notes_page(df)
+        show_notes_page(None)
 
     elif st.session_state["page"] == "detail":
         selected = st.session_state.get("selected_customer")
         if selected:
+            df = load_data()
             show_customer_detail(df, selected)
         else:
             set_page("home")
