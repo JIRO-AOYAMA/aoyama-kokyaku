@@ -29,6 +29,7 @@ st.set_page_config(
     page_title=APP_TITLE,
     page_icon="🚚",
     layout="wide",
+    initial_sidebar_state="collapsed",
 )
 
 EXCEL_FILE = "配車予定 次郎.xlsm"
