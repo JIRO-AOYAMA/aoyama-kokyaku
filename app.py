@@ -1323,6 +1323,17 @@ def show_dropbox_download_error(path, response):
     st.stop()
 
 
+@st.cache_data(ttl=60, show_spinner=False)
+def get_cached_dropbox_excel_content():
+    """同じExcelを画面操作ごとに再取得せず、1分間だけ共有する。"""
+    access_token = get_dropbox_access_token()
+    dropbox_file_path = get_dropbox_file_path()
+    content, response = download_dropbox_file(dropbox_file_path, access_token)
+    if content is None:
+        raise RuntimeError(dropbox_error_text(response))
+    return content
+
+
 def read_excel_from_dropbox_api():
     """Dropbox APIでExcelをダウンロードして読み込む"""
     if not has_dropbox_auth_config():
@@ -1330,12 +1341,15 @@ def read_excel_from_dropbox_api():
         st.write("secrets.toml に DROPBOX_APP_KEY / DROPBOX_APP_SECRET / DROPBOX_REFRESH_TOKEN を設定してください。")
         st.stop()
 
-    access_token = get_dropbox_access_token()
     dropbox_file_path = get_dropbox_file_path()
-    content, response = download_dropbox_file(dropbox_file_path, access_token)
-
-    if content is None:
-        show_dropbox_download_error(dropbox_file_path, response)
+    try:
+        content = get_cached_dropbox_excel_content()
+    except Exception:
+        # 従来の詳しいエラー表示を維持するため、失敗時だけ直接取得する。
+        access_token = get_dropbox_access_token()
+        content, response = download_dropbox_file(dropbox_file_path, access_token)
+        if content is None:
+            show_dropbox_download_error(dropbox_file_path, response)
 
     return BytesIO(content)
 
@@ -1434,6 +1448,7 @@ def show_supabase_response_error(action, response):
     st.stop()
 
 
+@st.cache_data(ttl=30, show_spinner=False)
 def load_notes_from_supabase(customer_name=None, limit=500):
     """Supabaseのnotesテーブルからメモを新しい順で読み込む"""
     if not has_supabase_config():
@@ -1495,6 +1510,7 @@ def insert_note_to_supabase(note):
 
     if response.status_code not in (200, 201):
         show_supabase_response_error("保存", response)
+    load_notes_from_supabase.clear()
 
 
 def delete_note_from_supabase(note_id):
@@ -1522,6 +1538,7 @@ def delete_note_from_supabase(note_id):
     if response.status_code not in (200, 204):
         show_supabase_response_error("削除", response)
 
+    load_notes_from_supabase.clear()
     return True
 
 
@@ -1705,9 +1722,8 @@ def rebuild_sheet1_from_formula_references(excel_source):
         content = Path(excel_source).read_bytes()
 
     formula_wb = load_workbook(BytesIO(content), keep_vba=True, data_only=False, read_only=True)
-    values_wb = load_workbook(BytesIO(content), keep_vba=False, data_only=True, read_only=True)
     try:
-        if SHEET_NAME not in formula_wb.sheetnames or DELIVERY_SHEET_NAME not in values_wb.sheetnames:
+        if SHEET_NAME not in formula_wb.sheetnames or DELIVERY_SHEET_NAME not in formula_wb.sheetnames:
             return pd.DataFrame()
 
         sheet1 = formula_wb[SHEET_NAME]
@@ -1749,7 +1765,6 @@ def rebuild_sheet1_from_formula_references(excel_source):
         return pd.DataFrame(rows)
     finally:
         formula_wb.close()
-        values_wb.close()
 
 
 def normalize_excel_table(excel_source):
@@ -1763,6 +1778,14 @@ def normalize_excel_table(excel_source):
     2) 上部に大きな表示があり、途中の行に見出しがある形
        9行目などに ID / 顧客名 / 地域 / 商品名 ... がある
     """
+    # 現在のブック構造ではこちらが最短経路。数式キャッシュの有無にも影響されない。
+    try:
+        rebuilt = rebuild_sheet1_from_formula_references(excel_source)
+        if not rebuilt.empty:
+            return rebuilt
+    except Exception:
+        pass
+
     try:
         raw = pd.read_excel(
             excel_source,
@@ -2269,18 +2292,11 @@ def show_customer_detail(df, customer_name):
     edit_bundle = None
     if has_dropbox_auth_config():
         try:
-            token = get_dropbox_access_token()
-            latest_excel_content, latest_response = download_dropbox_file(
-                get_dropbox_file_path(),
-                token,
+            latest_excel_content = get_cached_dropbox_excel_content()
+            edit_bundle = read_customer_edit_bundle_from_bytes(
+                latest_excel_content,
+                customer_name,
             )
-            if latest_excel_content is None:
-                latest_excel_error = dropbox_error_text(latest_response)
-            else:
-                edit_bundle = read_customer_edit_bundle_from_bytes(
-                    latest_excel_content,
-                    customer_name,
-                )
         except Exception as exc:
             latest_excel_error = str(exc)
 
