@@ -1676,6 +1676,93 @@ def show_notes_page(df):
 # =========================
 # Excel読み込み・整形
 # =========================
+def calculate_delivery_values(delivery_values_ws, row):
+    """Excelの数式キャッシュが消えている場合に、L列とO列をPythonで再計算する。"""
+    usage = delivery_values_ws.cell(row, 7).value
+    kg_per_bottle = delivery_values_ws.cell(row, 9).value
+    delivery_date = delivery_values_ws.cell(row, 10).value
+    delivery_quantity = delivery_values_ws.cell(row, 11).value
+    next_delivery = delivery_values_ws.cell(row, 12).value
+    remaining = delivery_values_ws.cell(row, 15).value
+
+    if isinstance(next_delivery, str) and next_delivery.startswith("="):
+        next_delivery = None
+    if isinstance(remaining, str) and remaining.startswith("="):
+        remaining = None
+
+    try:
+        if next_delivery is None and delivery_date is not None:
+            next_delivery = delivery_date + timedelta(
+                days=math.floor(float(delivery_quantity) / float(usage))
+            )
+    except Exception:
+        next_delivery = None
+
+    try:
+        if remaining is None and next_delivery is not None:
+            target_date = next_delivery.date() if isinstance(next_delivery, datetime) else next_delivery
+            remaining = (target_date - date.today()).days * float(usage) / float(kg_per_bottle)
+    except Exception:
+        remaining = None
+
+    return next_delivery, remaining
+
+
+def rebuild_sheet1_from_formula_references(excel_source):
+    """openpyxl保存後に数式キャッシュが消えても、参照元からSheet1相当を復元する。"""
+    if isinstance(excel_source, BytesIO):
+        content = excel_source.getvalue()
+    else:
+        content = Path(excel_source).read_bytes()
+
+    formula_wb = load_workbook(BytesIO(content), keep_vba=True, data_only=False, read_only=True)
+    values_wb = load_workbook(BytesIO(content), keep_vba=False, data_only=True, read_only=True)
+    try:
+        if SHEET_NAME not in formula_wb.sheetnames or DELIVERY_SHEET_NAME not in values_wb.sheetnames:
+            return pd.DataFrame()
+
+        sheet1 = formula_wb[SHEET_NAME]
+        # 顧客名などの元データは数式ではなく直接値なので、数式を保持する側から読む。
+        # data_only側はopenpyxl保存後に数式キャッシュが消え、空欄になるため使わない。
+        delivery = formula_wb[DELIVERY_SHEET_NAME]
+        rows = []
+        for sheet1_row in range(2, sheet1.max_row + 1):
+            source_row = None
+            for column in (1, 2):
+                formula = sheet1.cell(sheet1_row, column).value
+                if isinstance(formula, str) and formula.startswith("="):
+                    # シート名の引用符・全角文字に依存せず、参照式末尾の行番号を使う。
+                    match = re.search(r"(\d+)\s*$", formula.strip())
+                    if match:
+                        source_row = int(match.group(1))
+                        break
+            if source_row is None:
+                continue
+
+            customer_name = delivery.cell(source_row, 2).value
+            product_name = delivery.cell(source_row, 5).value
+            if not normalize_match_value(customer_name) or not normalize_match_value(product_name):
+                continue
+
+            next_delivery, remaining = calculate_delivery_values(delivery, source_row)
+            rows.append({
+                "ID": delivery.cell(source_row, 1).value,
+                "顧客名": customer_name,
+                "地域": delivery.cell(source_row, 3).value,
+                "商品名": product_name,
+                "使用数量/日": delivery.cell(source_row, 7).value,
+                "次回配達予定": next_delivery,
+                "残数": remaining,
+                "ひらがな": sheet1.cell(sheet1_row, 8).value,
+                "住所": sheet1.cell(sheet1_row, SHEET1_ADDRESS_COLUMN).value,
+                "マップ位置": sheet1.cell(sheet1_row, SHEET1_MAP_COLUMN).value,
+            })
+        return pd.DataFrame(rows)
+    finally:
+        formula_wb.close()
+        values_wb.close()
+
+
 def normalize_excel_table(excel_source):
     """
     ExcelのSheet1から、顧客一覧表を取り出す。
@@ -1712,11 +1799,14 @@ def normalize_excel_table(excel_source):
             break
 
     if header_row_index is None:
-        st.error("必要な見出し行が見つかりません。")
-        st.write("必要な列：", REQUIRED_COLUMNS)
-        st.write("読み取った先頭20行：")
-        st.dataframe(raw.head(20))
-        st.stop()
+        # openpyxlでxlsmを保存すると数式セルの前回計算結果が消える。
+        # その場合はSheet1の数式参照先である「次回配達日」から一覧を復元する。
+        rebuilt = rebuild_sheet1_from_formula_references(excel_source)
+        if rebuilt.empty:
+            st.error("必要な見出し行が見つかりません。")
+            st.write("必要な列：", REQUIRED_COLUMNS)
+            st.stop()
+        return rebuilt
 
     header = raw.iloc[header_row_index].tolist()
     df = raw.iloc[header_row_index + 1:].copy()
