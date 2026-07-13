@@ -2006,7 +2006,7 @@ def sync_page_from_query_params():
     page = str(get_query_value("page", "home")).strip() or "home"
     customer = str(get_query_value("customer", "")).strip()
 
-    valid_pages = {"home", "region", "calendar", "delivery", "notes", "detail"}
+    valid_pages = {"home", "customer", "region", "calendar", "delivery", "notes", "detail"}
 
     raw_page = str(get_query_value("page", "")).strip()
     if page not in valid_pages:
@@ -2043,6 +2043,21 @@ def select_customer(customer_name, page_name="detail"):
 def show_back_home_button(key):
     """各画面からホームへ戻るための共通リンク。ブラウザ履歴にも残る。"""
     st.markdown(render_page_link("← ホームへ戻る", page="home"), unsafe_allow_html=True)
+
+
+def show_detail_search_shortcuts():
+    """顧客詳細から、次の検索をすぐ始めるためのショートカット。"""
+    col_customer, col_region = st.columns(2)
+    with col_customer:
+        st.markdown(
+            render_page_link("🔍 顧客名で検索", page="customer"),
+            unsafe_allow_html=True,
+        )
+    with col_region:
+        st.markdown(
+            render_page_link("📍 地域名で検索", page="region"),
+            unsafe_allow_html=True,
+        )
 
 
 # =========================
@@ -2366,6 +2381,7 @@ def show_customer_detail(df, customer_name):
         return
 
     show_back_home_button("detail_back_home")
+    show_detail_search_shortcuts()
 
     # 使用数量/日が0・空白・NaNの商品行は、商品名ごと表示しない。
     visible_detail = detail[~detail["使用数量/日"].apply(is_blank_or_zero)].copy()
@@ -2452,9 +2468,13 @@ def show_customer_detail(df, customer_name):
 # =========================
 # 顧客検索
 # =========================
-def show_customer_search(df=None):
+def show_customer_search(df=None, show_home_link=False):
     st.subheader("🔍 顧客検索")
+    if show_home_link:
+        show_back_home_button("customer_back_home")
     st.caption(f"🎤 {VOICE_INPUT_HELP} 漢字の顧客名でも検索できます。")
+
+    page_name = "customer" if show_home_link else "home"
 
     default_keyword = str(get_query_value("customer_search", "")).strip()
     if st_keyup is not None:
@@ -2479,9 +2499,9 @@ def show_customer_search(df=None):
         ).strip()
 
     if keyword:
-        update_query_params(page="home", customer_search=keyword)
+        update_query_params(page=page_name, customer_search=keyword)
     else:
-        update_query_params(page="home", customer_search=None)
+        update_query_params(page=page_name, customer_search=None)
 
     if not keyword:
         st.info("顧客名のひらがなを入力してください。")
@@ -3148,7 +3168,7 @@ def show_home_menu():
 
     col1, col2 = st.columns(2)
     with col1:
-        st.markdown(render_page_link("🔍 顧客検索", page="home"), unsafe_allow_html=True)
+        st.markdown(render_page_link("🔍 顧客検索", page="customer"), unsafe_allow_html=True)
     with col2:
         st.markdown(render_page_link("📍 地域検索", page="region"), unsafe_allow_html=True)
 
@@ -3176,7 +3196,7 @@ handle_customer_query_param()
 
 
 MENU_OPTIONS = {
-    "🔍 顧客検索": "home",
+    "🔍 顧客検索": "customer",
     "📍 地域検索": "region",
     "🗓 配車カレンダー": "calendar",
     "📅 配達予定一覧": "delivery",
@@ -3188,7 +3208,7 @@ current_page = st.session_state.get("page", "home")
 with st.sidebar:
     st.title(f"🚚 {APP_TITLE}")
     st.markdown("### メニュー")
-    st.markdown(render_page_link("🔍 顧客検索", page="home"), unsafe_allow_html=True)
+    st.markdown(render_page_link("🔍 顧客検索", page="customer"), unsafe_allow_html=True)
     st.markdown(render_page_link("📍 地域検索", page="region"), unsafe_allow_html=True)
     st.markdown(render_page_link("🗓 配車カレンダー", page="calendar"), unsafe_allow_html=True)
     st.markdown(render_page_link("📅 配達予定一覧", page="delivery"), unsafe_allow_html=True)
@@ -3222,6 +3242,9 @@ try:
     if st.session_state["page"] == "home":
         show_home_menu()
         show_customer_search()
+
+    elif st.session_state["page"] == "customer":
+        show_customer_search(show_home_link=True)
 
     elif st.session_state["page"] == "region":
         df = load_data()
