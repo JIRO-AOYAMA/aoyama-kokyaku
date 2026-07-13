@@ -1608,6 +1608,13 @@ def show_customer_notes(customer_name):
     st.caption("スマホではキーボードのマイクから音声入力できます。")
 
     note_key = f"customer_note_input_{customer_name}"
+    clear_note_key = f"clear_{note_key}"
+
+    # Streamlitでは生成済みウィジェットの値を同じ実行中に変更できないため、
+    # 保存後の次回実行で入力欄を空にする。
+    if st.session_state.pop(clear_note_key, False):
+        st.session_state[note_key] = ""
+
     note_text = st.text_area(
         "メモ本文",
         key=note_key,
@@ -1617,9 +1624,12 @@ def show_customer_notes(customer_name):
 
     if st.button("メモを保存", key=f"save_customer_note_{customer_name}"):
         if add_note(customer_name, note_text):
-            st.session_state[note_key] = ""
-            st.success("メモを保存しました。")
+            st.session_state[clear_note_key] = True
+            st.session_state["note_save_success"] = customer_name
             st.rerun()
+
+    if st.session_state.pop("note_save_success", None) == customer_name:
+        st.success("メモを保存しました。")
 
     customer_notes = get_notes_for_customer(customer_name)
 
