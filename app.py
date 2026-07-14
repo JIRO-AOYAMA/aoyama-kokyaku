@@ -346,6 +346,10 @@ st.markdown(
         color: #667085 !important;
         font-size: 0.85rem !important;
         box-shadow: none !important;
+        white-space: nowrap !important;
+    }
+    [data-testid="stPopover"] button p {
+        white-space: nowrap !important;
     }
 
 
@@ -2560,7 +2564,7 @@ def show_customer_detail(df, customer_name):
     st.markdown("---")
     line_connected = get_line_connected(customer_name)
 
-    name_col, line_col, _ = st.columns([6, 2, 4])
+    name_col, line_col, _ = st.columns([6, 3, 3])
     with name_col:
         st.markdown(
             '<div class="customer-name-row customer-detail-name-row">'
