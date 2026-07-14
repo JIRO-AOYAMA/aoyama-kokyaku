@@ -124,6 +124,21 @@ except Exception:
 if not st.session_state.authenticated:
     st.title("🔒 顧客カルテ")
 
+    # ログイン画面は下の共通CSSより前に停止するため、パスワード欄の枠線だけここで指定する。
+    st.markdown(
+        """
+        <style>
+        div[data-testid="stTextInputRootElement"],
+        div[data-baseweb="input"] {
+            border: 1px solid rgba(15, 23, 42, 0.28) !important;
+            border-radius: 14px !important;
+            background: #ffffff !important;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
     if not APP_PASSWORD:
         st.error("APP_PASSWORD が設定されていません。Streamlit Cloud の Secrets に APP_PASSWORD を追加してください。")
         st.stop()
@@ -312,6 +327,10 @@ st.markdown(
     .line-status-disconnected {
         color: #98a2b3;
     }
+    .customer-detail-name-row {
+        font-size: 1.65rem;
+        margin-top: 0.15rem;
+    }
 
 
     @media (max-width: 640px) {
@@ -387,6 +406,20 @@ def is_line_connected(value):
     """ExcelのLINE欄を○／×表示用の真偽値にそろえる。"""
     text = clean_value(value, blank_text="").strip().lower()
     return text in {"○", "〇", "◯", "1", "true", "yes", "あり", "有", "済"}
+
+
+def render_customer_name_with_line(customer_name, connected, detail=False):
+    """顧客名の横に控えめなLINE ○／×を表示する。"""
+    line_mark = "○" if connected else "×"
+    line_class = "line-status-connected" if connected else "line-status-disconnected"
+    detail_class = " customer-detail-name-row" if detail else ""
+    st.markdown(
+        f'<div class="customer-name-row{detail_class}">'
+        f'<span>👤 {html.escape(clean_value(customer_name))}</span>'
+        f'<span class="line-status {line_class}">LINE {line_mark}</span>'
+        "</div>",
+        unsafe_allow_html=True,
+    )
 
 
 def format_date(value):
@@ -2427,7 +2460,11 @@ def show_customer_detail(df, customer_name):
     region = clean_value(detail.iloc[0]["地域"])
 
     st.markdown("---")
-    st.header(f"👤 {customer_name}")
+    line_connected = (
+        "LINE" in detail.columns
+        and any(is_line_connected(value) for value in detail["LINE"])
+    )
+    render_customer_name_with_line(customer_name, line_connected, detail=True)
     st.write(f"**地域：** {region}")
     st.write(f"**商品数：** {len(visible_detail)}件")
 
@@ -2573,17 +2610,9 @@ def show_customer_search(df=None, show_home_link=False):
         name = clean_value(row["顧客名"])
         region = clean_value(row["地域"])
         line_connected = line_by_customer.get(row["顧客名"], False)
-        line_mark = "○" if line_connected else "×"
-        line_class = "line-status-connected" if line_connected else "line-status-disconnected"
 
         with st.container(border=True):
-            st.markdown(
-                '<div class="customer-name-row">'
-                f'<span>👤 {html.escape(name)}</span>'
-                f'<span class="line-status {line_class}">LINE {line_mark}</span>'
-                "</div>",
-                unsafe_allow_html=True,
-            )
+            render_customer_name_with_line(name, line_connected)
             st.write(f"地域：{region}")
 
             st.markdown(
