@@ -1,4 +1,5 @@
 import calendar
+import hashlib
 import html
 import json
 import math
@@ -49,14 +50,14 @@ DELIVERY_SHEET_NAME = "次回配達日"
 SHEET1_CUSTOMER_COLUMN = 2   # B列：顧客名
 SHEET1_ADDRESS_COLUMN = 9    # I列：住所
 SHEET1_MAP_COLUMN = 10       # J列：マップ位置
-SHEET1_LINE_COLUMN = 11      # K列：LINE（○／×）
-FAST_CACHE_VERSION = 2
 APP_PASSWORD = st.secrets.get("APP_PASSWORD", "")
 SUPABASE_URL = st.secrets.get("SUPABASE_URL", "")
 SUPABASE_SECRET_KEY = st.secrets.get("SUPABASE_SECRET_KEY", "")
 SUPABASE_SERVICE_ROLE_KEY = st.secrets.get("SUPABASE_SERVICE_ROLE_KEY", "")
 SUPABASE_ANON_KEY = st.secrets.get("SUPABASE_ANON_KEY", "")
 SUPABASE_NOTES_TABLE = st.secrets.get("SUPABASE_NOTES_TABLE", "notes")
+LINE_STATUS_NOTE_PREFIX = "line_status_"
+LINE_STATUS_BODY = "__LINE_CONNECTED__"
 VOICE_INPUT_HELP = "スマホではキーボードのマイクを押して音声入力できます。"
 
 REQUIRED_COLUMNS = [
@@ -400,12 +401,6 @@ def clean_value(value, blank_text="未設定"):
         return blank_text
 
     return text
-
-
-def is_line_connected(value):
-    """ExcelのLINE欄を○／×表示用の真偽値にそろえる。"""
-    text = clean_value(value, blank_text="").strip().lower()
-    return text in {"○", "〇", "◯", "1", "true", "yes", "あり", "有", "済"}
 
 
 def render_customer_name_with_line(customer_name, connected, detail=False):
@@ -1507,6 +1502,101 @@ def get_supabase_headers(prefer=None):
     return headers
 
 
+def make_line_status_id(customer_name):
+    """顧客名から、LINE状態保存用の重複しないIDを作る。"""
+    customer = clean_value(customer_name, blank_text="")
+    digest = hashlib.sha256(customer.encode("utf-8")).hexdigest()
+    return f"{LINE_STATUS_NOTE_PREFIX}{digest}"
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def load_line_statuses_from_supabase():
+    """LINE接続中の顧客名だけを小さなデータとして読み込む。"""
+    if not has_supabase_config():
+        return {}
+
+    try:
+        response = requests.get(
+            get_supabase_notes_url(),
+            headers=get_supabase_headers(),
+            params={
+                "select": "customer_name",
+                "id": f"like.{LINE_STATUS_NOTE_PREFIX}*",
+                "limit": "5000",
+            },
+            timeout=15,
+        )
+    except Exception:
+        return {}
+
+    if response.status_code != 200:
+        return {}
+
+    try:
+        rows = response.json()
+    except Exception:
+        return {}
+
+    if not isinstance(rows, list):
+        return {}
+
+    return {
+        clean_value(row.get("customer_name"), blank_text=""): True
+        for row in rows
+        if clean_value(row.get("customer_name"), blank_text="")
+    }
+
+
+def get_line_connected(customer_name):
+    customer = clean_value(customer_name, blank_text="")
+    return bool(load_line_statuses_from_supabase().get(customer, False))
+
+
+def save_line_connected(customer_name, connected):
+    """Excelを変更せず、LINE状態だけをSupabaseへ保存する。"""
+    if not has_supabase_config():
+        st.error("LINE状態を保存するための接続設定がありません。")
+        return False
+
+    customer = clean_value(customer_name, blank_text="")
+    status_id = make_line_status_id(customer)
+
+    try:
+        if connected:
+            response = requests.post(
+                get_supabase_notes_url(),
+                headers=get_supabase_headers(
+                    prefer="resolution=merge-duplicates,return=minimal"
+                ),
+                json={
+                    "id": status_id,
+                    "customer_name": customer,
+                    "body": LINE_STATUS_BODY,
+                    "created_at": get_jst_now().isoformat(),
+                },
+                timeout=15,
+            )
+            success = response.status_code in (200, 201)
+        else:
+            response = requests.delete(
+                get_supabase_notes_url(),
+                headers=get_supabase_headers(prefer="return=minimal"),
+                params={"id": f"eq.{status_id}"},
+                timeout=15,
+            )
+            success = response.status_code in (200, 204)
+    except Exception as exc:
+        st.error(f"LINE状態を保存できませんでした：{exc}")
+        return False
+
+    if not success:
+        st.error("LINE状態を保存できませんでした。")
+        return False
+
+    load_line_statuses_from_supabase.clear()
+    return True
+
+
 def show_supabase_config_error():
     st.error("メモ帳を使うにはSupabase設定が必要です。")
     st.write("Streamlit Cloud の Secrets に以下を追加してください。")
@@ -1543,6 +1633,7 @@ def load_notes_from_supabase(customer_name=None, limit=500):
         "select": "id,customer_name,body,created_at",
         "order": "created_at.desc",
         "limit": str(limit),
+        "id": f"not.like.{LINE_STATUS_NOTE_PREFIX}*",
     }
 
     if customer_name is not None:
@@ -1847,7 +1938,6 @@ def rebuild_sheet1_from_formula_references(excel_source):
                 "ひらがな": sheet1.cell(sheet1_row, 8).value,
                 "住所": sheet1.cell(sheet1_row, SHEET1_ADDRESS_COLUMN).value,
                 "マップ位置": sheet1.cell(sheet1_row, SHEET1_MAP_COLUMN).value,
-                "LINE": sheet1.cell(sheet1_row, SHEET1_LINE_COLUMN).value,
                 "メーカー": delivery.cell(source_row, 6).value,
                 "本数": delivery.cell(source_row, 8).value,
                 "kg/本": delivery.cell(source_row, 9).value,
@@ -1968,10 +2058,7 @@ def load_fast_dropbox_data():
     if cache_content is not None:
         try:
             payload = json.loads(cache_content.decode("utf-8"))
-            if (
-                payload.get("excel_revision") == excel_revision
-                and payload.get("schema_version") == FAST_CACHE_VERSION
-            ):
+            if payload.get("excel_revision") == excel_revision:
                 records = payload.get("records", [])
                 if isinstance(records, list) and records:
                     return pd.DataFrame(records)
@@ -1985,11 +2072,7 @@ def load_fast_dropbox_data():
     df = normalize_excel_table(BytesIO(excel_content))
     records = json.loads(df.to_json(orient="records", date_format="iso", force_ascii=False))
     payload = json.dumps(
-        {
-            "schema_version": FAST_CACHE_VERSION,
-            "excel_revision": excel_revision,
-            "records": records,
-        },
+        {"excel_revision": excel_revision, "records": records},
         ensure_ascii=False,
         separators=(",", ":"),
     ).encode("utf-8")
@@ -2460,13 +2543,18 @@ def show_customer_detail(df, customer_name):
     region = clean_value(detail.iloc[0]["地域"])
 
     st.markdown("---")
-    line_connected = (
-        "LINE" in detail.columns
-        and any(is_line_connected(value) for value in detail["LINE"])
-    )
+    line_connected = get_line_connected(customer_name)
     render_customer_name_with_line(customer_name, line_connected, detail=True)
     st.write(f"**地域：** {region}")
     st.write(f"**商品数：** {len(visible_detail)}件")
+
+    new_line_connected = not line_connected
+    line_button_label = "LINEを○にする" if new_line_connected else "LINEを×にする"
+    if st.button(line_button_label, key=f"line_status_{make_line_status_id(customer_name)}"):
+        with st.spinner("LINE状態を保存しています…"):
+            if save_line_connected(customer_name, new_line_connected):
+                st.toast("LINE状態を変更しました。")
+                st.rerun()
 
     success = st.session_state.pop("excel_save_success", None)
     if success:
@@ -2597,12 +2685,7 @@ def show_customer_search(df=None, show_home_link=False):
         return
 
     customers = hit[["顧客名", "地域"]].drop_duplicates().reset_index(drop=True)
-    if "LINE" in hit.columns:
-        line_by_customer = hit.groupby("顧客名")["LINE"].apply(
-            lambda values: any(is_line_connected(value) for value in values)
-        ).to_dict()
-    else:
-        line_by_customer = {}
+    line_by_customer = load_line_statuses_from_supabase()
 
     st.write(f"候補：{len(customers)}件")
 
