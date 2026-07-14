@@ -49,6 +49,8 @@ DELIVERY_SHEET_NAME = "次回配達日"
 SHEET1_CUSTOMER_COLUMN = 2   # B列：顧客名
 SHEET1_ADDRESS_COLUMN = 9    # I列：住所
 SHEET1_MAP_COLUMN = 10       # J列：マップ位置
+SHEET1_LINE_COLUMN = 11      # K列：LINE（○／×）
+FAST_CACHE_VERSION = 2
 APP_PASSWORD = st.secrets.get("APP_PASSWORD", "")
 SUPABASE_URL = st.secrets.get("SUPABASE_URL", "")
 SUPABASE_SECRET_KEY = st.secrets.get("SUPABASE_SECRET_KEY", "")
@@ -289,6 +291,28 @@ st.markdown(
         word-break: break-word;
     }
 
+    .customer-name-row {
+        display: flex;
+        align-items: center;
+        gap: 0.45rem;
+        margin: 0.1rem 0 0.45rem;
+        color: #172033;
+        font-size: 1.25rem;
+        font-weight: 700;
+    }
+    .line-status {
+        font-size: 0.7rem;
+        font-weight: 600;
+        line-height: 1;
+        white-space: nowrap;
+    }
+    .line-status-connected {
+        color: #4f8f68;
+    }
+    .line-status-disconnected {
+        color: #98a2b3;
+    }
+
 
     @media (max-width: 640px) {
         .block-container {
@@ -357,6 +381,12 @@ def clean_value(value, blank_text="未設定"):
         return blank_text
 
     return text
+
+
+def is_line_connected(value):
+    """ExcelのLINE欄を○／×表示用の真偽値にそろえる。"""
+    text = clean_value(value, blank_text="").strip().lower()
+    return text in {"○", "〇", "◯", "1", "true", "yes", "あり", "有", "済"}
 
 
 def format_date(value):
@@ -1784,6 +1814,7 @@ def rebuild_sheet1_from_formula_references(excel_source):
                 "ひらがな": sheet1.cell(sheet1_row, 8).value,
                 "住所": sheet1.cell(sheet1_row, SHEET1_ADDRESS_COLUMN).value,
                 "マップ位置": sheet1.cell(sheet1_row, SHEET1_MAP_COLUMN).value,
+                "LINE": sheet1.cell(sheet1_row, SHEET1_LINE_COLUMN).value,
                 "メーカー": delivery.cell(source_row, 6).value,
                 "本数": delivery.cell(source_row, 8).value,
                 "kg/本": delivery.cell(source_row, 9).value,
@@ -1904,7 +1935,10 @@ def load_fast_dropbox_data():
     if cache_content is not None:
         try:
             payload = json.loads(cache_content.decode("utf-8"))
-            if payload.get("excel_revision") == excel_revision:
+            if (
+                payload.get("excel_revision") == excel_revision
+                and payload.get("schema_version") == FAST_CACHE_VERSION
+            ):
                 records = payload.get("records", [])
                 if isinstance(records, list) and records:
                     return pd.DataFrame(records)
@@ -1918,7 +1952,11 @@ def load_fast_dropbox_data():
     df = normalize_excel_table(BytesIO(excel_content))
     records = json.loads(df.to_json(orient="records", date_format="iso", force_ascii=False))
     payload = json.dumps(
-        {"excel_revision": excel_revision, "records": records},
+        {
+            "schema_version": FAST_CACHE_VERSION,
+            "excel_revision": excel_revision,
+            "records": records,
+        },
         ensure_ascii=False,
         separators=(",", ":"),
     ).encode("utf-8")
@@ -2522,15 +2560,30 @@ def show_customer_search(df=None, show_home_link=False):
         return
 
     customers = hit[["顧客名", "地域"]].drop_duplicates().reset_index(drop=True)
+    if "LINE" in hit.columns:
+        line_by_customer = hit.groupby("顧客名")["LINE"].apply(
+            lambda values: any(is_line_connected(value) for value in values)
+        ).to_dict()
+    else:
+        line_by_customer = {}
 
     st.write(f"候補：{len(customers)}件")
 
     for i, row in customers.iterrows():
         name = clean_value(row["顧客名"])
         region = clean_value(row["地域"])
+        line_connected = line_by_customer.get(row["顧客名"], False)
+        line_mark = "○" if line_connected else "×"
+        line_class = "line-status-connected" if line_connected else "line-status-disconnected"
 
         with st.container(border=True):
-            st.markdown(f"### 👤 {name}")
+            st.markdown(
+                '<div class="customer-name-row">'
+                f'<span>👤 {html.escape(name)}</span>'
+                f'<span class="line-status {line_class}">LINE {line_mark}</span>'
+                "</div>",
+                unsafe_allow_html=True,
+            )
             st.write(f"地域：{region}")
 
             st.markdown(
