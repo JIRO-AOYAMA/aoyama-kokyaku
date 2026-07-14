@@ -317,7 +317,7 @@ st.markdown(
         font-weight: 700;
     }
     .line-status {
-        font-size: 0.7rem;
+        font-size: 0.85rem;
         font-weight: 600;
         line-height: 1;
         white-space: nowrap;
@@ -331,6 +331,21 @@ st.markdown(
     .customer-detail-name-row {
         font-size: 1.65rem;
         margin-top: 0.15rem;
+    }
+    .line-detail-static {
+        color: #4f8f68;
+        font-size: 0.85rem;
+        font-weight: 600;
+        margin-top: 0.8rem;
+        white-space: nowrap;
+    }
+    [data-testid="stPopover"] button {
+        min-height: 0 !important;
+        margin-top: 0.35rem !important;
+        padding: 0.3rem 0.55rem !important;
+        color: #667085 !important;
+        font-size: 0.85rem !important;
+        box-shadow: none !important;
     }
 
 
@@ -2544,17 +2559,35 @@ def show_customer_detail(df, customer_name):
 
     st.markdown("---")
     line_connected = get_line_connected(customer_name)
-    render_customer_name_with_line(customer_name, line_connected, detail=True)
+
+    name_col, line_col, _ = st.columns([6, 2, 4])
+    with name_col:
+        st.markdown(
+            '<div class="customer-name-row customer-detail-name-row">'
+            f'<span>👤 {html.escape(clean_value(customer_name))}</span>'
+            "</div>",
+            unsafe_allow_html=True,
+        )
+    with line_col:
+        if line_connected:
+            st.markdown(
+                '<div class="line-detail-static">LINE ○</div>',
+                unsafe_allow_html=True,
+            )
+        else:
+            with st.popover("LINE ×"):
+                st.caption("LINEを○にしますか？")
+                if st.button(
+                    "○にする",
+                    key=f"line_status_{make_line_status_id(customer_name)}",
+                ):
+                    with st.spinner("保存しています…"):
+                        if save_line_connected(customer_name, True):
+                            st.toast("LINEを○にしました。")
+                            st.rerun()
+
     st.write(f"**地域：** {region}")
     st.write(f"**商品数：** {len(visible_detail)}件")
-
-    new_line_connected = not line_connected
-    line_button_label = "LINEを○にする" if new_line_connected else "LINEを×にする"
-    if st.button(line_button_label, key=f"line_status_{make_line_status_id(customer_name)}"):
-        with st.spinner("LINE状態を保存しています…"):
-            if save_line_connected(customer_name, new_line_connected):
-                st.toast("LINE状態を変更しました。")
-                st.rerun()
 
     success = st.session_state.pop("excel_save_success", None)
     if success:
