@@ -2879,6 +2879,7 @@ DISPATCH_COLUMN_CANDIDATES = {
     "customer": ["顧客名", "牧場名", "取引先名", "得意先名", "お客様名", "名前", "名称"],
     "region": ["地域", "地区", "エリア", "住所", "市町村"],
     "product": ["商品名", "商品", "品名", "製品名"],
+    "maker": ["メーカー", "製造元", "製造メーカー"],
 }
 
 DISPATCH_REQUIRED_LABELS = {
@@ -2901,9 +2902,9 @@ def find_dispatch_columns(df):
 
 def show_missing_dispatch_columns_error(df, dispatch_columns):
     missing = [
-        DISPATCH_REQUIRED_LABELS[key]
-        for key, col in dispatch_columns.items()
-        if not col
+        label
+        for key, label in DISPATCH_REQUIRED_LABELS.items()
+        if not dispatch_columns.get(key)
     ]
 
     if not missing:
@@ -2973,6 +2974,21 @@ def change_dispatch_month(delta):
     st.session_state["dispatch_calendar_month"] = month
 
 
+def clean_dispatch_maker(value):
+    """カレンダーに表示するメーカー名を整える。空白と数値の0は表示しない。"""
+    maker = clean_value(value, blank_text="").strip()
+    if not maker:
+        return ""
+
+    try:
+        if float(maker.replace(",", "")) == 0:
+            return ""
+    except ValueError:
+        pass
+
+    return maker
+
+
 def format_month_day(target_day):
     weekday = WEEKDAYS_JA[target_day.weekday()]
     return f"{target_day.month}/{target_day.day}（{weekday}）"
@@ -2992,6 +3008,7 @@ def make_dispatch_items_by_day(df, month_start, dispatch_columns):
     customer_column = dispatch_columns["customer"]
     region_column = dispatch_columns["region"]
     product_column = dispatch_columns["product"]
+    maker_column = dispatch_columns.get("maker")
     parsed_dates = pd.to_datetime(df[date_column], errors="coerce").dt.date
 
     for idx, row in df.iterrows():
@@ -3004,6 +3021,7 @@ def make_dispatch_items_by_day(df, month_start, dispatch_columns):
             "顧客名": clean_value(row[customer_column]),
             "地域": clean_value(row[region_column]),
             "商品名": clean_value(row[product_column]),
+            "メーカー": clean_dispatch_maker(row[maker_column]) if maker_column else "",
         }
         rows_by_day[delivery_date].append(item)
 
@@ -3205,6 +3223,9 @@ def build_two_day_panel_html(target_day, items):
             parts.append(f'<div class="dispatch-name">👤 {customer_link}</div>')
             parts.append(f'<div class="dispatch-line">地域：{escape_html(item.get("地域"))}</div>')
             parts.append(f'<div class="dispatch-line">商品：{escape_html(item.get("商品名"))}</div>')
+            maker = clean_dispatch_maker(item.get("メーカー"))
+            if maker:
+                parts.append(f'<div class="dispatch-line">メーカー：{escape_html(maker)}</div>')
             parts.append('</div>')
 
     parts.append('</div>')
@@ -3215,9 +3236,13 @@ def show_dispatch_month_switcher(month_start):
     col_prev, col_month, col_next = st.columns([1, 2, 1])
 
     with col_prev:
-        if st.button("◀", key="dispatch_prev_month", use_container_width=True):
-            change_dispatch_month(-1)
-            st.rerun()
+        st.button(
+            "◀",
+            key="dispatch_prev_month",
+            use_container_width=True,
+            on_click=change_dispatch_month,
+            args=(-1,),
+        )
 
     with col_month:
         st.markdown(
@@ -3226,9 +3251,13 @@ def show_dispatch_month_switcher(month_start):
         )
 
     with col_next:
-        if st.button("▶", key="dispatch_next_month", use_container_width=True):
-            change_dispatch_month(1)
-            st.rerun()
+        st.button(
+            "▶",
+            key="dispatch_next_month",
+            use_container_width=True,
+            on_click=change_dispatch_month,
+            args=(1,),
+        )
 
 
 def show_two_day_dispatch_calendar(rows_by_day, month_start):
@@ -3251,13 +3280,15 @@ def show_two_day_dispatch_calendar(rows_by_day, month_start):
 
 def format_month_cell_item(item):
     customer_name = clean_value(item.get("顧客名"))
-    product_name = clean_value(item.get("商品名"))
+    product_name = clean_value(item.get("商品名"), blank_text="").strip()
+    maker = clean_dispatch_maker(item.get("メーカー"))
     customer_link = build_customer_detail_link(customer_name, class_name="dispatch-month-link")
 
-    if product_name == "未設定":
+    if not product_name and not maker:
         return customer_link
 
-    return f'{customer_link}<br><span class="dispatch-month-product">{escape_html(product_name)}</span>'
+    product_label = f"{product_name}/{maker}" if product_name and maker else product_name or maker
+    return f'{customer_link}<br><span class="dispatch-month-product">{escape_html(product_label)}</span>'
 
 
 def make_month_dispatch_table(rows_by_day, month_start):
@@ -3353,6 +3384,7 @@ def show_dispatch_calendar(df):
         "表示切替",
         ["📱 2日表示", "🗓 月表示"],
         horizontal=True,
+        key="dispatch_calendar_view",
     )
 
     if view == "📱 2日表示":
