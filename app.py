@@ -3726,6 +3726,191 @@ def show_dispatch_filtered_list(df):
         render_dispatch_board_card(row)
 
 
+def render_dispatch_responsive_list(display_df):
+    """PCはExcel風一覧、スマホは横スクロール不要の縦型カードで表示する。"""
+    st.markdown(
+        """
+        <style>
+        .dispatch-desktop-view {
+            display: block;
+            max-height: 760px;
+            overflow: auto;
+            border: 1px solid #cbd5e1;
+            border-radius: 10px;
+            background: #ffffff;
+        }
+        .dispatch-excel-table {
+            width: 100%;
+            min-width: 1050px;
+            border-collapse: separate;
+            border-spacing: 0;
+            font-size: 14px;
+            color: #172033;
+        }
+        .dispatch-excel-table th {
+            position: sticky;
+            top: 0;
+            z-index: 2;
+            padding: 10px 8px;
+            background: #dbeaf7;
+            border-right: 1px solid #94a3b8;
+            border-bottom: 2px solid #64748b;
+            text-align: center;
+            white-space: nowrap;
+        }
+        .dispatch-excel-table td {
+            padding: 8px;
+            border-right: 1px solid #cbd5e1;
+            border-bottom: 1px solid #cbd5e1;
+            vertical-align: middle;
+            background: #ffffff;
+            overflow-wrap: anywhere;
+        }
+        .dispatch-excel-table tr:nth-child(even) td { background: #f8fafc; }
+        .dispatch-excel-table .date-cell,
+        .dispatch-excel-table .quantity-cell { text-align: center; white-space: nowrap; }
+        .dispatch-mobile-view { display: none; }
+
+        @media (max-width: 768px) {
+            .dispatch-desktop-view { display: none; }
+            .dispatch-mobile-view { display: block; }
+            .dispatch-day-group { margin: 0 0 18px 0; }
+            .dispatch-day-heading {
+                position: sticky;
+                top: 0;
+                z-index: 2;
+                margin: 0 0 7px 0;
+                padding: 8px 10px;
+                border-left: 5px solid #2563eb;
+                border-radius: 7px;
+                background: #eaf2ff;
+                color: #172033;
+                font-size: 16px;
+                font-weight: 800;
+            }
+            .dispatch-mobile-card {
+                margin: 0 0 8px 0;
+                padding: 10px 11px;
+                border: 1px solid #cbd5e1;
+                border-radius: 10px;
+                background: #ffffff;
+                box-shadow: 0 1px 3px rgba(15, 23, 42, 0.08);
+                color: #172033;
+            }
+            .dispatch-date-line {
+                display: grid;
+                grid-template-columns: minmax(0, 1fr) 20px minmax(0, 1fr);
+                align-items: center;
+                gap: 4px;
+                margin-bottom: 8px;
+            }
+            .dispatch-date-box {
+                padding: 6px 7px;
+                border-radius: 7px;
+                text-align: center;
+                line-height: 1.25;
+            }
+            .dispatch-pickup-date { background: #e8f1ff; color: #174ea6; }
+            .dispatch-arrival-date { background: #e8f8ef; color: #176b3a; }
+            .dispatch-date-label { display: block; font-size: 10px; font-weight: 700; }
+            .dispatch-date-value { display: block; margin-top: 2px; font-size: 14px; font-weight: 800; }
+            .dispatch-date-arrow { text-align: center; color: #64748b; font-weight: 800; }
+            .dispatch-route {
+                display: grid;
+                grid-template-columns: minmax(0, 1fr) 20px minmax(0, 1fr);
+                align-items: stretch;
+                gap: 4px;
+                margin-bottom: 8px;
+            }
+            .dispatch-route-box {
+                min-width: 0;
+                padding: 6px 7px;
+                border: 1px solid #e2e8f0;
+                border-radius: 7px;
+                background: #fafcff;
+            }
+            .dispatch-route-label,
+            .dispatch-detail-label { display: block; color: #64748b; font-size: 10px; font-weight: 700; }
+            .dispatch-route-value { display: block; margin-top: 2px; font-size: 13px; font-weight: 800; overflow-wrap: anywhere; }
+            .dispatch-route-arrow { align-self: center; text-align: center; color: #64748b; font-weight: 800; }
+            .dispatch-details {
+                display: grid;
+                grid-template-columns: minmax(0, 1.4fr) minmax(0, 0.8fr);
+                gap: 6px;
+                margin-bottom: 6px;
+            }
+            .dispatch-detail-box {
+                min-width: 0;
+                padding: 5px 7px;
+                border-radius: 6px;
+                background: #f8fafc;
+            }
+            .dispatch-detail-value { display: block; margin-top: 1px; font-size: 13px; font-weight: 700; overflow-wrap: anywhere; }
+            .dispatch-carrier {
+                padding: 6px 7px;
+                border-radius: 6px;
+                background: #fff7e6;
+            }
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    def safe_value(value):
+        text = normalize_dispatch_text(value) or "未入力"
+        return html.escape(text)
+
+    columns = ["引取日", "引取先", "商品名", "数量", "運送会社", "納品先", "着日"]
+    desktop_parts = [
+        '<div class="dispatch-desktop-view">',
+        '<table class="dispatch-excel-table"><thead><tr>',
+    ]
+    desktop_parts.extend(f"<th>{html.escape(column)}</th>" for column in columns)
+    desktop_parts.append("</tr></thead><tbody>")
+    for _, row in display_df.iterrows():
+        desktop_parts.append("<tr>")
+        for column in columns:
+            css_class = "date-cell" if column in ["引取日", "着日"] else "quantity-cell" if column == "数量" else ""
+            desktop_parts.append(f'<td class="{css_class}">{safe_value(row.get(column))}</td>')
+        desktop_parts.append("</tr>")
+    desktop_parts.append("</tbody></table></div>")
+
+    mobile_parts = ['<div class="dispatch-mobile-view">']
+    for pickup_date, day_rows in display_df.groupby("引取日", sort=False, dropna=False):
+        pickup_label = safe_value(pickup_date)
+        mobile_parts.append('<section class="dispatch-day-group">')
+        mobile_parts.append(
+            f'<div class="dispatch-day-heading">{pickup_label}　引取 {len(day_rows)}件</div>'
+        )
+        for _, row in day_rows.iterrows():
+            mobile_parts.extend(
+                [
+                    '<article class="dispatch-mobile-card">',
+                    '<div class="dispatch-date-line">',
+                    f'<div class="dispatch-date-box dispatch-pickup-date"><span class="dispatch-date-label">引取日</span><span class="dispatch-date-value">{safe_value(row.get("引取日"))}</span></div>',
+                    '<div class="dispatch-date-arrow">→</div>',
+                    f'<div class="dispatch-date-box dispatch-arrival-date"><span class="dispatch-date-label">着日</span><span class="dispatch-date-value">{safe_value(row.get("着日"))}</span></div>',
+                    '</div>',
+                    '<div class="dispatch-route">',
+                    f'<div class="dispatch-route-box"><span class="dispatch-route-label">引取先</span><span class="dispatch-route-value">{safe_value(row.get("引取先"))}</span></div>',
+                    '<div class="dispatch-route-arrow">→</div>',
+                    f'<div class="dispatch-route-box"><span class="dispatch-route-label">納品先</span><span class="dispatch-route-value">{safe_value(row.get("納品先"))}</span></div>',
+                    '</div>',
+                    '<div class="dispatch-details">',
+                    f'<div class="dispatch-detail-box"><span class="dispatch-detail-label">商品名</span><span class="dispatch-detail-value">{safe_value(row.get("商品名"))}</span></div>',
+                    f'<div class="dispatch-detail-box"><span class="dispatch-detail-label">数量</span><span class="dispatch-detail-value">{safe_value(row.get("数量"))}</span></div>',
+                    '</div>',
+                    f'<div class="dispatch-carrier"><span class="dispatch-detail-label">運送会社</span><span class="dispatch-detail-value">{safe_value(row.get("運送会社"))}</span></div>',
+                    '</article>',
+                ]
+            )
+        mobile_parts.append("</section>")
+    mobile_parts.append("</div>")
+
+    st.markdown("".join(desktop_parts + mobile_parts), unsafe_allow_html=True)
+
+
 def show_dispatch_board():
     st.markdown("---")
     st.header("🚚 配車表")
@@ -3766,7 +3951,7 @@ def show_dispatch_board():
     st.markdown(
         f"**参照：{selected_month}シート　｜　全 {len(month_df)}件　｜　条件一致 {len(filtered)}件**"
     )
-    st.caption("※ 1件は、元のExcelの明細1行（発注番号1つ）です。")
+    st.caption("※ 1件は、元のExcelの月別シートにある明細1行です。")
 
     if filtered.empty:
         st.info("条件に一致する配車はありません。")
@@ -3775,30 +3960,14 @@ def show_dispatch_board():
     display_df = filtered.sort_values(
         ["_引取日", "_着日", "発注番号"],
         na_position="last",
-    )[DISPATCH_REQUIRED_COLUMNS].copy()
+    )[["引取日", "引取先", "商品名", "数量", "運送会社", "納品先", "着日"]].copy()
 
-    display_df["発注番号"] = display_df["発注番号"].map(normalize_dispatch_text)
     display_df["引取日"] = filtered.loc[display_df.index, "_引取日"].map(dispatch_date_label)
     display_df["着日"] = filtered.loc[display_df.index, "_着日"].map(dispatch_date_label)
     for column in ["引取先", "商品名", "数量", "運送会社", "納品先"]:
         display_df[column] = display_df[column].map(normalize_dispatch_text)
 
-    st.dataframe(
-        display_df,
-        hide_index=True,
-        use_container_width=True,
-        height=min(760, 38 + len(display_df) * 35),
-        column_config={
-            "発注番号": st.column_config.TextColumn("発注番号", width="small"),
-            "引取日": st.column_config.TextColumn("引取日", width="small"),
-            "引取先": st.column_config.TextColumn("引取先", width="medium"),
-            "商品名": st.column_config.TextColumn("商品名", width="medium"),
-            "数量": st.column_config.TextColumn("数量", width="small"),
-            "運送会社": st.column_config.TextColumn("運送会社", width="medium"),
-            "納品先": st.column_config.TextColumn("納品先", width="large"),
-            "着日": st.column_config.TextColumn("着日", width="small"),
-        },
-    )
+    render_dispatch_responsive_list(display_df)
 
 
 
