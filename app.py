@@ -2263,7 +2263,7 @@ def sync_page_from_query_params():
     page = str(get_query_value("page", "home")).strip() or "home"
     customer = str(get_query_value("customer", "")).strip()
 
-    valid_pages = {"home", "customer", "region", "calendar", "notes", "detail"}
+    valid_pages = {"home", "customer", "region", "calendar", "dispatch_table", "notes", "detail"}
 
     raw_page = str(get_query_value("page", "")).strip()
     if page not in valid_pages:
@@ -3740,16 +3740,8 @@ def show_dispatch_board():
 
     filtered = show_dispatch_filters(df)
     st.caption(f"表示対象：{len(filtered)}件 / 全{len(df)}件")
-    view = st.radio(
-        "表示切替",
-        ["📅 カレンダー", "🔎 一覧"],
-        horizontal=True,
-        key="dispatch_board_view",
-    )
-    if view == "📅 カレンダー":
-        show_dispatch_month_calendar(filtered)
-    else:
-        show_dispatch_filtered_list(filtered)
+    st.subheader("📅 配車カレンダー")
+    show_dispatch_month_calendar(filtered)
 
 
 
@@ -3767,8 +3759,12 @@ def show_home_menu():
 
     col3, col4 = st.columns(2)
     with col3:
-        st.markdown(render_page_link("🚚 配車表", page="calendar"), unsafe_allow_html=True)
+        st.markdown(render_page_link("🚚 配車表", page="dispatch_table"), unsafe_allow_html=True)
     with col4:
+        st.markdown(render_page_link("🗓 配車カレンダー", page="calendar"), unsafe_allow_html=True)
+
+    col5, _ = st.columns(2)
+    with col5:
         st.markdown(render_page_link("📝 メモ帳", page="notes"), unsafe_allow_html=True)
 
     st.markdown("---")
@@ -3789,7 +3785,8 @@ handle_customer_query_param()
 MENU_OPTIONS = {
     "🔍 顧客検索": "customer",
     "📍 地域検索": "region",
-    "🚚 配車表": "calendar",
+    "🚚 配車表": "dispatch_table",
+    "🗓 配車カレンダー": "calendar",
     "📝 メモ帳": "notes",
 }
 
@@ -3800,7 +3797,8 @@ with st.sidebar:
     st.markdown("### メニュー")
     st.markdown(render_page_link("🔍 顧客検索", page="customer"), unsafe_allow_html=True)
     st.markdown(render_page_link("📍 地域検索", page="region"), unsafe_allow_html=True)
-    st.markdown(render_page_link("🚚 配車表", page="calendar"), unsafe_allow_html=True)
+    st.markdown(render_page_link("🚚 配車表", page="dispatch_table"), unsafe_allow_html=True)
+    st.markdown(render_page_link("🗓 配車カレンダー", page="calendar"), unsafe_allow_html=True)
     st.markdown(render_page_link("📝 メモ帳", page="notes"), unsafe_allow_html=True)
 
     st.markdown("---")
@@ -3813,7 +3811,7 @@ col_title, col_logout = st.columns([3, 1])
 
 with col_title:
     st.title(f"🚚 {APP_TITLE}")
-    st.caption("顧客検索・地域検索・配車表・メモ帳")
+    st.caption("顧客検索・地域検索・配車表・配車カレンダー・メモ帳")
 
 with col_logout:
     st.write("")
@@ -3840,6 +3838,10 @@ try:
         show_region_search(df)
 
     elif st.session_state["page"] == "calendar":
+        df = load_data()
+        show_dispatch_calendar(df)
+
+    elif st.session_state["page"] == "dispatch_table":
         show_dispatch_board()
 
     elif st.session_state["page"] == "notes":
