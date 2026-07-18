@@ -3730,7 +3730,7 @@ def show_dispatch_board():
     st.markdown("---")
     st.header("🚚 配車表")
     show_back_home_button("dispatch_board_back_home")
-    st.caption("配車表1.xlsmの1月～12月シートを表示しています。")
+    st.caption("配車表1.xlsmの月別シートを、元のExcelに近い一覧で表示します。")
 
     with st.spinner("配車表を読み込んでいます…"):
         df = load_dispatch_board_data()
@@ -3738,10 +3738,67 @@ def show_dispatch_board():
         st.warning("1月～12月シートに表示できるデータがありません。")
         return
 
-    filtered = show_dispatch_filters(df)
-    st.caption(f"表示対象：{len(filtered)}件 / 全{len(df)}件")
-    st.subheader("📅 配車カレンダー")
-    show_dispatch_month_calendar(filtered)
+    current_month_name = f"{date.today().month}月"
+    default_month_index = (
+        DISPATCH_MONTH_SHEETS.index(current_month_name)
+        if current_month_name in DISPATCH_MONTH_SHEETS
+        else 0
+    )
+    selected_month = st.selectbox(
+        "表示する月",
+        DISPATCH_MONTH_SHEETS,
+        index=default_month_index,
+        key="dispatch_table_month",
+    )
+
+    previous_month = st.session_state.get("_dispatch_table_previous_month")
+    if previous_month is not None and previous_month != selected_month:
+        for key in list(st.session_state.keys()):
+            if key.startswith("dispatch_filter_"):
+                del st.session_state[key]
+        st.session_state["_dispatch_table_previous_month"] = selected_month
+        st.rerun()
+    st.session_state["_dispatch_table_previous_month"] = selected_month
+
+    month_df = df[df["参照シート"] == selected_month].copy()
+    filtered = show_dispatch_filters(month_df)
+
+    st.markdown(
+        f"**参照：{selected_month}シート　｜　全 {len(month_df)}件　｜　条件一致 {len(filtered)}件**"
+    )
+    st.caption("※ 1件は、元のExcelの明細1行（発注番号1つ）です。")
+
+    if filtered.empty:
+        st.info("条件に一致する配車はありません。")
+        return
+
+    display_df = filtered.sort_values(
+        ["_引取日", "_着日", "発注番号"],
+        na_position="last",
+    )[DISPATCH_REQUIRED_COLUMNS].copy()
+
+    display_df["発注番号"] = display_df["発注番号"].map(normalize_dispatch_text)
+    display_df["引取日"] = filtered.loc[display_df.index, "_引取日"].map(dispatch_date_label)
+    display_df["着日"] = filtered.loc[display_df.index, "_着日"].map(dispatch_date_label)
+    for column in ["引取先", "商品名", "数量", "運送会社", "納品先"]:
+        display_df[column] = display_df[column].map(normalize_dispatch_text)
+
+    st.dataframe(
+        display_df,
+        hide_index=True,
+        use_container_width=True,
+        height=min(760, 38 + len(display_df) * 35),
+        column_config={
+            "発注番号": st.column_config.TextColumn("発注番号", width="small"),
+            "引取日": st.column_config.TextColumn("引取日", width="small"),
+            "引取先": st.column_config.TextColumn("引取先", width="medium"),
+            "商品名": st.column_config.TextColumn("商品名", width="medium"),
+            "数量": st.column_config.TextColumn("数量", width="small"),
+            "運送会社": st.column_config.TextColumn("運送会社", width="medium"),
+            "納品先": st.column_config.TextColumn("納品先", width="large"),
+            "着日": st.column_config.TextColumn("着日", width="small"),
+        },
+    )
 
 
 
