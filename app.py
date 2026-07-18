@@ -33,7 +33,7 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 
-EXCEL_FILE = "配車予定 次郎.xlsm"
+EXCEL_FILE = "配車予定 次郎_修正版.xlsm"
 SHEET_NAME = "Sheet1"
 
 # secrets.toml に入れる設定
@@ -48,8 +48,9 @@ DROPBOX_BACKUP_FOLDER = "/1共有　青山商店　本社/配車表-北海道-/B
 DROPBOX_FAST_CACHE_FILE = "/1共有　青山商店　本社/配車表-北海道-/顧客検索キャッシュ.json"
 DELIVERY_SHEET_NAME = "次回配達日"
 SHEET1_CUSTOMER_COLUMN = 2   # B列：顧客名
-SHEET1_ADDRESS_COLUMN = 9    # I列：住所
-SHEET1_MAP_COLUMN = 10       # J列：マップ位置
+SHEET1_HIRAGANA_COLUMN = 9   # I列：ひらがな
+SHEET1_ADDRESS_COLUMN = 10   # J列：住所
+SHEET1_MAP_COLUMN = 11       # K列：マップ位置
 APP_PASSWORD = st.secrets.get("APP_PASSWORD", "")
 SUPABASE_URL = st.secrets.get("SUPABASE_URL", "")
 SUPABASE_SECRET_KEY = st.secrets.get("SUPABASE_SECRET_KEY", "")
@@ -1249,7 +1250,7 @@ def save_customer_excel_changes(customer_name, product_name, proposed):
 
 @st.cache_data(ttl=60, show_spinner=False)
 def read_customer_map_values_from_bytes(content, customer_name):
-    """Sheet1の表示値で顧客を探し、I列住所・J列マップ位置を返す。"""
+    """Sheet1の表示値で顧客を探し、J列住所・K列マップ位置を返す。"""
     workbook = load_workbook(BytesIO(content), keep_vba=True, data_only=False, read_only=False)
     try:
         if SHEET_NAME not in workbook.sheetnames:
@@ -1269,7 +1270,7 @@ def read_customer_map_values_from_bytes(content, customer_name):
 
 
 def update_customer_map_workbook_bytes(original_content, customer_name, address, map_location):
-    """Sheet1のI列住所・J列マップ位置だけを更新する。"""
+    """Sheet1のJ列住所・K列マップ位置だけを更新する。"""
     workbook = load_workbook(BytesIO(original_content), keep_vba=True, data_only=False, read_only=False)
     original_sheets = list(workbook.sheetnames)
     changed_cells = []
@@ -1954,7 +1955,7 @@ def rebuild_sheet1_from_formula_references(excel_source):
                 "使用数量/日": delivery.cell(source_row, 7).value,
                 "次回配達予定": next_delivery,
                 "残数": remaining,
-                "ひらがな": sheet1.cell(sheet1_row, 8).value,
+                "ひらがな": sheet1.cell(sheet1_row, SHEET1_HIRAGANA_COLUMN).value,
                 "住所": sheet1.cell(sheet1_row, SHEET1_ADDRESS_COLUMN).value,
                 "マップ位置": sheet1.cell(sheet1_row, SHEET1_MAP_COLUMN).value,
                 "メーカー": delivery.cell(source_row, 6).value,
