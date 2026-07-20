@@ -1594,10 +1594,14 @@ def get_supabase_headers(prefer=None):
     key = get_supabase_key()
     headers = {
         "apikey": key,
-        "Authorization": f"Bearer {key}",
         "Accept": "application/json",
         "Content-Type": "application/json",
     }
+    # 新しいsb_secret_/sb_publishable_キーはJWTではないため、
+    # Authorization: Bearerには入れず、apikeyヘッダーだけで送る。
+    # 旧service_role/anonのJWTキーは従来どおりBearerにも設定する。
+    if not key.startswith(("sb_secret_", "sb_publishable_")):
+        headers["Authorization"] = f"Bearer {key}"
     if prefer:
         headers["Prefer"] = prefer
     return headers
@@ -2349,13 +2353,14 @@ def render_customer_information_card(customer_name, customer_key=None):
                         unsafe_allow_html=True,
                     )
 
-        st.markdown("---")
-        render_customer_information_form(
-            customer_name,
-            customer_key,
-            items,
-            state_suffix,
-        )
+        if edit_mode:
+            st.markdown("---")
+            render_customer_information_form(
+                customer_name,
+                customer_key,
+                items,
+                state_suffix,
+            )
 
 
 
