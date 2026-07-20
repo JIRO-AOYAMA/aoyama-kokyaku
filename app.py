@@ -5873,7 +5873,8 @@ def show_soluble_inventory_page():
 
     month_keys = sorted({(row["date"].year, row["date"].month) for row in active_rows})
     month_labels = [f"{year}年{month}月" for year, month in month_keys]
-    today = date.today()
+    # Streamlit CloudはUTCで動くため、日本時間の「今日」を使う。
+    today = get_jst_now().date()
     today_key = (today.year, today.month)
     today_month_label = f"{today.year}年{today.month}月"
     default_month = month_keys.index(today_key) if today_key in month_keys else len(month_keys) - 1
@@ -5918,22 +5919,41 @@ def show_soluble_inventory_page():
         )
     with control_right:
         period_widget_key = f"soluble_period_{location}"
-        period_default_key = f"{period_widget_key}_default_month_all_v1"
-        if not st.session_state.get(period_default_key):
-            st.session_state[period_widget_key] = "月全体"
+        period_options = ["7日間", "14日間", "1か月"]
+        period_default_key = f"{period_widget_key}_default_one_month_v2"
+        if (
+            not st.session_state.get(period_default_key)
+            or st.session_state.get(period_widget_key) not in period_options
+        ):
+            st.session_state[period_widget_key] = "1か月"
             st.session_state[period_default_key] = True
         period = st.selectbox(
             "表示期間",
-            ["7日間", "14日間", "月全体"],
+            period_options,
             index=2,
             key=period_widget_key,
         )
     manual_only = st.checkbox("黄色の手入力だけ表示", key=f"soluble_manual_only_{location}")
 
-    visible_rows = month_rows if period == "月全体" else [
-        row for row in month_rows
-        if start_day <= row["date"] < start_day + timedelta(days=7 if period == "7日間" else 14)
-    ]
+    if period == "1か月":
+        next_month = 1 if start_day.month == 12 else start_day.month + 1
+        next_year = start_day.year + 1 if start_day.month == 12 else start_day.year
+        one_month_later = date(
+            next_year,
+            next_month,
+            min(start_day.day, calendar.monthrange(next_year, next_month)[1]),
+        )
+        visible_rows = [
+            row for row in active_rows
+            if start_day <= row["date"] < one_month_later
+        ]
+    else:
+        visible_rows = [
+            row for row in month_rows
+            if start_day <= row["date"] < start_day + timedelta(
+                days=7 if period == "7日間" else 14
+            )
+        ]
     if manual_only:
         visible_rows = [
             row for row in visible_rows
