@@ -5873,13 +5873,25 @@ def show_soluble_inventory_page():
 
     month_keys = sorted({(row["date"].year, row["date"].month) for row in active_rows})
     month_labels = [f"{year}年{month}月" for year, month in month_keys]
-    today_key = (date.today().year, date.today().month)
+    today = date.today()
+    today_key = (today.year, today.month)
+    today_month_label = f"{today.year}年{today.month}月"
     default_month = month_keys.index(today_key) if today_key in month_keys else len(month_keys) - 1
+
+    # 日付が変わった最初の表示だけ、表示月と開始日を今日へ戻す。
+    # 同じ日のうちは、ユーザーが選んだ別の日付・表示月をそのまま維持する。
+    month_widget_key = f"soluble_month_{location}"
+    daily_reset_key = f"soluble_daily_default_{location}"
+    if st.session_state.get(daily_reset_key) != today.isoformat():
+        if today_month_label in month_labels:
+            st.session_state[month_widget_key] = today_month_label
+        st.session_state[daily_reset_key] = today.isoformat()
+
     selected_month_label = st.selectbox(
         "表示月",
         month_labels,
         index=default_month,
-        key=f"soluble_month_{location}",
+        key=month_widget_key,
     )
     selected_month_key = month_keys[month_labels.index(selected_month_label)]
     month_rows = [
@@ -5888,7 +5900,13 @@ def show_soluble_inventory_page():
     ]
 
     day_options = [row["date"] for row in month_rows]
-    default_day = day_options.index(date.today()) if date.today() in day_options else 0
+    default_day = day_options.index(today) if today in day_options else 0
+    start_widget_key = f"soluble_start_{location}_{selected_month_label}"
+    start_default_key = f"{start_widget_key}_default_{today.isoformat()}"
+    if today in day_options and not st.session_state.get(start_default_key):
+        st.session_state[start_widget_key] = today
+        st.session_state[start_default_key] = True
+
     control_left, control_right = st.columns(2)
     with control_left:
         start_day = st.selectbox(
@@ -5896,13 +5914,19 @@ def show_soluble_inventory_page():
             day_options,
             index=default_day,
             format_func=lambda day: f"{day.month}/{day.day}（{'月火水木金土日'[day.weekday()]}）",
-            key=f"soluble_start_{location}_{selected_month_label}",
+            key=start_widget_key,
         )
     with control_right:
+        period_widget_key = f"soluble_period_{location}"
+        period_default_key = f"{period_widget_key}_default_month_all_v1"
+        if not st.session_state.get(period_default_key):
+            st.session_state[period_widget_key] = "月全体"
+            st.session_state[period_default_key] = True
         period = st.selectbox(
             "表示期間",
             ["7日間", "14日間", "月全体"],
-            key=f"soluble_period_{location}",
+            index=2,
+            key=period_widget_key,
         )
     manual_only = st.checkbox("黄色の手入力だけ表示", key=f"soluble_manual_only_{location}")
 
