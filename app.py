@@ -2064,6 +2064,26 @@ def show_notes_page(df):
         render_note_delete_controls(note)
 
 
+# 過去商品のメモは、既存の顧客情報テーブルへ非表示項目として保存する。
+# 新しいSupabaseテーブルやExcel列は不要。
+PAST_PRODUCT_MEMO_PREFIX = "__past_product_memo__:"
+
+
+def make_past_product_memo_field_name(product_name):
+    return f"{PAST_PRODUCT_MEMO_PREFIX}{clean_value(product_name, blank_text='').strip()}"
+
+
+def is_past_product_memo_item(item):
+    return str(item.get("field_name", "")).startswith(PAST_PRODUCT_MEMO_PREFIX)
+
+
+def get_past_product_name_from_item(item):
+    field_name = str(item.get("field_name", ""))
+    if not field_name.startswith(PAST_PRODUCT_MEMO_PREFIX):
+        return ""
+    return field_name[len(PAST_PRODUCT_MEMO_PREFIX):].strip()
+
+
 # =========================
 # 顧客情報（Supabase保存）
 # =========================
@@ -2320,7 +2340,9 @@ def render_customer_information_card(customer_name, customer_key=None):
             return
 
         try:
-            items = load_customer_information(customer_name, customer_key)
+            all_items = load_customer_information(customer_name, customer_key)
+            # 過去商品の専用メモは、通常の「顧客情報」には表示しない。
+            items = [item for item in all_items if not is_past_product_memo_item(item)]
         except Exception as exc:
             st.warning(str(exc))
             return
@@ -3157,6 +3179,112 @@ def render_customer_map_editor(customer_name, current):
             st.error(f"保存できませんでした：{exc}")
 
 
+
+def get_past_product_names(detail, visible_detail):
+    """使用量が0/空白で、同名の商品に使用中行がないものだけを返す。"""
+    active_names = {
+        clean_value(value, blank_text="").strip()
+        for value in visible_detail["商品名"].tolist()
+        if clean_value(value, blank_text="").strip()
+    }
+
+    past_names = []
+    seen = set()
+    for _, row in detail.iterrows():
+        if not is_blank_or_zero(row.get("使用数量/日")):
+            continue
+        product_name = clean_value(row.get("商品名"), blank_text="").strip()
+        if not product_name or product_name in active_names or product_name in seen:
+            continue
+        seen.add(product_name)
+        past_names.append(product_name)
+    return past_names
+
+
+def render_past_products(customer_name, customer_key, product_names):
+    """画面最下部に過去商品名を並べ、商品ごとのメモを編集できるようにする。"""
+    if not product_names:
+        return
+
+    st.markdown("---")
+    st.subheader("📦 過去に使用した商品")
+
+    if not has_supabase_config():
+        st.warning("商品メモを使うにはSupabase設定が必要です。")
+        for product_name in product_names:
+            st.markdown(f"**{html.escape(product_name)}**")
+        return
+
+    try:
+        all_items = load_customer_information(customer_name, customer_key)
+    except Exception as exc:
+        st.warning(str(exc))
+        for product_name in product_names:
+            st.markdown(f"**{html.escape(product_name)}**")
+        return
+
+    memo_items = {
+        get_past_product_name_from_item(item): item
+        for item in all_items
+        if is_past_product_memo_item(item)
+        and get_past_product_name_from_item(item)
+    }
+
+    identity = customer_key or customer_name
+    customer_suffix = hashlib.sha256(str(identity).encode("utf-8")).hexdigest()[:12]
+
+    for product_name in product_names:
+        item = memo_items.get(product_name)
+        current_memo = str(item.get("content", "") if item else "")
+        product_suffix = hashlib.sha256(product_name.encode("utf-8")).hexdigest()[:12]
+        state_key = f"past_product_memo_{customer_suffix}_{product_suffix}"
+        success_key = f"past_product_memo_success_{customer_suffix}_{product_suffix}"
+
+        with st.expander(f"📦 {product_name}"):
+            if st.session_state.pop(success_key, False):
+                st.success("商品メモを保存しました。")
+
+            with st.form(f"past_product_memo_form_{customer_suffix}_{product_suffix}"):
+                memo_text = st.text_area(
+                    "メモ",
+                    value=current_memo,
+                    key=state_key,
+                    height=120,
+                    placeholder="例：価格変更のため中止。別商品へ切り替え。など",
+                    help=VOICE_INPUT_HELP,
+                )
+                save = st.form_submit_button(
+                    "メモを保存",
+                    type="primary",
+                    use_container_width=True,
+                )
+
+            if save:
+                try:
+                    if item:
+                        update_customer_information(
+                            item["id"],
+                            make_past_product_memo_field_name(product_name),
+                            memo_text,
+                        )
+                    else:
+                        next_order = max(
+                            (int(row.get("sort_order", 0)) for row in all_items),
+                            default=0,
+                        ) + 10
+                        insert_customer_information(
+                            customer_name,
+                            customer_key,
+                            make_past_product_memo_field_name(product_name),
+                            memo_text,
+                            next_order,
+                        )
+                    st.session_state[success_key] = True
+                    st.rerun()
+                except RuntimeError as exc:
+                    st.error(str(exc))
+
+
 def show_customer_detail(df, customer_name):
     detail = df[df["顧客名"] == customer_name].copy()
 
@@ -3167,8 +3295,9 @@ def show_customer_detail(df, customer_name):
     show_back_home_button("detail_back_home")
     show_detail_search_shortcuts()
 
-    # 使用数量/日が0・空白・NaNの商品行は、商品名ごと表示しない。
+    # 使用数量/日が0・空白・NaNの商品行は、通常の商品カードには表示しない。
     visible_detail = detail[~detail["使用数量/日"].apply(is_blank_or_zero)].copy()
+    past_product_names = get_past_product_names(detail, visible_detail)
 
     region = clean_value(detail.iloc[0]["地域"])
 
@@ -3234,8 +3363,7 @@ def show_customer_detail(df, customer_name):
     render_customer_information_card(customer_name, customer_key)
 
     if visible_detail.empty:
-        st.info("表示対象の商品はありません。使用数量/日が0または空白の商品は非表示にしています。")
-        return
+        st.info("現在使用中の商品はありません。")
 
     for _, row in visible_detail.iterrows():
         product_name = clean_value(row["商品名"])
@@ -3278,6 +3406,7 @@ def show_customer_detail(df, customer_name):
 
 
     show_customer_notes(customer_name)
+    render_past_products(customer_name, customer_key, past_product_names)
 
 # =========================
 # 顧客名一覧
