@@ -5296,7 +5296,6 @@ def show_soluble_inventory_page():
                 inventory_text = st.text_input(
                     "在庫（自動計算を外した場合に使用）",
                     value=soluble_input_value(inventory),
-                    disabled=auto_inventory,
                     key=f"{form_key}_inventory",
                 )
                 submitted = st.form_submit_button("バックアップして保存", use_container_width=True)
