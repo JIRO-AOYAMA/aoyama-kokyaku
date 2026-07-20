@@ -293,9 +293,37 @@ st.markdown(
         box-shadow: 0 6px 18px rgba(15, 23, 42, 0.07);
         font-weight: 700 !important;
     }
+    .stButton > button,
+    .stButton > button *,
+    .stFormSubmitButton > button,
+    .stFormSubmitButton > button * {
+        color: #172033 !important;
+        -webkit-text-fill-color: #172033 !important;
+        opacity: 1 !important;
+    }
     .stButton > button:hover {
         border-color: rgba(37, 99, 235, 0.35) !important;
         box-shadow: 0 10px 24px rgba(37, 99, 235, 0.12);
+    }
+
+    .customer-information-row {
+        display: grid;
+        grid-template-columns: minmax(6.5rem, 1.4fr) minmax(0, 3fr);
+        align-items: start;
+        column-gap: 0.9rem;
+        padding: 0.35rem 0;
+        color: #172033;
+        font-size: 1rem;
+        line-height: 1.55;
+    }
+    .customer-information-label,
+    .customer-information-content {
+        margin: 0;
+        padding: 0;
+        overflow-wrap: anywhere;
+    }
+    .customer-information-label {
+        font-weight: 800;
     }
 
     .stTextInput input {
@@ -411,6 +439,12 @@ st.markdown(
         }
         h3 {
             font-size: 1.08rem !important;
+        }
+
+        .customer-information-row {
+            grid-template-columns: minmax(5.5rem, 1.35fr) minmax(0, 2.65fr);
+            column-gap: 0.7rem;
+            align-items: baseline;
         }
     }
     
@@ -2202,7 +2236,7 @@ def render_customer_information_card(customer_name, customer_key=None):
         with action_col:
             edit_mode = bool(st.session_state.get(edit_mode_key))
             if st.button(
-                "編集終了" if edit_mode else "編集モード",
+                "完了" if edit_mode else "編集",
                 key=f"customer_information_mode_button_{state_suffix}",
                 use_container_width=True,
             ):
@@ -2276,9 +2310,8 @@ def render_customer_information_card(customer_name, customer_key=None):
                 delete_col, cancel_col = st.columns(2)
                 with delete_col:
                     if st.button(
-                        "削除",
+                        "削除する",
                         key=f"customer_information_delete_confirm_{item_id}",
-                        type="primary",
                         use_container_width=True,
                     ):
                         try:
@@ -2343,15 +2376,17 @@ def render_customer_information_card(customer_name, customer_key=None):
                         st.session_state.pop(editing_item_key, None)
                         st.rerun()
             else:
-                name_col, content_col = st.columns([1.4, 3])
-                with name_col:
-                    st.markdown(f"**{html.escape(field_name)}**", unsafe_allow_html=True)
-                with content_col:
-                    safe_content = html.escape(content).replace("\n", "<br>")
-                    st.markdown(
-                        f'<div style="overflow-wrap:anywhere">{safe_content}</div>',
-                        unsafe_allow_html=True,
-                    )
+                safe_name = html.escape(field_name)
+                safe_content = html.escape(content).replace("\n", "<br>")
+                st.markdown(
+                    (
+                        '<div class="customer-information-row">'
+                        f'<div class="customer-information-label">{safe_name}</div>'
+                        f'<div class="customer-information-content">{safe_content}</div>'
+                        '</div>'
+                    ),
+                    unsafe_allow_html=True,
+                )
 
         if edit_mode:
             st.markdown("---")
