@@ -4637,7 +4637,7 @@ def show_dispatch_board():
 
 
 # =========================
-# ソリュブル在庫計画（aoベンチャーグレイン配車表.xlsx）
+# ソリュブル在庫（aoベンチャーグレイン配車表.xlsx）
 # =========================
 def soluble_cell_is_manual(cell):
     """Excelで黄色に塗られたセルを手入力値として扱う。"""
@@ -5212,11 +5212,11 @@ def save_soluble_changes(row_number, location, updates):
 
 def show_soluble_inventory_page():
     st.markdown("---")
-    st.header("🧪 ソリュブル在庫計画")
+    st.header("🧪 ソリュブル在庫")
     show_back_home_button("soluble_back_home")
     st.caption("aoベンチャーグレイン配車表.xlsx の「ソリュブル」シートを表示します。")
 
-    with st.spinner("ソリュブル在庫計画を読み込んでいます…"):
+    with st.spinner("ソリュブル在庫を読み込んでいます…"):
         content, source = load_soluble_workbook_content()
         rows = read_soluble_rows(content)
     if not rows:
@@ -5418,7 +5418,7 @@ def show_home_menu():
     with col5:
         st.markdown(render_page_link("🚚 配車表", page="dispatch_table"), unsafe_allow_html=True)
     with col6:
-        st.markdown(render_page_link("🧪 ソリュブル在庫計画", page="soluble_inventory"), unsafe_allow_html=True)
+        st.markdown(render_page_link("🧪 ソリュブル在庫", page="soluble_inventory"), unsafe_allow_html=True)
 
     col7, _ = st.columns(2)
     with col7:
@@ -5445,7 +5445,7 @@ MENU_OPTIONS = {
     "📍 地域検索": "region",
     "🗓 配車カレンダー": "calendar",
     "🚚 配車表": "dispatch_table",
-    "🧪 ソリュブル在庫計画": "soluble_inventory",
+    "🧪 ソリュブル在庫": "soluble_inventory",
     "📝 メモ帳": "notes",
 }
 
@@ -5459,7 +5459,7 @@ with st.sidebar:
     st.markdown(render_page_link("📍 地域検索", page="region"), unsafe_allow_html=True)
     st.markdown(render_page_link("🗓 配車カレンダー", page="calendar"), unsafe_allow_html=True)
     st.markdown(render_page_link("🚚 配車表", page="dispatch_table"), unsafe_allow_html=True)
-    st.markdown(render_page_link("🧪 ソリュブル在庫計画", page="soluble_inventory"), unsafe_allow_html=True)
+    st.markdown(render_page_link("🧪 ソリュブル在庫", page="soluble_inventory"), unsafe_allow_html=True)
     st.markdown(render_page_link("📝 メモ帳", page="notes"), unsafe_allow_html=True)
 
     st.markdown("---")
@@ -5472,7 +5472,7 @@ col_title, col_logout = st.columns([3, 1])
 
 with col_title:
     st.title(f"🚚 {APP_TITLE}")
-    st.caption("顧客名一覧・顧客検索・地域検索・配車カレンダー・配車表・ソリュブル在庫計画・メモ帳")
+    st.caption("顧客名一覧・顧客検索・地域検索・配車カレンダー・配車表・ソリュブル在庫・メモ帳")
 
 with col_logout:
     st.write("")
@@ -5528,4 +5528,4 @@ except Exception as e:
     st.exception(e)
     st.stop()
 
-st.caption("※ 顧客情報はSheet1、配車表は配車表1.xlsm、ソリュブル在庫計画はaoベンチャーグレイン配車表.xlsxを読み込んで表示しています。")
+st.caption("※ 顧客情報はSheet1、配車表は配車表1.xlsm、ソリュブル在庫はaoベンチャーグレイン配車表.xlsxを読み込んで表示しています。")
