@@ -1,14 +1,18 @@
 import calendar
+import copy
 import hashlib
 import html
 import json
 import math
+import posixpath
 import re
 import urllib.parse
 import uuid
+import zipfile
 from datetime import date, datetime, timedelta, timezone
 from io import BytesIO
 from pathlib import Path
+from xml.etree import ElementTree as ET
 
 import pandas as pd
 import requests
@@ -59,6 +63,24 @@ DISPATCH_LOCAL_FILE = st.secrets.get(
     r"C:\Users\jiroa\Aoyama Dropbox\bulu jack\1共有　青山商店　本社\配車表-次郎-\配車表1.xlsm",
 )
 DISPATCH_MONTH_SHEETS = [f"{month}月" for month in range(1, 13)]
+SOLUBLE_SHEET_NAME = "ソリュブル"
+SOLUBLE_FILE_NAME = "aoベンチャーグレイン配車表.xlsx"
+SOLUBLE_DROPBOX_DEFAULT_FILE_PATH = (
+    str(DROPBOX_DEFAULT_FILE_PATH).rsplit("/", 1)[0] + "/" + SOLUBLE_FILE_NAME
+)
+SOLUBLE_DROPBOX_FILE_PATH = st.secrets.get(
+    "SOLUBLE_DROPBOX_FILE_PATH",
+    str(DROPBOX_FILE_PATH).rsplit("/", 1)[0] + "/" + SOLUBLE_FILE_NAME,
+)
+SOLUBLE_LOCAL_FILE = st.secrets.get(
+    "SOLUBLE_LOCAL_FILE",
+    r"C:\Users\jiroa\Aoyama Dropbox\bulu jack\1共有　青山商店　本社\配車表-北海道-\aoベンチャーグレイン配車表.xlsx",
+)
+SOLUBLE_BACKUP_FOLDER = str(SOLUBLE_DROPBOX_FILE_PATH).rsplit("/", 1)[0] + "/Backups"
+SOLUBLE_LOCATIONS = {
+    "ノベルズ": {"usage": 3, "delivery": 4, "inventory": 5},
+    "コスモアグリ": {"usage": 6, "delivery": 7, "inventory": 8},
+}
 DISPATCH_REQUIRED_COLUMNS = [
     "発注番号",
     "引取日",
@@ -2764,6 +2786,7 @@ def sync_page_from_query_params():
         "region",
         "calendar",
         "dispatch_table",
+        "soluble_inventory",
         "notes",
         "detail",
     }
@@ -4612,6 +4635,699 @@ def show_dispatch_board():
     render_dispatch_responsive_list(display_df)
 
 
+# =========================
+# ソリュブル在庫計画（aoベンチャーグレイン配車表.xlsx）
+# =========================
+def soluble_cell_is_manual(cell):
+    """Excelで黄色に塗られたセルを手入力値として扱う。"""
+    if cell.fill.fill_type != "solid":
+        return False
+    color = cell.fill.fgColor
+    if color.type == "rgb":
+        return str(color.rgb or "").upper().endswith("FFFF00")
+    return False
+
+
+def soluble_formula_value(formula_ws, value_ws, row, column, memo=None, visiting=None):
+    """保存後にExcelの計算キャッシュが空でも、対象表の単純な加減式を表示できるようにする。"""
+    memo = memo if memo is not None else {}
+    visiting = visiting if visiting is not None else set()
+    key = (row, column)
+    if key in memo:
+        return memo[key]
+    if key in visiting:
+        return None
+
+    raw = formula_ws.cell(row, column).value
+    cached = value_ws.cell(row, column).value
+    if not (isinstance(raw, str) and raw.startswith("=")):
+        memo[key] = raw
+        return raw
+    if cached is not None:
+        memo[key] = cached
+        return cached
+
+    expression = raw[1:].replace(" ", "").replace("$", "").upper()
+    tokens = re.findall(r"[A-Z]+\d+|\d+(?:\.\d+)?|[+-]", expression)
+    if not tokens or "".join(tokens) != expression:
+        return None
+
+    visiting.add(key)
+    try:
+        def token_value(token):
+            match = re.fullmatch(r"([A-Z]+)(\d+)", token)
+            if match:
+                letters, target_row = match.groups()
+                target_column = 0
+                for letter in letters:
+                    target_column = target_column * 26 + (ord(letter) - 64)
+                return soluble_formula_value(
+                    formula_ws,
+                    value_ws,
+                    int(target_row),
+                    target_column,
+                    memo,
+                    visiting,
+                )
+            return float(token)
+
+        result = token_value(tokens[0])
+        index = 1
+        while index < len(tokens):
+            operator = tokens[index]
+            right = token_value(tokens[index + 1])
+            if result is None:
+                result = 0
+            if right is None:
+                right = 0
+            if isinstance(result, (date, datetime)) and isinstance(right, (int, float)):
+                result = result + timedelta(days=right if operator == "+" else -right)
+            else:
+                result = result + right if operator == "+" else result - right
+            index += 2
+        memo[key] = result
+        return result
+    except Exception:
+        return None
+    finally:
+        visiting.discard(key)
+
+
+def soluble_date_value(value):
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    if isinstance(value, (int, float)):
+        return date(1899, 12, 30) + timedelta(days=int(value))
+    parsed = pd.to_datetime(value, errors="coerce")
+    if pd.isna(parsed):
+        return None
+    return parsed.date()
+
+
+def soluble_number_label(value):
+    if value is None or (isinstance(value, float) and math.isnan(value)):
+        return "—"
+    if isinstance(value, (int, float)):
+        number = float(value)
+        if number.is_integer():
+            return f"{int(number):,}"
+        return f"{number:,.2f}".rstrip("0").rstrip(".")
+    return str(value)
+
+
+def soluble_input_value(value):
+    if value is None:
+        return ""
+    if isinstance(value, (int, float)) and float(value).is_integer():
+        return str(int(value))
+    return str(value)
+
+
+def parse_soluble_number(text, label):
+    cleaned = str(text or "").strip().replace(",", "").replace("，", "")
+    if not cleaned:
+        return None
+    try:
+        number = float(cleaned)
+    except ValueError as exc:
+        raise ValueError(f"{label}は数字で入力してください。") from exc
+    return int(number) if number.is_integer() else number
+
+
+def same_soluble_value(left, right):
+    if left is None and right is None:
+        return True
+    if isinstance(left, (int, float)) and isinstance(right, (int, float)):
+        return math.isclose(float(left), float(right), rel_tol=0, abs_tol=1e-9)
+    return left == right
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def load_soluble_workbook_content():
+    """Dropboxを優先し、開発用PCでは同期済みローカルファイルも利用する。"""
+    target_path = str(SOLUBLE_DROPBOX_FILE_PATH or SOLUBLE_DROPBOX_DEFAULT_FILE_PATH).strip()
+    if has_dropbox_auth_config():
+        access_token = get_dropbox_access_token()
+        content, response = download_dropbox_file(target_path, access_token)
+        if content is not None:
+            return content, "Dropbox"
+        local_path = Path(str(SOLUBLE_LOCAL_FILE))
+        if not local_path.exists():
+            raise RuntimeError(
+                "aoベンチャーグレイン配車表.xlsxをDropboxから取得できませんでした。\n"
+                + dropbox_error_text(response)
+            )
+        return local_path.read_bytes(), "同期済みローカルファイル"
+
+    local_path = Path(str(SOLUBLE_LOCAL_FILE))
+    if not local_path.exists():
+        raise FileNotFoundError(f"対象ファイルが見つかりません：{local_path}")
+    return local_path.read_bytes(), "同期済みローカルファイル"
+
+
+def read_soluble_rows(content):
+    formula_wb = load_workbook(BytesIO(content), data_only=False, read_only=False)
+    value_wb = load_workbook(BytesIO(content), data_only=True, read_only=False)
+    try:
+        if SOLUBLE_SHEET_NAME not in formula_wb.sheetnames:
+            raise ValueError("ソリュブルシートが見つかりません。")
+        formula_ws = formula_wb[SOLUBLE_SHEET_NAME]
+        value_ws = value_wb[SOLUBLE_SHEET_NAME]
+        memo = {}
+        rows = []
+        for row_number in range(11, formula_ws.max_row + 1):
+            day_value = soluble_formula_value(formula_ws, value_ws, row_number, 2, memo)
+            day = soluble_date_value(day_value)
+            if day is None:
+                continue
+            record = {"row": row_number, "date": day}
+            for location, columns in SOLUBLE_LOCATIONS.items():
+                for field, column in columns.items():
+                    record[f"{location}_{field}"] = soluble_formula_value(
+                        formula_ws, value_ws, row_number, column, memo
+                    )
+                    record[f"{location}_{field}_manual"] = soluble_cell_is_manual(
+                        formula_ws.cell(row_number, column)
+                    )
+                    record[f"{location}_{field}_formula"] = (
+                        formula_ws.cell(row_number, column).value
+                        if isinstance(formula_ws.cell(row_number, column).value, str)
+                        and formula_ws.cell(row_number, column).value.startswith("=")
+                        else ""
+                    )
+            rows.append(record)
+        return rows
+    finally:
+        formula_wb.close()
+        value_wb.close()
+
+
+def build_soluble_updated_workbook(content, row_number, location, updates):
+    """XLSX全体を再生成せず、対象セルのXMLだけを変更して既存の計算結果を保つ。"""
+    if location not in SOLUBLE_LOCATIONS:
+        raise ValueError("対象の会社が正しくありません。")
+    if row_number < 11:
+        raise ValueError("更新する行が正しくありません。")
+    if not updates:
+        raise ValueError("変更された項目がありません。")
+
+    columns = SOLUBLE_LOCATIONS[location]
+    for field in updates:
+        if field not in columns:
+            raise ValueError("更新項目が正しくありません。")
+
+    original_rows = read_soluble_rows(content)
+    current_row = next((row for row in original_rows if row["row"] == row_number), None)
+    previous_row = next((row for row in original_rows if row["row"] == row_number - 1), None)
+    if current_row is None:
+        raise ValueError("更新する日付行が見つかりません。")
+
+    # openpyxlは共有数式を各セルの通常の式へ展開して読めるため、表示値の再計算に利用する。
+    formula_book = load_workbook(BytesIO(content), data_only=False, read_only=False)
+    try:
+        if SOLUBLE_SHEET_NAME not in formula_book.sheetnames:
+            raise ValueError("ソリュブルシートが見つかりません。")
+        formula_sheet = formula_book[SOLUBLE_SHEET_NAME]
+        expanded_formulas = {
+            cell.coordinate: cell.value[1:]
+            for row in formula_sheet.iter_rows(min_row=11, min_col=2, max_col=8)
+            for cell in row
+            if isinstance(cell.value, str) and cell.value.startswith("=")
+        }
+    finally:
+        formula_book.close()
+
+    resolved_updates = {}
+    cached_values = {}
+    for field, requested_value in updates.items():
+        if requested_value == "__AUTO_INVENTORY__":
+            if field != "inventory" or previous_row is None:
+                raise ValueError("この日は在庫を自動計算にできません。")
+            inventory_column = columns["inventory"]
+            usage_column = columns["usage"]
+            delivery_column = columns["delivery"]
+            inventory_letter = chr(64 + inventory_column)
+            usage_letter = chr(64 + usage_column)
+            delivery_letter = chr(64 + delivery_column)
+            formula = f"={inventory_letter}{row_number - 1}-{usage_letter}{row_number}+{delivery_letter}{row_number}"
+            previous_inventory = previous_row.get(f"{location}_inventory") or 0
+            current_usage = updates.get("usage", current_row.get(f"{location}_usage")) or 0
+            current_delivery = updates.get("delivery", current_row.get(f"{location}_delivery")) or 0
+            if not all(isinstance(value, (int, float)) for value in (previous_inventory, current_usage, current_delivery)):
+                raise ValueError("在庫の自動計算に使う値が数字ではありません。")
+            resolved_updates[field] = formula
+            cached_values[field] = previous_inventory - current_usage + current_delivery
+        else:
+            resolved_updates[field] = requested_value
+            cached_values[field] = requested_value
+
+    main_ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+    office_rel_ns = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+    package_rel_ns = "http://schemas.openxmlformats.org/package/2006/relationships"
+    ET.register_namespace("", main_ns)
+
+    with zipfile.ZipFile(BytesIO(content), "r") as source_zip:
+        workbook_root = ET.fromstring(source_zip.read("xl/workbook.xml"))
+        relationship_id = ""
+        for sheet_node in workbook_root.findall(f".//{{{main_ns}}}sheet"):
+            if sheet_node.get("name") == SOLUBLE_SHEET_NAME:
+                relationship_id = sheet_node.get(f"{{{office_rel_ns}}}id", "")
+                break
+        if not relationship_id:
+            raise ValueError("ソリュブルシートが見つかりません。")
+
+        relationships_root = ET.fromstring(source_zip.read("xl/_rels/workbook.xml.rels"))
+        sheet_target = ""
+        for relationship in relationships_root.findall(f"{{{package_rel_ns}}}Relationship"):
+            if relationship.get("Id") == relationship_id:
+                sheet_target = relationship.get("Target", "")
+                break
+        if not sheet_target:
+            raise ValueError("ソリュブルシートの保存先を確認できません。")
+        sheet_part = (
+            sheet_target.lstrip("/")
+            if sheet_target.startswith("/")
+            else posixpath.normpath(posixpath.join("xl", sheet_target))
+        )
+
+        sheet_root = ET.fromstring(source_zip.read(sheet_part))
+        styles_root = ET.fromstring(source_zip.read("xl/styles.xml"))
+        fills = styles_root.find(f"{{{main_ns}}}fills")
+        cell_xfs = styles_root.find(f"{{{main_ns}}}cellXfs")
+        if fills is None or cell_xfs is None:
+            raise ValueError("Excelの表示形式を確認できません。")
+
+        yellow_fill_id = None
+        for fill_index, fill in enumerate(list(fills)):
+            foreground = fill.find(f".//{{{main_ns}}}fgColor")
+            if foreground is not None and str(foreground.get("rgb", "")).upper().endswith("FFFF00"):
+                yellow_fill_id = fill_index
+                break
+        if yellow_fill_id is None:
+            fill = ET.Element(f"{{{main_ns}}}fill")
+            pattern = ET.SubElement(fill, f"{{{main_ns}}}patternFill", {"patternType": "solid"})
+            ET.SubElement(pattern, f"{{{main_ns}}}fgColor", {"rgb": "FFFFFF00"})
+            ET.SubElement(pattern, f"{{{main_ns}}}bgColor", {"indexed": "64"})
+            fills.append(fill)
+            yellow_fill_id = len(fills) - 1
+            fills.set("count", str(len(fills)))
+
+        style_cache = {}
+
+        def style_with_manual_fill(style_id, manual):
+            style_id = int(style_id or 0)
+            if style_id >= len(cell_xfs):
+                style_id = 0
+            original_xf = cell_xfs[style_id]
+            current_fill_id = int(original_xf.get("fillId", "0"))
+            is_yellow = current_fill_id == yellow_fill_id
+            if is_yellow == manual:
+                return style_id
+            cache_key = (style_id, manual)
+            if cache_key in style_cache:
+                return style_cache[cache_key]
+            new_xf = copy.deepcopy(original_xf)
+            new_xf.set("fillId", str(yellow_fill_id if manual else 0))
+            new_xf.set("applyFill", "1" if manual else "0")
+            cell_xfs.append(new_xf)
+            new_style_id = len(cell_xfs) - 1
+            cell_xfs.set("count", str(len(cell_xfs)))
+            style_cache[cache_key] = new_style_id
+            return new_style_id
+
+        sheet_data = sheet_root.find(f"{{{main_ns}}}sheetData")
+        if sheet_data is None:
+            raise ValueError("ソリュブルシートのセルを確認できません。")
+        row_node = sheet_data.find(f"{{{main_ns}}}row[@r='{row_number}']")
+        if row_node is None:
+            raise ValueError("更新する日付行が見つかりません。")
+
+        changed = []
+        for field, new_value in resolved_updates.items():
+            coordinate = f"{chr(64 + columns[field])}{row_number}"
+            cell_node = row_node.find(f"{{{main_ns}}}c[@r='{coordinate}']")
+            if cell_node is None:
+                cell_node = ET.SubElement(row_node, f"{{{main_ns}}}c", {"r": coordinate})
+            is_formula = isinstance(new_value, str) and new_value.startswith("=")
+            should_be_manual = not is_formula
+            cell_node.set("s", str(style_with_manual_fill(cell_node.get("s", "0"), should_be_manual)))
+            cell_node.attrib.pop("t", None)
+            for child in list(cell_node):
+                if child.tag in {f"{{{main_ns}}}f", f"{{{main_ns}}}v", f"{{{main_ns}}}is"}:
+                    cell_node.remove(child)
+            if is_formula:
+                formula_node = ET.SubElement(cell_node, f"{{{main_ns}}}f")
+                formula_node.text = new_value[1:]
+            cached_value = cached_values[field]
+            if cached_value is not None:
+                value_node = ET.SubElement(cell_node, f"{{{main_ns}}}v")
+                value_node.text = str(int(cached_value)) if isinstance(cached_value, float) and cached_value.is_integer() else str(cached_value)
+            changed.append((coordinate, new_value, should_be_manual))
+
+        # 変更後の数値を使って、ソリュブル表内の単純な加減式の表示値も更新する。
+        # これによりExcelを開く前でも、アプリとExcelプレビューで最新在庫を確認できる。
+        cell_nodes = {
+            cell.get("r", ""): cell
+            for cell in sheet_root.findall(f".//{{{main_ns}}}c")
+            if cell.get("r")
+        }
+        calculated = {}
+        calculating = set()
+
+        def calculate_xml_cell(coordinate):
+            if coordinate in calculated:
+                return calculated[coordinate]
+            if coordinate in calculating:
+                return 0
+            node = cell_nodes.get(coordinate)
+            if node is None:
+                return 0
+            formula_node = node.find(f"{{{main_ns}}}f")
+            value_node = node.find(f"{{{main_ns}}}v")
+            formula_text = (
+                formula_node.text
+                if formula_node is not None and formula_node.text
+                else expanded_formulas.get(coordinate, "") if formula_node is not None else ""
+            )
+            if not formula_text:
+                try:
+                    value = float(value_node.text) if value_node is not None and value_node.text else 0
+                except ValueError:
+                    value = 0
+                calculated[coordinate] = value
+                return value
+
+            expression = formula_text.replace(" ", "").replace("$", "").upper()
+            tokens = re.findall(r"[A-Z]+\d+|\d+(?:\.\d+)?|[+-]", expression)
+            if not tokens or "".join(tokens) != expression:
+                return 0
+            calculating.add(coordinate)
+            try:
+                def token_number(token):
+                    return calculate_xml_cell(token) if re.fullmatch(r"[A-Z]+\d+", token) else float(token)
+
+                result = token_number(tokens[0])
+                index = 1
+                while index < len(tokens):
+                    right = token_number(tokens[index + 1])
+                    result = result + right if tokens[index] == "+" else result - right
+                    index += 2
+                calculated[coordinate] = result
+                return result
+            finally:
+                calculating.discard(coordinate)
+
+        for coordinate, node in cell_nodes.items():
+            match = re.fullmatch(r"([B-H])(\d+)", coordinate)
+            formula_node = node.find(f"{{{main_ns}}}f")
+            if not match or int(match.group(2)) < 11 or formula_node is None:
+                continue
+            result = calculate_xml_cell(coordinate)
+            value_node = node.find(f"{{{main_ns}}}v")
+            if value_node is None:
+                value_node = ET.SubElement(node, f"{{{main_ns}}}v")
+            value_node.text = str(int(result)) if float(result).is_integer() else str(result)
+
+        calculation_properties = workbook_root.find(f"{{{main_ns}}}calcPr")
+        if calculation_properties is not None:
+            calculation_properties.set("calcMode", "auto")
+            calculation_properties.set("fullCalcOnLoad", "1")
+            calculation_properties.set("forceFullCalc", "1")
+
+        replacement_parts = {
+            sheet_part: ET.tostring(sheet_root, encoding="utf-8", xml_declaration=True),
+            "xl/styles.xml": ET.tostring(styles_root, encoding="utf-8", xml_declaration=True),
+            "xl/workbook.xml": ET.tostring(workbook_root, encoding="utf-8", xml_declaration=True),
+        }
+        output = BytesIO()
+        with zipfile.ZipFile(output, "w") as target_zip:
+            for item in source_zip.infolist():
+                target_zip.writestr(item, replacement_parts.get(item.filename, source_zip.read(item.filename)))
+
+    saved_content = output.getvalue()
+    formula_wb = load_workbook(BytesIO(saved_content), data_only=False, read_only=False)
+    value_wb = load_workbook(BytesIO(saved_content), data_only=True, read_only=False)
+    try:
+        ws = formula_wb[SOLUBLE_SHEET_NAME]
+        value_ws = value_wb[SOLUBLE_SHEET_NAME]
+        for coordinate, expected, expected_manual in changed:
+            cell = ws[coordinate]
+            if cell.value != expected or soluble_cell_is_manual(cell) != expected_manual:
+                raise ValueError(f"保存確認で{SOLUBLE_SHEET_NAME}!{coordinate}が一致しません。")
+            if expected is not None and value_ws[coordinate].value is None:
+                raise ValueError(f"保存確認で{SOLUBLE_SHEET_NAME}!{coordinate}の表示値がありません。")
+    finally:
+        formula_wb.close()
+        value_wb.close()
+    return saved_content, changed
+
+
+def ensure_soluble_backup_folder(access_token):
+    response = call_dropbox_rpc(
+        "files/create_folder_v2",
+        {"path": SOLUBLE_BACKUP_FOLDER, "autorename": False},
+        access_token,
+    )
+    if response.status_code == 200:
+        return
+    if response.status_code == 409 and "conflict" in str(response.text).lower():
+        return
+    raise RuntimeError("Dropboxにバックアップフォルダを作成できませんでした。\n" + dropbox_error_text(response))
+
+
+def save_soluble_changes(row_number, location, updates):
+    target_path = str(SOLUBLE_DROPBOX_FILE_PATH or SOLUBLE_DROPBOX_DEFAULT_FILE_PATH).strip()
+    timestamp = get_jst_now().strftime("%Y%m%d_%H%M%S_%f")
+
+    if has_dropbox_auth_config():
+        access_token = get_dropbox_access_token()
+        original_content, response = download_dropbox_file(target_path, access_token)
+        if original_content is None:
+            raise RuntimeError("最新の対象Excelを取得できませんでした。\n" + dropbox_error_text(response))
+        revision = get_download_revision(response)
+        if not revision:
+            raise RuntimeError("Dropboxの更新番号を取得できないため、保存を中止しました。")
+        saved_content, changed = build_soluble_updated_workbook(
+            original_content, row_number, location, updates
+        )
+        ensure_soluble_backup_folder(access_token)
+        backup_path = f"{SOLUBLE_BACKUP_FOLDER}/aoベンチャーグレイン配車表_{timestamp}.xlsx"
+        backup_response = upload_dropbox_file(backup_path, original_content, access_token, mode="add")
+        if backup_response.status_code != 200:
+            raise RuntimeError("バックアップを作成できないため、本番ファイルは更新しません。\n" + dropbox_error_text(backup_response))
+        upload_response = upload_dropbox_file(
+            target_path, saved_content, access_token, mode="update", rev=revision
+        )
+        if upload_response.status_code == 409:
+            raise RuntimeError("保存中にPCなどでExcelが更新されました。再読み込みしてからやり直してください。")
+        if upload_response.status_code != 200:
+            raise RuntimeError("対象Excelを更新できませんでした。\n" + dropbox_error_text(upload_response))
+    else:
+        local_path = Path(str(SOLUBLE_LOCAL_FILE))
+        if not local_path.exists():
+            raise FileNotFoundError(f"対象ファイルが見つかりません：{local_path}")
+        original_content = local_path.read_bytes()
+        saved_content, changed = build_soluble_updated_workbook(
+            original_content, row_number, location, updates
+        )
+        backup_dir = local_path.parent / "Backups"
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        backup_path = backup_dir / f"aoベンチャーグレイン配車表_{timestamp}.xlsx"
+        backup_path.write_bytes(original_content)
+        local_path.write_bytes(saved_content)
+
+    st.cache_data.clear()
+    return changed
+
+
+def show_soluble_inventory_page():
+    st.markdown("---")
+    st.header("🧪 ソリュブル在庫計画")
+    show_back_home_button("soluble_back_home")
+    st.caption("aoベンチャーグレイン配車表.xlsx の「ソリュブル」シートを表示します。")
+
+    with st.spinner("ソリュブル在庫計画を読み込んでいます…"):
+        content, source = load_soluble_workbook_content()
+        rows = read_soluble_rows(content)
+    if not rows:
+        st.warning("ソリュブルシートに表示できる日付がありません。")
+        return
+
+    location = st.radio(
+        "表示する会社",
+        list(SOLUBLE_LOCATIONS.keys()),
+        horizontal=True,
+        key="soluble_location",
+    )
+    # 数値がまだ空の日も、ここから新しく入力できるように日付行はすべて表示対象にする。
+    active_rows = list(rows)
+    if not active_rows:
+        st.info(f"{location}の表示データはありません。")
+        return
+
+    month_keys = sorted({(row["date"].year, row["date"].month) for row in active_rows})
+    month_labels = [f"{year}年{month}月" for year, month in month_keys]
+    today_key = (date.today().year, date.today().month)
+    default_month = month_keys.index(today_key) if today_key in month_keys else len(month_keys) - 1
+    selected_month_label = st.selectbox(
+        "表示月",
+        month_labels,
+        index=default_month,
+        key=f"soluble_month_{location}",
+    )
+    selected_month_key = month_keys[month_labels.index(selected_month_label)]
+    month_rows = [
+        row for row in active_rows
+        if (row["date"].year, row["date"].month) == selected_month_key
+    ]
+
+    day_options = [row["date"] for row in month_rows]
+    default_day = day_options.index(date.today()) if date.today() in day_options else 0
+    control_left, control_right = st.columns(2)
+    with control_left:
+        start_day = st.selectbox(
+            "開始日",
+            day_options,
+            index=default_day,
+            format_func=lambda day: f"{day.month}/{day.day}（{'月火水木金土日'[day.weekday()]}）",
+            key=f"soluble_start_{location}_{selected_month_label}",
+        )
+    with control_right:
+        period = st.selectbox(
+            "表示期間",
+            ["7日間", "14日間", "月全体"],
+            key=f"soluble_period_{location}",
+        )
+    manual_only = st.checkbox("黄色の手入力だけ表示", key=f"soluble_manual_only_{location}")
+
+    visible_rows = month_rows if period == "月全体" else [
+        row for row in month_rows
+        if start_day <= row["date"] < start_day + timedelta(days=7 if period == "7日間" else 14)
+    ]
+    if manual_only:
+        visible_rows = [
+            row for row in visible_rows
+            if any(row.get(f"{location}_{field}_manual") for field in ("usage", "delivery", "inventory"))
+        ]
+
+    st.markdown(
+        """
+        <style>
+        .soluble-legend {display:flex; gap:.7rem; align-items:center; margin:.35rem 0 1rem; color:#596273;}
+        .soluble-yellow-chip {display:inline-block; width:1.25rem; height:1.25rem; background:#fff59d; border:1px solid #e3cb42; border-radius:.3rem;}
+        .soluble-card {background:rgba(255,255,255,.78); border:1px solid #cbd5e1; border-radius:16px; padding:14px 16px; margin:.65rem 0 .25rem; box-shadow:0 6px 16px rgba(30,41,59,.05);}
+        .soluble-card-date {font-size:1.12rem; font-weight:800; margin-bottom:10px;}
+        .soluble-values {display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:8px;}
+        .soluble-value {background:#f8fafc; border-radius:12px; padding:9px 10px; min-width:0;}
+        .soluble-value.manual {background:#fff59d; border:1px solid #e3cb42;}
+        .soluble-value.negative {background:#fee2e2; border:1px solid #f87171;}
+        .soluble-label {display:block; color:#697386; font-size:.78rem; margin-bottom:3px;}
+        .soluble-number {display:block; color:#182033; font-size:1.04rem; font-weight:800; overflow-wrap:anywhere;}
+        @media (max-width: 640px) {
+          .soluble-card {padding:13px 12px; border-radius:14px;}
+          .soluble-values {gap:6px;}
+          .soluble-value {padding:9px 7px;}
+          .soluble-label {font-size:.72rem;}
+          .soluble-number {font-size:.96rem;}
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        f'<div class="soluble-legend"><span class="soluble-yellow-chip"></span><span>黄色は手入力　｜　参照：{html.escape(source)}</span></div>',
+        unsafe_allow_html=True,
+    )
+
+    if not visible_rows:
+        st.info("この条件で表示するデータはありません。")
+        return
+
+    weekday = "月火水木金土日"
+    for row in visible_rows:
+        usage = row.get(f"{location}_usage")
+        delivery = row.get(f"{location}_delivery")
+        inventory = row.get(f"{location}_inventory")
+        cells = []
+        for label, field, value in (
+            ("使用量/日", "usage", usage),
+            ("納品", "delivery", delivery),
+            ("在庫", "inventory", inventory),
+        ):
+            classes = ["soluble-value"]
+            if row.get(f"{location}_{field}_manual"):
+                classes.append("manual")
+            if field == "inventory" and isinstance(value, (int, float)) and value < 0:
+                classes.append("negative")
+            cells.append(
+                f'<div class="{" ".join(classes)}"><span class="soluble-label">{label}</span>'
+                f'<span class="soluble-number">{html.escape(soluble_number_label(value))}</span></div>'
+            )
+        day = row["date"]
+        st.markdown(
+            f'<section class="soluble-card"><div class="soluble-card-date">{day.month}/{day.day}（{weekday[day.weekday()]}）</div>'
+            f'<div class="soluble-values">{"".join(cells)}</div></section>',
+            unsafe_allow_html=True,
+        )
+
+        with st.expander(f"✏️ {day.month}/{day.day}を入力・修正"):
+            form_key = f"soluble_form_{location}_{row['row']}"
+            with st.form(form_key):
+                usage_text = st.text_input(
+                    "使用量/日",
+                    value=soluble_input_value(usage),
+                    key=f"{form_key}_usage",
+                )
+                delivery_text = st.text_input(
+                    "納品",
+                    value=soluble_input_value(delivery),
+                    key=f"{form_key}_delivery",
+                )
+                current_formula = bool(row.get(f"{location}_inventory_formula")) and not bool(
+                    row.get(f"{location}_inventory_manual")
+                )
+                auto_inventory = st.checkbox(
+                    "在庫は「前日在庫 − 使用量 + 納品」で自動計算する",
+                    value=current_formula,
+                    key=f"{form_key}_auto",
+                )
+                inventory_text = st.text_input(
+                    "在庫（自動計算を外した場合に使用）",
+                    value=soluble_input_value(inventory),
+                    disabled=auto_inventory,
+                    key=f"{form_key}_inventory",
+                )
+                submitted = st.form_submit_button("バックアップして保存", use_container_width=True)
+
+            if submitted:
+                try:
+                    new_usage = parse_soluble_number(usage_text, "使用量/日")
+                    new_delivery = parse_soluble_number(delivery_text, "納品")
+                    new_inventory = None if auto_inventory else parse_soluble_number(inventory_text, "在庫")
+                    updates = {}
+                    if not same_soluble_value(new_usage, usage):
+                        updates["usage"] = new_usage
+                    if not same_soluble_value(new_delivery, delivery):
+                        updates["delivery"] = new_delivery
+                    if auto_inventory:
+                        if not current_formula:
+                            updates["inventory"] = "__AUTO_INVENTORY__"
+                    elif current_formula or not same_soluble_value(new_inventory, inventory):
+                        updates["inventory"] = new_inventory
+                    with st.spinner("元ファイルをバックアップして保存しています…"):
+                        changed = save_soluble_changes(
+                            row["row"],
+                            location,
+                            updates,
+                        )
+                    st.success(f"保存しました（{len(changed)}セル更新）。黄色は手入力値です。")
+                    st.rerun()
+                except Exception as error:
+                    st.error(str(error))
+
+
 
 # =========================
 # ホームメニュー
@@ -4635,6 +5351,10 @@ def show_home_menu():
     with col5:
         st.markdown(render_page_link("🚚 配車表", page="dispatch_table"), unsafe_allow_html=True)
     with col6:
+        st.markdown(render_page_link("🧪 ソリュブル在庫計画", page="soluble_inventory"), unsafe_allow_html=True)
+
+    col7, _ = st.columns(2)
+    with col7:
         st.markdown(render_page_link("📝 メモ帳", page="notes"), unsafe_allow_html=True)
 
     st.markdown("---")
@@ -4658,6 +5378,7 @@ MENU_OPTIONS = {
     "📍 地域検索": "region",
     "🗓 配車カレンダー": "calendar",
     "🚚 配車表": "dispatch_table",
+    "🧪 ソリュブル在庫計画": "soluble_inventory",
     "📝 メモ帳": "notes",
 }
 
@@ -4671,6 +5392,7 @@ with st.sidebar:
     st.markdown(render_page_link("📍 地域検索", page="region"), unsafe_allow_html=True)
     st.markdown(render_page_link("🗓 配車カレンダー", page="calendar"), unsafe_allow_html=True)
     st.markdown(render_page_link("🚚 配車表", page="dispatch_table"), unsafe_allow_html=True)
+    st.markdown(render_page_link("🧪 ソリュブル在庫計画", page="soluble_inventory"), unsafe_allow_html=True)
     st.markdown(render_page_link("📝 メモ帳", page="notes"), unsafe_allow_html=True)
 
     st.markdown("---")
@@ -4683,7 +5405,7 @@ col_title, col_logout = st.columns([3, 1])
 
 with col_title:
     st.title(f"🚚 {APP_TITLE}")
-    st.caption("顧客名一覧・顧客検索・地域検索・配車カレンダー・配車表・メモ帳")
+    st.caption("顧客名一覧・顧客検索・地域検索・配車カレンダー・配車表・ソリュブル在庫計画・メモ帳")
 
 with col_logout:
     st.write("")
@@ -4719,6 +5441,9 @@ try:
     elif st.session_state["page"] == "dispatch_table":
         show_dispatch_board()
 
+    elif st.session_state["page"] == "soluble_inventory":
+        show_soluble_inventory_page()
+
     elif st.session_state["page"] == "notes":
         show_notes_page(None)
 
@@ -4736,4 +5461,4 @@ except Exception as e:
     st.exception(e)
     st.stop()
 
-st.caption("※ 顧客情報はSheet1、配車表は配車表1.xlsmの1月～12月シートを読み込んで表示しています。")
+st.caption("※ 顧客情報はSheet1、配車表は配車表1.xlsm、ソリュブル在庫計画はaoベンチャーグレイン配車表.xlsxを読み込んで表示しています。")
