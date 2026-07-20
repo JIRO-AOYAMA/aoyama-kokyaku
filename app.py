@@ -4359,24 +4359,40 @@ def render_dispatch_responsive_list(display_df):
         .dispatch-desktop-view {
             display: block;
             max-height: 760px;
-            overflow: auto;
+            overflow-y: auto;
+            overflow-x: hidden;
             border: 1px solid #cbd5e1;
             border-radius: 10px;
             background: #ffffff;
         }
         .dispatch-excel-table {
             width: 100%;
-            min-width: 1050px;
+            min-width: 0;
+            table-layout: fixed;
             border-collapse: separate;
             border-spacing: 0;
-            font-size: 14px;
+            font-size: 13px;
             color: #172033;
         }
+        .dispatch-excel-table th:nth-child(1),
+        .dispatch-excel-table td:nth-child(1) { width: 9%; }
+        .dispatch-excel-table th:nth-child(2),
+        .dispatch-excel-table td:nth-child(2) { width: 20%; }
+        .dispatch-excel-table th:nth-child(3),
+        .dispatch-excel-table td:nth-child(3) { width: 18%; }
+        .dispatch-excel-table th:nth-child(4),
+        .dispatch-excel-table td:nth-child(4) { width: 10%; }
+        .dispatch-excel-table th:nth-child(5),
+        .dispatch-excel-table td:nth-child(5) { width: 15%; }
+        .dispatch-excel-table th:nth-child(6),
+        .dispatch-excel-table td:nth-child(6) { width: 19%; }
+        .dispatch-excel-table th:nth-child(7),
+        .dispatch-excel-table td:nth-child(7) { width: 9%; }
         .dispatch-excel-table th {
             position: sticky;
             top: 0;
             z-index: 2;
-            padding: 10px 8px;
+            padding: 9px 6px;
             background: #dbeaf7;
             border-right: 1px solid #94a3b8;
             border-bottom: 2px solid #64748b;
@@ -4384,12 +4400,13 @@ def render_dispatch_responsive_list(display_df):
             white-space: nowrap;
         }
         .dispatch-excel-table td {
-            padding: 8px;
+            padding: 7px 6px;
             border-right: 1px solid #cbd5e1;
             border-bottom: 1px solid #cbd5e1;
             vertical-align: middle;
             background: #ffffff;
             overflow-wrap: anywhere;
+            word-break: break-word;
         }
         .dispatch-excel-table tr:nth-child(even) td { background: #f8fafc; }
         .dispatch-excel-table .date-cell,
