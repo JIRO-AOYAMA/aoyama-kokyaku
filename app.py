@@ -326,6 +326,45 @@ st.markdown(
         font-weight: 800;
     }
 
+    .customer-directory {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 0.65rem;
+        margin-top: 0.75rem;
+    }
+    .customer-directory-item {
+        display: flex;
+        flex-direction: column;
+        justify-content: center;
+        min-height: 4.3rem;
+        box-sizing: border-box;
+        padding: 0.72rem 0.9rem;
+        border: 1px solid rgba(15, 23, 42, 0.10);
+        border-radius: 14px;
+        background: rgba(255, 255, 255, 0.92);
+        color: #172033 !important;
+        text-decoration: none !important;
+        box-shadow: 0 6px 18px rgba(15, 23, 42, 0.06);
+    }
+    .customer-directory-item:hover {
+        border-color: rgba(37, 99, 235, 0.35);
+        background: #eff6ff;
+    }
+    .customer-directory-name {
+        color: #172033;
+        font-size: 1rem;
+        font-weight: 800;
+        line-height: 1.4;
+        overflow-wrap: anywhere;
+    }
+    .customer-directory-meta {
+        margin-top: 0.22rem;
+        color: #667085;
+        font-size: 0.82rem;
+        line-height: 1.35;
+        overflow-wrap: anywhere;
+    }
+
     .stTextInput input {
         border-radius: 14px !important;
         border: 1px solid rgba(15, 23, 42, 0.13) !important;
@@ -445,6 +484,14 @@ st.markdown(
             grid-template-columns: minmax(5.5rem, 1.35fr) minmax(0, 2.65fr);
             column-gap: 0.7rem;
             align-items: baseline;
+        }
+
+        .customer-directory {
+            grid-template-columns: 1fr;
+            gap: 0.55rem;
+        }
+        .customer-directory-item {
+            min-height: 3.9rem;
         }
     }
     
@@ -2710,7 +2757,16 @@ def sync_page_from_query_params():
     page = str(get_query_value("page", "home")).strip() or "home"
     customer = str(get_query_value("customer", "")).strip()
 
-    valid_pages = {"home", "customer", "region", "calendar", "dispatch_table", "notes", "detail"}
+    valid_pages = {
+        "home",
+        "customer_list",
+        "customer",
+        "region",
+        "calendar",
+        "dispatch_table",
+        "notes",
+        "detail",
+    }
 
     raw_page = str(get_query_value("page", "")).strip()
     if page not in valid_pages:
@@ -3198,6 +3254,125 @@ def show_customer_detail(df, customer_name):
 
 
     show_customer_notes(customer_name)
+
+# =========================
+# 顧客名一覧
+# =========================
+CUSTOMER_DIRECTORY_GROUPS = {
+    "あ行": set("あいうえおぁぃぅぇぉ"),
+    "か行": set("かきくけこがぎぐげご"),
+    "さ行": set("さしすせそざじずぜぞ"),
+    "た行": set("たちつてとだぢづでどっ"),
+    "な行": set("なにぬねの"),
+    "は行": set("はひふへほばびぶべぼぱぴぷぺぽ"),
+    "ま行": set("まみむめも"),
+    "や行": set("やゆよゃゅょ"),
+    "ら行": set("らりるれろ"),
+    "わ行": set("わをんゎ"),
+}
+
+
+def normalize_directory_kana(value):
+    """顧客名一覧の並び替え用に、カタカナをひらがなへ寄せる。"""
+    text = clean_value(value, blank_text="").strip()
+    return "".join(
+        chr(ord(char) - 0x60) if "ァ" <= char <= "ヶ" else char
+        for char in text
+    )
+
+
+def get_customer_directory_group(value):
+    kana = normalize_directory_kana(value)
+    if not kana:
+        return "その他"
+    first = kana[0]
+    for group_name, characters in CUSTOMER_DIRECTORY_GROUPS.items():
+        if first in characters:
+            return group_name
+    return "その他"
+
+
+def show_customer_directory(df=None):
+    st.subheader("👥 顧客名一覧")
+    show_back_home_button("customer_directory_back_home")
+    st.caption("Sheet1の顧客を五十音順で表示します。顧客名を押すと詳細を開きます。")
+
+    if df is None:
+        with st.spinner("顧客データを読み込んでいます…"):
+            df = load_data()
+
+    directory = df[["顧客名", "地域", "商品名", "ひらがな"]].copy()
+    for column in directory.columns:
+        directory[column] = directory[column].fillna("").astype(str).str.strip()
+    directory = directory[directory["顧客名"] != ""]
+
+    if directory.empty:
+        st.info("表示できる顧客がありません。")
+        return
+
+    customers = (
+        directory.groupby("顧客名", as_index=False)
+        .agg(
+            地域=("地域", "first"),
+            ひらがな=("ひらがな", "first"),
+            商品数=("商品名", lambda values: values[values != ""].nunique()),
+        )
+    )
+    customers["並び順"] = customers.apply(
+        lambda row: normalize_directory_kana(row["ひらがな"] or row["顧客名"]),
+        axis=1,
+    )
+    customers["五十音"] = customers["並び順"].map(get_customer_directory_group)
+
+    kana_filter = st.selectbox(
+        "五十音で絞り込み",
+        ["すべて", *CUSTOMER_DIRECTORY_GROUPS.keys(), "その他"],
+        key="customer_directory_kana_filter",
+    )
+    keyword = st.text_input(
+        "一覧を絞り込み",
+        placeholder="顧客名・ひらがな・地域",
+        key="customer_directory_keyword",
+    ).strip()
+
+    filtered = customers
+    if kana_filter != "すべて":
+        filtered = filtered[filtered["五十音"] == kana_filter]
+    if keyword:
+        keyword_kana = normalize_directory_kana(keyword)
+        name_text = filtered["顧客名"].astype(str)
+        region_text = filtered["地域"].astype(str)
+        kana_text = filtered["並び順"].astype(str)
+        filtered = filtered[
+            name_text.str.contains(keyword, case=False, na=False, regex=False)
+            | region_text.str.contains(keyword, case=False, na=False, regex=False)
+            | kana_text.str.contains(keyword_kana, case=False, na=False, regex=False)
+        ]
+
+    filtered = filtered.sort_values(["並び順", "顧客名"]).reset_index(drop=True)
+    st.write(f"顧客：{len(filtered)}件")
+
+    if filtered.empty:
+        st.info("条件に一致する顧客がありません。")
+        return
+
+    parts = ['<div class="customer-directory">']
+    for _, row in filtered.iterrows():
+        name = clean_value(row["顧客名"])
+        region = clean_value(row["地域"], blank_text="未設定")
+        product_count = int(row["商品数"])
+        url = html.escape(make_app_url(page="detail", customer=name), quote=True)
+        parts.append(
+            (
+                f'<a class="customer-directory-item" href="{url}" target="_self">'
+                f'<span class="customer-directory-name">{html.escape(name)}</span>'
+                f'<span class="customer-directory-meta">地域：{html.escape(region)}　商品：{product_count}件</span>'
+                '</a>'
+            )
+        )
+    parts.append("</div>")
+    st.markdown("".join(parts), unsafe_allow_html=True)
+
 
 # =========================
 # 顧客検索
@@ -4429,18 +4604,20 @@ def show_home_menu():
 
     col1, col2 = st.columns(2)
     with col1:
-        st.markdown(render_page_link("🔍 顧客検索", page="customer"), unsafe_allow_html=True)
+        st.markdown(render_page_link("👥 顧客名一覧", page="customer_list"), unsafe_allow_html=True)
     with col2:
-        st.markdown(render_page_link("📍 地域検索", page="region"), unsafe_allow_html=True)
+        st.markdown(render_page_link("🔍 顧客検索", page="customer"), unsafe_allow_html=True)
 
     col3, col4 = st.columns(2)
     with col3:
-        st.markdown(render_page_link("🚚 配車表", page="dispatch_table"), unsafe_allow_html=True)
+        st.markdown(render_page_link("📍 地域検索", page="region"), unsafe_allow_html=True)
     with col4:
         st.markdown(render_page_link("🗓 配車カレンダー", page="calendar"), unsafe_allow_html=True)
 
-    col5, _ = st.columns(2)
+    col5, col6 = st.columns(2)
     with col5:
+        st.markdown(render_page_link("🚚 配車表", page="dispatch_table"), unsafe_allow_html=True)
+    with col6:
         st.markdown(render_page_link("📝 メモ帳", page="notes"), unsafe_allow_html=True)
 
     st.markdown("---")
@@ -4459,10 +4636,11 @@ handle_customer_query_param()
 
 
 MENU_OPTIONS = {
+    "👥 顧客名一覧": "customer_list",
     "🔍 顧客検索": "customer",
     "📍 地域検索": "region",
-    "🚚 配車表": "dispatch_table",
     "🗓 配車カレンダー": "calendar",
+    "🚚 配車表": "dispatch_table",
     "📝 メモ帳": "notes",
 }
 
@@ -4471,10 +4649,11 @@ current_page = st.session_state.get("page", "home")
 with st.sidebar:
     st.title(f"🚚 {APP_TITLE}")
     st.markdown("### メニュー")
+    st.markdown(render_page_link("👥 顧客名一覧", page="customer_list"), unsafe_allow_html=True)
     st.markdown(render_page_link("🔍 顧客検索", page="customer"), unsafe_allow_html=True)
     st.markdown(render_page_link("📍 地域検索", page="region"), unsafe_allow_html=True)
-    st.markdown(render_page_link("🚚 配車表", page="dispatch_table"), unsafe_allow_html=True)
     st.markdown(render_page_link("🗓 配車カレンダー", page="calendar"), unsafe_allow_html=True)
+    st.markdown(render_page_link("🚚 配車表", page="dispatch_table"), unsafe_allow_html=True)
     st.markdown(render_page_link("📝 メモ帳", page="notes"), unsafe_allow_html=True)
 
     st.markdown("---")
@@ -4487,7 +4666,7 @@ col_title, col_logout = st.columns([3, 1])
 
 with col_title:
     st.title(f"🚚 {APP_TITLE}")
-    st.caption("顧客検索・地域検索・配車表・配車カレンダー・メモ帳")
+    st.caption("顧客名一覧・顧客検索・地域検索・配車カレンダー・配車表・メモ帳")
 
 with col_logout:
     st.write("")
@@ -4508,6 +4687,9 @@ try:
 
     elif st.session_state["page"] == "customer":
         show_customer_search(show_home_link=True)
+
+    elif st.session_state["page"] == "customer_list":
+        show_customer_directory()
 
     elif st.session_state["page"] == "region":
         df = load_data()
