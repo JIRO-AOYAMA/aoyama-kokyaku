@@ -2667,27 +2667,68 @@ def render_customer_information_card(customer_name, customer_key=None):
 # =========================
 # Excel読み込み・整形
 # =========================
-def calculate_delivery_values(delivery_values_ws, row):
-    """Excelの数式キャッシュが消えている場合に、L列とO列をPythonで再計算する。"""
-    usage = delivery_values_ws.cell(row, 7).value
-    kg_per_bottle = delivery_values_ws.cell(row, 9).value
-    delivery_date = delivery_values_ws.cell(row, 10).value
-    delivery_quantity = delivery_values_ws.cell(row, 11).value
-    next_delivery = delivery_values_ws.cell(row, 12).value
-    remaining = delivery_values_ws.cell(row, 15).value
+def calculate_delivery_values(delivery_formula_ws, row, delivery_value_ws=None):
+    """
+    次回配達予定と残数を表示用に取得する。
 
-    if isinstance(next_delivery, str) and next_delivery.startswith("="):
-        next_delivery = None
-    if isinstance(remaining, str) and remaining.startswith("="):
-        remaining = None
+    ・PCのExcelで計算・保存された値があり、現在の入力値からの計算と一致する場合は
+      Excel側の計算結果を採用する。
+    ・アプリから本数・kg/本・配達日などを変更した直後で、Excelの計算キャッシュが
+      未更新または古い場合は、Excelと同じ式をPythonで計算して即時表示する。
+    ・Excel内の数式セル自体は変更しない。
+    """
+    usage = delivery_formula_ws.cell(row, 7).value
+    bottle_count = delivery_formula_ws.cell(row, 8).value
+    kg_per_bottle = delivery_formula_ws.cell(row, 9).value
+    delivery_date = delivery_formula_ws.cell(row, 10).value
+    stored_delivery_quantity = delivery_formula_ws.cell(row, 11).value
+    remaining = delivery_formula_ws.cell(row, 15).value
 
+    cached_next_delivery = None
+    if delivery_value_ws is not None:
+        cached_next_delivery = delivery_value_ws.cell(row, 12).value
+
+    # アプリはH列（本数）とI列（kg/本）を直接編集するため、K列の保存値がまだ古い場合は
+    # H×Iを表示計算用の配達数量として使う。PCのExcelで更新済みなら両者は一致する。
+    effective_delivery_quantity = stored_delivery_quantity
     try:
-        if next_delivery is None and delivery_date is not None:
-            next_delivery = delivery_date + timedelta(
-                days=math.floor(float(delivery_quantity) / float(usage))
+        calculated_quantity = float(bottle_count) * float(kg_per_bottle)
+        stored_quantity_number = float(stored_delivery_quantity)
+        if not math.isclose(
+            stored_quantity_number,
+            calculated_quantity,
+            rel_tol=0,
+            abs_tol=1e-9,
+        ):
+            effective_delivery_quantity = calculated_quantity
+    except Exception:
+        try:
+            if isinstance(stored_delivery_quantity, str) and stored_delivery_quantity.startswith("="):
+                effective_delivery_quantity = float(bottle_count) * float(kg_per_bottle)
+            elif stored_delivery_quantity is None:
+                effective_delivery_quantity = float(bottle_count) * float(kg_per_bottle)
+        except Exception:
+            pass
+
+    calculated_next_delivery = None
+    try:
+        if delivery_date is not None:
+            calculated_next_delivery = delivery_date + timedelta(
+                days=math.floor(float(effective_delivery_quantity) / float(usage))
             )
     except Exception:
-        next_delivery = None
+        calculated_next_delivery = None
+
+    # PCのExcelで計算して保存された値がある場合は、そのExcel値を優先する。
+    # アプリ保存後はopenpyxlによって数式キャッシュが空になるため、その場合だけ
+    # Python計算の値を表示する。Excel内のL列数式自体は変更しない。
+    if to_date(cached_next_delivery) is not None:
+        next_delivery = cached_next_delivery
+    else:
+        next_delivery = calculated_next_delivery
+
+    if isinstance(remaining, str) and remaining.startswith("="):
+        remaining = None
 
     try:
         if remaining is None and next_delivery is not None:
@@ -2707,14 +2748,16 @@ def rebuild_sheet1_from_formula_references(excel_source):
         content = Path(excel_source).read_bytes()
 
     formula_wb = load_workbook(BytesIO(content), keep_vba=True, data_only=False, read_only=True)
+    value_wb = load_workbook(BytesIO(content), keep_vba=False, data_only=True, read_only=True)
     try:
         if SHEET_NAME not in formula_wb.sheetnames or DELIVERY_SHEET_NAME not in formula_wb.sheetnames:
             return pd.DataFrame()
 
         sheet1 = formula_wb[SHEET_NAME]
-        # 顧客名などの元データは数式ではなく直接値なので、数式を保持する側から読む。
-        # data_only側はopenpyxl保存後に数式キャッシュが消え、空欄になるため使わない。
+        # 入力値と数式はformula側から読み、PC版Excelが保存した計算結果がある場合だけ
+        # data_only側のキャッシュも参照する。アプリ保存後にキャッシュが空ならPython計算へ戻る。
         delivery = formula_wb[DELIVERY_SHEET_NAME]
+        delivery_values = value_wb[DELIVERY_SHEET_NAME]
         rows = []
         for sheet1_row in range(2, sheet1.max_row + 1):
             source_row = None
@@ -2734,7 +2777,11 @@ def rebuild_sheet1_from_formula_references(excel_source):
             if not normalize_match_value(customer_name) or not normalize_match_value(product_name):
                 continue
 
-            next_delivery, remaining = calculate_delivery_values(delivery, source_row)
+            next_delivery, remaining = calculate_delivery_values(
+                delivery,
+                source_row,
+                delivery_values,
+            )
             rows.append({
                 "ID": delivery.cell(source_row, 1).value,
                 "顧客名": customer_name,
@@ -2754,6 +2801,7 @@ def rebuild_sheet1_from_formula_references(excel_source):
         return pd.DataFrame(rows)
     finally:
         formula_wb.close()
+        value_wb.close()
 
 
 def normalize_excel_table(excel_source):
