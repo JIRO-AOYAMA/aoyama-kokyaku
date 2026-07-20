@@ -18,6 +18,7 @@ import pandas as pd
 import requests
 import streamlit as st
 from openpyxl import load_workbook
+from openpyxl.styles import PatternFill
 
 try:
     from st_keyup import st_keyup
@@ -4824,7 +4825,7 @@ def read_soluble_rows(content):
         value_wb.close()
 
 
-def build_soluble_updated_workbook(content, row_number, location, updates):
+def _disabled_unsafe_xml_builder(content, row_number, location, updates):
     """XLSX全体を再生成せず、対象セルのXMLだけを変更して既存の計算結果を保つ。"""
     if location not in SOLUBLE_LOCATIONS:
         raise ValueError("対象の会社が正しくありません。")
@@ -5081,6 +5082,73 @@ def build_soluble_updated_workbook(content, row_number, location, updates):
     finally:
         formula_wb.close()
         value_wb.close()
+    return saved_content, changed
+
+
+def build_soluble_updated_workbook(content, row_number, location, updates):
+    """openpyxlの標準保存を使い、Excel本体で開ける形式のまま対象セルを更新する。"""
+    if location not in SOLUBLE_LOCATIONS:
+        raise ValueError("対象の会社が正しくありません。")
+    if row_number < 11:
+        raise ValueError("更新する行が正しくありません。")
+    if not updates:
+        raise ValueError("変更された項目がありません。")
+
+    workbook = load_workbook(BytesIO(content), data_only=False, read_only=False)
+    original_sheets = list(workbook.sheetnames)
+    changed = []
+    yellow_fill = PatternFill(fill_type="solid", fgColor="FFFFFF00")
+    clear_fill = PatternFill(fill_type=None)
+    try:
+        if SOLUBLE_SHEET_NAME not in workbook.sheetnames:
+            raise ValueError("ソリュブルシートが見つかりません。")
+        ws = workbook[SOLUBLE_SHEET_NAME]
+        if row_number > ws.max_row:
+            raise ValueError("更新する日付行が見つかりません。")
+        columns = SOLUBLE_LOCATIONS[location]
+
+        for field, requested_value in updates.items():
+            if field not in columns:
+                raise ValueError("更新項目が正しくありません。")
+            if requested_value == "__AUTO_INVENTORY__":
+                if field != "inventory" or row_number <= 11:
+                    raise ValueError("この日は在庫を自動計算にできません。")
+                inventory_letter = ws.cell(row_number, columns["inventory"]).column_letter
+                usage_letter = ws.cell(row_number, columns["usage"]).column_letter
+                delivery_letter = ws.cell(row_number, columns["delivery"]).column_letter
+                new_value = (
+                    f"={inventory_letter}{row_number - 1}-{usage_letter}{row_number}+{delivery_letter}{row_number}"
+                )
+                manual = False
+            else:
+                new_value = requested_value
+                manual = True
+
+            cell = ws.cell(row_number, columns[field])
+            cell.value = new_value
+            cell.fill = yellow_fill if manual else clear_fill
+            changed.append((cell.coordinate, new_value, manual))
+
+        workbook.calculation.fullCalcOnLoad = True
+        workbook.calculation.forceFullCalc = True
+        workbook.calculation.calcMode = "auto"
+        output = BytesIO()
+        workbook.save(output)
+    finally:
+        workbook.close()
+
+    saved_content = output.getvalue()
+    verified = load_workbook(BytesIO(saved_content), data_only=False, read_only=False)
+    try:
+        if list(verified.sheetnames) != original_sheets:
+            raise ValueError("保存後にシート構成が変わったため、更新を中止しました。")
+        ws = verified[SOLUBLE_SHEET_NAME]
+        for coordinate, expected, expected_manual in changed:
+            cell = ws[coordinate]
+            if cell.value != expected or soluble_cell_is_manual(cell) != expected_manual:
+                raise ValueError(f"保存確認で{SOLUBLE_SHEET_NAME}!{coordinate}が一致しません。")
+    finally:
+        verified.close()
     return saved_content, changed
 
 
