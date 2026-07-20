@@ -82,6 +82,14 @@ SOLUBLE_LOCATIONS = {
     "ノベルズ": {"usage": 3, "delivery": 4, "inventory": 5},
     "コスモアグリ": {"usage": 6, "delivery": 7, "inventory": 8},
 }
+SOLUBLE_CUSTOMER_NAMES = ("三谷牧場", "熊林牧場")
+SOLUBLE_CUSTOMER_COLUMNS = {
+    "customer_name": 2,       # B列
+    "delivery_date": 5,       # E列：配達日
+    "delivery_quantity": 6,   # F列：配達数量
+    "next_delivery": 7,       # G列：次回配達予定（数式・表示のみ）
+    "usage": 8,               # H列：使用数量/日
+}
 DISPATCH_REQUIRED_COLUMNS = [
     "発注番号",
     "引取日",
@@ -110,6 +118,7 @@ SUPABASE_CUSTOMER_INFO_TABLE = st.secrets.get(
 LINE_STATUS_NOTE_PREFIX = "line_status_"
 LINE_STATUS_BODY = "__LINE_CONNECTED__"
 VOICE_INPUT_HELP = "スマホではキーボードのマイクを押して音声入力できます。"
+PAST_PRODUCT_NOTE_PREFIX = "__past_product_note__:"
 
 REQUIRED_COLUMNS = [
     "ID",
@@ -2064,26 +2073,6 @@ def show_notes_page(df):
         render_note_delete_controls(note)
 
 
-# 過去商品のメモは、既存の顧客情報テーブルへ非表示項目として保存する。
-# 新しいSupabaseテーブルやExcel列は不要。
-PAST_PRODUCT_MEMO_PREFIX = "__past_product_memo__:"
-
-
-def make_past_product_memo_field_name(product_name):
-    return f"{PAST_PRODUCT_MEMO_PREFIX}{clean_value(product_name, blank_text='').strip()}"
-
-
-def is_past_product_memo_item(item):
-    return str(item.get("field_name", "")).startswith(PAST_PRODUCT_MEMO_PREFIX)
-
-
-def get_past_product_name_from_item(item):
-    field_name = str(item.get("field_name", ""))
-    if not field_name.startswith(PAST_PRODUCT_MEMO_PREFIX):
-        return ""
-    return field_name[len(PAST_PRODUCT_MEMO_PREFIX):].strip()
-
-
 # =========================
 # 顧客情報（Supabase保存）
 # =========================
@@ -2262,6 +2251,191 @@ def reorder_customer_information(first_item, second_item):
     clear_customer_information_cache()
 
 
+
+def make_past_product_note_field(product_name):
+    """顧客情報テーブル内で、過去商品メモを通常項目と分けるための内部項目名を作る。"""
+    product = clean_value(product_name, blank_text="").strip()
+    return f"{PAST_PRODUCT_NOTE_PREFIX}{product}"
+
+
+def extract_past_product_name(field_name):
+    """内部項目名から商品名だけを取り出す。"""
+    field = clean_value(field_name, blank_text="")
+    if not field.startswith(PAST_PRODUCT_NOTE_PREFIX):
+        return ""
+    return field[len(PAST_PRODUCT_NOTE_PREFIX):].strip()
+
+
+def is_past_product_note_item(item):
+    """顧客情報テーブル上の商品メモ専用レコードか判定する。"""
+    return clean_value(item.get("field_name"), blank_text="").startswith(PAST_PRODUCT_NOTE_PREFIX)
+
+
+def get_past_product_names(detail, visible_detail):
+    """使用数量/日が0または空白の商品を、過去に使用した商品として抽出する。"""
+    active_products = {
+        clean_value(value, blank_text="").strip()
+        for value in visible_detail.get("商品名", []).tolist()
+        if clean_value(value, blank_text="").strip()
+    }
+
+    past_products = []
+    for _, row in detail.iterrows():
+        product_name = clean_value(row.get("商品名"), blank_text="").strip()
+        if not product_name:
+            continue
+        if product_name in active_products:
+            continue
+        if not is_blank_or_zero(row.get("使用数量/日")):
+            continue
+        if product_name not in past_products:
+            past_products.append(product_name)
+
+    return past_products
+
+
+def get_past_product_note_items(customer_name, customer_key):
+    """過去商品メモを商品名ごとの辞書で返す。"""
+    items = load_customer_information(customer_name, customer_key)
+    result = {}
+    for item in items:
+        if not is_past_product_note_item(item):
+            continue
+        product_name = extract_past_product_name(item.get("field_name"))
+        if product_name and product_name not in result:
+            result[product_name] = item
+    return result
+
+
+def save_past_product_note(customer_name, customer_key, product_name, content):
+    """過去商品の商品別メモを、既存の顧客情報テーブルへ内部項目として保存する。"""
+    field_name = make_past_product_note_field(product_name)
+    items = load_customer_information(customer_name, customer_key)
+    existing = next(
+        (
+            item for item in items
+            if clean_value(item.get("field_name"), blank_text="") == field_name
+        ),
+        None,
+    )
+
+    if existing:
+        update_customer_information(existing["id"], field_name, content)
+        return
+
+    next_order = max(
+        (int(item.get("sort_order", 0)) for item in items),
+        default=0,
+    ) + 10
+    insert_customer_information(
+        customer_name,
+        customer_key,
+        field_name,
+        content,
+        next_order,
+    )
+
+
+def delete_past_product_note(note_item):
+    """過去商品の商品別メモを削除する。"""
+    item_id = clean_value(note_item.get("id"), blank_text="")
+    if not item_id:
+        raise RuntimeError("削除する商品メモが見つかりません。")
+    delete_customer_information(item_id)
+
+
+def render_past_products_section(customer_name, customer_key, detail, visible_detail):
+    """顧客詳細の最下部に、過去に使用した商品と商品別メモを表示する。"""
+    past_products = get_past_product_names(detail, visible_detail)
+    if not past_products:
+        return
+
+    st.markdown("---")
+    st.subheader("過去に使用した商品")
+
+    if not has_supabase_config():
+        st.warning("商品メモを使うにはSupabase設定が必要です。")
+        return
+
+    try:
+        note_items = get_past_product_note_items(customer_name, customer_key)
+    except Exception as exc:
+        st.warning(f"商品メモを読み込めませんでした：{exc}")
+        note_items = {}
+
+    identity = customer_key or customer_name
+    for product_name in past_products:
+        note_item = note_items.get(product_name)
+        current_content = clean_value(
+            note_item.get("content") if note_item else "",
+            blank_text="",
+        )
+        state_suffix = hashlib.sha256(
+            f"past-product|{identity}|{product_name}".encode("utf-8")
+        ).hexdigest()[:16]
+        delete_confirm_key = f"past_product_delete_confirm_{state_suffix}"
+
+        with st.expander(product_name):
+            memo = st.text_area(
+                "メモ",
+                value=current_content,
+                key=f"past_product_note_{state_suffix}",
+                height=110,
+                placeholder="例：値上げのため中止、効果が薄かった、別商品へ変更 など",
+            )
+
+            save_col, delete_col = st.columns(2)
+            with save_col:
+                if st.button(
+                    "保存",
+                    key=f"past_product_note_save_{state_suffix}",
+                    type="primary",
+                    use_container_width=True,
+                ):
+                    try:
+                        save_past_product_note(
+                            customer_name,
+                            customer_key,
+                            product_name,
+                            memo,
+                        )
+                        st.success("商品メモを保存しました。")
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(f"商品メモを保存できませんでした：{exc}")
+
+            with delete_col:
+                if note_item:
+                    if st.session_state.get(delete_confirm_key):
+                        if st.button(
+                            "削除する",
+                            key=f"past_product_note_delete_confirm_{state_suffix}",
+                            use_container_width=True,
+                        ):
+                            try:
+                                delete_past_product_note(note_item)
+                                st.session_state.pop(delete_confirm_key, None)
+                                st.success("商品メモを削除しました。")
+                                st.rerun()
+                            except Exception as exc:
+                                st.error(f"商品メモを削除できませんでした：{exc}")
+                        if st.button(
+                            "キャンセル",
+                            key=f"past_product_note_delete_cancel_{state_suffix}",
+                            use_container_width=True,
+                        ):
+                            st.session_state.pop(delete_confirm_key, None)
+                            st.rerun()
+                    else:
+                        if st.button(
+                            "削除",
+                            key=f"past_product_note_delete_{state_suffix}",
+                            use_container_width=True,
+                        ):
+                            st.session_state[delete_confirm_key] = True
+                            st.rerun()
+
+
 def render_customer_information_form(customer_name, customer_key, items, state_suffix):
     add_key = f"customer_information_add_{state_suffix}"
     if not st.session_state.get(add_key):
@@ -2340,9 +2514,8 @@ def render_customer_information_card(customer_name, customer_key=None):
             return
 
         try:
-            all_items = load_customer_information(customer_name, customer_key)
-            # 過去商品の専用メモは、通常の「顧客情報」には表示しない。
-            items = [item for item in all_items if not is_past_product_memo_item(item)]
+            items = load_customer_information(customer_name, customer_key)
+            items = [item for item in items if not is_past_product_note_item(item)]
         except Exception as exc:
             st.warning(str(exc))
             return
@@ -3179,112 +3352,6 @@ def render_customer_map_editor(customer_name, current):
             st.error(f"保存できませんでした：{exc}")
 
 
-
-def get_past_product_names(detail, visible_detail):
-    """使用量が0/空白で、同名の商品に使用中行がないものだけを返す。"""
-    active_names = {
-        clean_value(value, blank_text="").strip()
-        for value in visible_detail["商品名"].tolist()
-        if clean_value(value, blank_text="").strip()
-    }
-
-    past_names = []
-    seen = set()
-    for _, row in detail.iterrows():
-        if not is_blank_or_zero(row.get("使用数量/日")):
-            continue
-        product_name = clean_value(row.get("商品名"), blank_text="").strip()
-        if not product_name or product_name in active_names or product_name in seen:
-            continue
-        seen.add(product_name)
-        past_names.append(product_name)
-    return past_names
-
-
-def render_past_products(customer_name, customer_key, product_names):
-    """画面最下部に過去商品名を並べ、商品ごとのメモを編集できるようにする。"""
-    if not product_names:
-        return
-
-    st.markdown("---")
-    st.subheader("📦 過去に使用した商品")
-
-    if not has_supabase_config():
-        st.warning("商品メモを使うにはSupabase設定が必要です。")
-        for product_name in product_names:
-            st.markdown(f"**{html.escape(product_name)}**")
-        return
-
-    try:
-        all_items = load_customer_information(customer_name, customer_key)
-    except Exception as exc:
-        st.warning(str(exc))
-        for product_name in product_names:
-            st.markdown(f"**{html.escape(product_name)}**")
-        return
-
-    memo_items = {
-        get_past_product_name_from_item(item): item
-        for item in all_items
-        if is_past_product_memo_item(item)
-        and get_past_product_name_from_item(item)
-    }
-
-    identity = customer_key or customer_name
-    customer_suffix = hashlib.sha256(str(identity).encode("utf-8")).hexdigest()[:12]
-
-    for product_name in product_names:
-        item = memo_items.get(product_name)
-        current_memo = str(item.get("content", "") if item else "")
-        product_suffix = hashlib.sha256(product_name.encode("utf-8")).hexdigest()[:12]
-        state_key = f"past_product_memo_{customer_suffix}_{product_suffix}"
-        success_key = f"past_product_memo_success_{customer_suffix}_{product_suffix}"
-
-        with st.expander(f"📦 {product_name}"):
-            if st.session_state.pop(success_key, False):
-                st.success("商品メモを保存しました。")
-
-            with st.form(f"past_product_memo_form_{customer_suffix}_{product_suffix}"):
-                memo_text = st.text_area(
-                    "メモ",
-                    value=current_memo,
-                    key=state_key,
-                    height=120,
-                    placeholder="例：価格変更のため中止。別商品へ切り替え。など",
-                    help=VOICE_INPUT_HELP,
-                )
-                save = st.form_submit_button(
-                    "メモを保存",
-                    type="primary",
-                    use_container_width=True,
-                )
-
-            if save:
-                try:
-                    if item:
-                        update_customer_information(
-                            item["id"],
-                            make_past_product_memo_field_name(product_name),
-                            memo_text,
-                        )
-                    else:
-                        next_order = max(
-                            (int(row.get("sort_order", 0)) for row in all_items),
-                            default=0,
-                        ) + 10
-                        insert_customer_information(
-                            customer_name,
-                            customer_key,
-                            make_past_product_memo_field_name(product_name),
-                            memo_text,
-                            next_order,
-                        )
-                    st.session_state[success_key] = True
-                    st.rerun()
-                except RuntimeError as exc:
-                    st.error(str(exc))
-
-
 def show_customer_detail(df, customer_name):
     detail = df[df["顧客名"] == customer_name].copy()
 
@@ -3295,9 +3362,8 @@ def show_customer_detail(df, customer_name):
     show_back_home_button("detail_back_home")
     show_detail_search_shortcuts()
 
-    # 使用数量/日が0・空白・NaNの商品行は、通常の商品カードには表示しない。
+    # 使用数量/日が0・空白・NaNの商品行は、商品名ごと表示しない。
     visible_detail = detail[~detail["使用数量/日"].apply(is_blank_or_zero)].copy()
-    past_product_names = get_past_product_names(detail, visible_detail)
 
     region = clean_value(detail.iloc[0]["地域"])
 
@@ -3363,7 +3429,7 @@ def show_customer_detail(df, customer_name):
     render_customer_information_card(customer_name, customer_key)
 
     if visible_detail.empty:
-        st.info("現在使用中の商品はありません。")
+        st.info("表示対象の商品はありません。使用数量/日が0または空白の商品は非表示にしています。")
 
     for _, row in visible_detail.iterrows():
         product_name = clean_value(row["商品名"])
@@ -3405,8 +3471,28 @@ def show_customer_detail(df, customer_name):
             render_customer_excel_editor(customer_name, product_name, current_edit_values)
 
 
+    if normalize_soluble_customer_name(customer_name) in {
+        normalize_soluble_customer_name(name) for name in SOLUBLE_CUSTOMER_NAMES
+    }:
+        try:
+            soluble_content, _ = load_soluble_workbook_content()
+            soluble_customer_summary = get_soluble_customer_summary(
+                soluble_content,
+                customer_name,
+            )
+            if soluble_customer_summary is not None:
+                render_soluble_customer_product_card(
+                    customer_name,
+                    soluble_customer_summary,
+                    key_scope="customer_detail",
+                )
+            else:
+                st.warning(f"ソリュブルシートに「{customer_name}」が見つかりません。")
+        except Exception as exc:
+            st.warning(f"ソリュブル情報を読み込めませんでした：{exc}")
+
     show_customer_notes(customer_name)
-    render_past_products(customer_name, customer_key, past_product_names)
+    render_past_products_section(customer_name, customer_key, detail, visible_detail)
 
 # =========================
 # 顧客名一覧
@@ -4894,6 +4980,103 @@ def same_soluble_value(left, right):
     return left == right
 
 
+def normalize_soluble_customer_name(value):
+    """ソリュブル上段の顧客名照合用。半角・全角空白の違いだけを吸収する。"""
+    return re.sub(r"[\s　]+", "", clean_value(value, blank_text=""))
+
+
+def find_soluble_customer_row(ws, customer_name):
+    """ソリュブルシート上段から顧客名で対象行を探す。"""
+    target = normalize_soluble_customer_name(customer_name)
+    if not target:
+        return None
+
+    customer_column = SOLUBLE_CUSTOMER_COLUMNS["customer_name"]
+    # 上段の顧客一覧は2行目の見出しから、日別表が始まる10行目より前にある。
+    for row_number in range(3, min(ws.max_row, 10) + 1):
+        if normalize_soluble_customer_name(ws.cell(row_number, customer_column).value) == target:
+            return row_number
+    return None
+
+
+def calculate_soluble_customer_next_delivery(delivery_date_value, delivery_quantity, usage):
+    """G列の「配達数量÷使用数量/日＋配達日」と同じ表示日を計算する。"""
+    delivery_day = soluble_date_value(delivery_date_value)
+    if delivery_day is None:
+        return None
+    try:
+        quantity = float(delivery_quantity)
+        daily_usage = float(usage)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(quantity) or not math.isfinite(daily_usage) or daily_usage <= 0:
+        return None
+    calculated = datetime.combine(delivery_day, datetime.min.time()) + timedelta(
+        days=quantity / daily_usage
+    )
+    return calculated.date()
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def read_soluble_customer_summaries(content):
+    """三谷牧場・熊林牧場の上段4項目をまとめて読む。"""
+    formula_wb = load_workbook(BytesIO(content), data_only=False, read_only=False)
+    value_wb = load_workbook(BytesIO(content), data_only=True, read_only=False)
+    try:
+        if SOLUBLE_SHEET_NAME not in formula_wb.sheetnames:
+            raise ValueError("ソリュブルシートが見つかりません。")
+        formula_ws = formula_wb[SOLUBLE_SHEET_NAME]
+        value_ws = value_wb[SOLUBLE_SHEET_NAME]
+        result = {}
+
+        for customer_name in SOLUBLE_CUSTOMER_NAMES:
+            row_number = find_soluble_customer_row(formula_ws, customer_name)
+            if row_number is None:
+                continue
+
+            delivery_date_value = formula_ws.cell(
+                row_number, SOLUBLE_CUSTOMER_COLUMNS["delivery_date"]
+            ).value
+            delivery_quantity = formula_ws.cell(
+                row_number, SOLUBLE_CUSTOMER_COLUMNS["delivery_quantity"]
+            ).value
+            usage = formula_ws.cell(
+                row_number, SOLUBLE_CUSTOMER_COLUMNS["usage"]
+            ).value
+            next_delivery_value = value_ws.cell(
+                row_number, SOLUBLE_CUSTOMER_COLUMNS["next_delivery"]
+            ).value
+            next_delivery = soluble_date_value(next_delivery_value)
+            if next_delivery is None:
+                next_delivery = calculate_soluble_customer_next_delivery(
+                    delivery_date_value,
+                    delivery_quantity,
+                    usage,
+                )
+
+            result[customer_name] = {
+                "row": row_number,
+                "顧客名": customer_name,
+                "配達日": soluble_date_value(delivery_date_value),
+                "配達数量": delivery_quantity,
+                "次回配達予定": next_delivery,
+                "使用数量/日": usage,
+            }
+        return result
+    finally:
+        formula_wb.close()
+        value_wb.close()
+
+
+def get_soluble_customer_summary(content, customer_name):
+    """選択中の顧客に対応するソリュブル上段情報を返す。"""
+    target = normalize_soluble_customer_name(customer_name)
+    for name, summary in read_soluble_customer_summaries(content).items():
+        if normalize_soluble_customer_name(name) == target:
+            return summary
+    return None
+
+
 @st.cache_data(ttl=60, show_spinner=False)
 def load_soluble_workbook_content():
     """Dropboxを優先し、開発用PCでは同期済みローカルファイルも利用する。"""
@@ -5339,6 +5522,311 @@ def save_soluble_changes(row_number, location, updates):
     return changed
 
 
+def build_soluble_customer_updated_workbook(content, customer_name, updates):
+    """上段顧客のE/F/H列だけを更新し、G列の数式は保持する。"""
+    if normalize_soluble_customer_name(customer_name) not in {
+        normalize_soluble_customer_name(name) for name in SOLUBLE_CUSTOMER_NAMES
+    }:
+        raise ValueError("編集対象の顧客が正しくありません。")
+    if not updates:
+        raise ValueError("変更された項目がありません。")
+
+    allowed_columns = {
+        "delivery_date": SOLUBLE_CUSTOMER_COLUMNS["delivery_date"],
+        "delivery_quantity": SOLUBLE_CUSTOMER_COLUMNS["delivery_quantity"],
+        "usage": SOLUBLE_CUSTOMER_COLUMNS["usage"],
+    }
+    if any(field not in allowed_columns for field in updates):
+        raise ValueError("更新項目が正しくありません。")
+
+    workbook = load_workbook(BytesIO(content), data_only=False, read_only=False)
+    original_sheets = list(workbook.sheetnames)
+    changed = []
+    try:
+        if SOLUBLE_SHEET_NAME not in workbook.sheetnames:
+            raise ValueError("ソリュブルシートが見つかりません。")
+        ws = workbook[SOLUBLE_SHEET_NAME]
+        row_number = find_soluble_customer_row(ws, customer_name)
+        if row_number is None:
+            raise ValueError(f"ソリュブルシートに「{customer_name}」が見つかりません。")
+
+        next_delivery_cell = ws.cell(
+            row_number,
+            SOLUBLE_CUSTOMER_COLUMNS["next_delivery"],
+        )
+        original_next_delivery_formula = next_delivery_cell.value
+        if not (
+            isinstance(original_next_delivery_formula, str)
+            and original_next_delivery_formula.startswith("=")
+        ):
+            raise ValueError("次回配達予定の数式が見つからないため、更新を中止しました。")
+
+        for field, new_value in updates.items():
+            column_number = allowed_columns[field]
+            cell = ws.cell(row_number, column_number)
+            if not same_excel_value(cell.value, new_value):
+                cell.value = new_value
+                changed.append((cell.coordinate, new_value))
+
+        if not changed:
+            raise ValueError("変更された項目がありません。")
+
+        # 次回配達予定は編集せず、既存のG列数式に任せる。
+        if next_delivery_cell.value != original_next_delivery_formula:
+            raise ValueError("次回配達予定の数式が変更されたため、保存を中止しました。")
+        enable_excel_recalculation(workbook)
+        output = BytesIO()
+        workbook.save(output)
+    finally:
+        workbook.close()
+
+    saved_content = output.getvalue()
+    verified = load_workbook(BytesIO(saved_content), data_only=False, read_only=False)
+    try:
+        if list(verified.sheetnames) != original_sheets:
+            raise ValueError("保存後にシート構成が変わったため、更新を中止しました。")
+        ws = verified[SOLUBLE_SHEET_NAME]
+        verified_row = find_soluble_customer_row(ws, customer_name)
+        if verified_row is None:
+            raise ValueError("保存後に対象顧客の行を確認できません。")
+        if ws.cell(
+            verified_row,
+            SOLUBLE_CUSTOMER_COLUMNS["next_delivery"],
+        ).value != original_next_delivery_formula:
+            raise ValueError("保存後に次回配達予定の数式が変わっています。")
+        for coordinate, expected in changed:
+            if not same_excel_value(ws[coordinate].value, expected):
+                raise ValueError(f"保存確認で{SOLUBLE_SHEET_NAME}!{coordinate}が一致しません。")
+    finally:
+        verified.close()
+    return saved_content, changed
+
+
+def verify_soluble_customer_saved_content(content, customer_name, changed):
+    """Dropbox保存後に、変更セルとG列数式が残っていることを確認する。"""
+    workbook = load_workbook(BytesIO(content), data_only=False, read_only=False)
+    try:
+        if SOLUBLE_SHEET_NAME not in workbook.sheetnames:
+            raise RuntimeError("保存後の確認でソリュブルシートが見つかりません。")
+        ws = workbook[SOLUBLE_SHEET_NAME]
+        row_number = find_soluble_customer_row(ws, customer_name)
+        if row_number is None:
+            raise RuntimeError("保存後の確認で対象顧客が見つかりません。")
+        formula = ws.cell(row_number, SOLUBLE_CUSTOMER_COLUMNS["next_delivery"]).value
+        if not (isinstance(formula, str) and formula.startswith("=")):
+            raise RuntimeError("保存後の確認で次回配達予定の数式が見つかりません。")
+        for coordinate, expected in changed:
+            if not same_excel_value(ws[coordinate].value, expected):
+                raise RuntimeError(
+                    f"Dropbox保存後の確認で{SOLUBLE_SHEET_NAME}!{coordinate}が更新されていません。"
+                )
+    finally:
+        workbook.close()
+
+
+def save_soluble_customer_changes(customer_name, updates):
+    """上段顧客の変更を、既存ソリュブル保存と同じバックアップ方式で保存する。"""
+    target_path = str(SOLUBLE_DROPBOX_FILE_PATH or SOLUBLE_DROPBOX_DEFAULT_FILE_PATH).strip()
+    timestamp = get_jst_now().strftime("%Y%m%d_%H%M%S_%f")
+
+    if has_dropbox_auth_config():
+        access_token = get_dropbox_access_token()
+        original_content, response = download_dropbox_file(target_path, access_token)
+        if original_content is None:
+            raise RuntimeError(
+                "最新の対象Excelを取得できませんでした。\n" + dropbox_error_text(response)
+            )
+        revision = get_download_revision(response)
+        if not revision:
+            raise RuntimeError("Dropboxの更新番号を取得できないため、保存を中止しました。")
+
+        saved_content, changed = build_soluble_customer_updated_workbook(
+            original_content,
+            customer_name,
+            updates,
+        )
+        ensure_soluble_backup_folder(access_token)
+        backup_path = (
+            f"{SOLUBLE_BACKUP_FOLDER}/"
+            f"aoベンチャーグレイン配車表_{timestamp}.xlsx"
+        )
+        backup_response = upload_dropbox_file(
+            backup_path,
+            original_content,
+            access_token,
+            mode="add",
+        )
+        if backup_response.status_code != 200:
+            raise RuntimeError(
+                "バックアップを作成できないため、本番ファイルは更新しません。\n"
+                + dropbox_error_text(backup_response)
+            )
+        upload_response = upload_dropbox_file(
+            target_path,
+            saved_content,
+            access_token,
+            mode="update",
+            rev=revision,
+        )
+        if upload_response.status_code == 409:
+            raise RuntimeError(
+                "保存中にPCなどでExcelが更新されました。再読み込みしてからやり直してください。"
+            )
+        if upload_response.status_code != 200:
+            raise RuntimeError(
+                "対象Excelを更新できませんでした。\n"
+                + dropbox_error_text(upload_response)
+            )
+
+        confirmed_content, confirmed_response = download_dropbox_file(target_path, access_token)
+        if confirmed_content is None:
+            raise RuntimeError(
+                "保存後のExcelを再取得できませんでした。\n"
+                + dropbox_error_text(confirmed_response)
+            )
+        verify_soluble_customer_saved_content(
+            confirmed_content,
+            customer_name,
+            changed,
+        )
+    else:
+        local_path = Path(str(SOLUBLE_LOCAL_FILE))
+        if not local_path.exists():
+            raise FileNotFoundError(f"対象ファイルが見つかりません：{local_path}")
+        original_content = local_path.read_bytes()
+        saved_content, changed = build_soluble_customer_updated_workbook(
+            original_content,
+            customer_name,
+            updates,
+        )
+        backup_dir = local_path.parent / "Backups"
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        backup_path = backup_dir / f"aoベンチャーグレイン配車表_{timestamp}.xlsx"
+        backup_path.write_bytes(original_content)
+        local_path.write_bytes(saved_content)
+        verify_soluble_customer_saved_content(
+            local_path.read_bytes(),
+            customer_name,
+            changed,
+        )
+
+    st.cache_data.clear()
+    return changed
+
+
+def render_soluble_customer_editor(customer_name, current, key_scope):
+    """既存の商品カードと同じ操作で、配達日・配達数量・使用数量/日だけ編集する。"""
+    identity = f"{key_scope}|{customer_name}|soluble"
+    key_suffix = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:16]
+    edit_key = f"soluble_customer_edit_{key_suffix}"
+
+    if not st.session_state.get(edit_key):
+        if st.button("編集", key=f"soluble_customer_edit_button_{key_suffix}"):
+            st.session_state[edit_key] = True
+            st.rerun()
+        return
+
+    with st.form(f"soluble_customer_edit_form_{key_suffix}"):
+        st.caption(f"🎤 {VOICE_INPUT_HELP} 入力欄は毎回空白から始まります。")
+        delivery_date_text = st.text_input(
+            "配達日",
+            value="",
+            placeholder="例：2026年7月15日",
+            help=VOICE_INPUT_HELP,
+        )
+        delivery_quantity_text = st.text_input(
+            "配達数量",
+            value="",
+            placeholder="例：15000",
+            help=VOICE_INPUT_HELP,
+        )
+        usage_text = st.text_input(
+            "使用数量/日",
+            value="",
+            placeholder="例：1000",
+            help=VOICE_INPUT_HELP,
+        )
+        st.caption("次回配達予定はExcelの数式で計算されるため、直接編集しません。")
+        save_col, cancel_col = st.columns(2)
+        with save_col:
+            save = st.form_submit_button("保存", type="primary", use_container_width=True)
+        with cancel_col:
+            cancel = st.form_submit_button("キャンセル", use_container_width=True)
+
+    if cancel:
+        st.session_state.pop(edit_key, None)
+        st.rerun()
+
+    if save:
+        try:
+            updates = {}
+            if str(delivery_date_text).strip():
+                new_delivery_date = parse_optional_date(delivery_date_text)
+                if not same_excel_value(new_delivery_date, current.get("配達日")):
+                    updates["delivery_date"] = new_delivery_date
+            if str(delivery_quantity_text).strip():
+                new_delivery_quantity = parse_optional_nonnegative_number(
+                    delivery_quantity_text,
+                    integer=False,
+                )
+                if not same_soluble_value(
+                    new_delivery_quantity,
+                    current.get("配達数量"),
+                ):
+                    updates["delivery_quantity"] = new_delivery_quantity
+            if str(usage_text).strip():
+                new_usage = parse_optional_nonnegative_number(
+                    usage_text,
+                    integer=False,
+                )
+                if not same_soluble_value(new_usage, current.get("使用数量/日")):
+                    updates["usage"] = new_usage
+
+            if not updates:
+                st.warning("変更された項目がありません。")
+                return
+
+            with st.spinner("元ファイルをバックアップして保存しています…"):
+                changed = save_soluble_customer_changes(customer_name, updates)
+            st.session_state.pop(edit_key, None)
+            st.session_state["soluble_customer_save_success"] = {
+                "customer_name": customer_name,
+                "changed_count": len(changed),
+            }
+            st.rerun()
+        except ValueError as exc:
+            st.error(str(exc))
+        except Exception as exc:
+            st.error(f"保存できませんでした：{exc}")
+
+
+def render_soluble_customer_product_card(customer_name, current, key_scope):
+    """三谷牧場・熊林牧場のソリュブル情報を既存商品カードと同じ形で表示する。"""
+    with st.container(border=True):
+        st.subheader("📦 ソリュブル")
+
+        success = st.session_state.get("soluble_customer_save_success")
+        if success and normalize_soluble_customer_name(
+            success.get("customer_name")
+        ) == normalize_soluble_customer_name(customer_name):
+            st.success(f"保存しました（{success.get('changed_count', 0)}セル更新）。")
+            st.session_state.pop("soluble_customer_save_success", None)
+
+        col1, col2 = st.columns(2)
+        with col1:
+            st.caption("配達日")
+            st.markdown(f"**{format_date(current.get('配達日'))}**")
+            st.caption("配達数量")
+            st.markdown(f"**{soluble_number_label(current.get('配達数量'))}**")
+        with col2:
+            st.caption("次回配達予定")
+            st.markdown(f"**{format_date(current.get('次回配達予定'))}**")
+            st.caption("使用数量/日")
+            st.markdown(f"**{soluble_number_label(current.get('使用数量/日'))}**")
+
+        render_soluble_customer_editor(customer_name, current, key_scope)
+
+
 def show_soluble_inventory_page():
     st.markdown("---")
     st.header("🧪 ソリュブル在庫")
@@ -5348,16 +5836,35 @@ def show_soluble_inventory_page():
     with st.spinner("ソリュブル在庫を読み込んでいます…"):
         content, source = load_soluble_workbook_content()
         rows = read_soluble_rows(content)
-    if not rows:
-        st.warning("ソリュブルシートに表示できる日付がありません。")
+        customer_summaries = read_soluble_customer_summaries(content)
+    if not rows and not customer_summaries:
+        st.warning("ソリュブルシートに表示できるデータがありません。")
         return
 
     location = st.radio(
         "表示する会社",
-        list(SOLUBLE_LOCATIONS.keys()),
+        list(SOLUBLE_LOCATIONS.keys()) + list(SOLUBLE_CUSTOMER_NAMES),
         horizontal=True,
         key="soluble_location",
     )
+
+    if location in SOLUBLE_CUSTOMER_NAMES:
+        current = customer_summaries.get(location)
+        if current is None:
+            st.warning(f"{location}の行がソリュブルシートに見つかりません。")
+            return
+        st.caption(f"参照：{source}")
+        render_soluble_customer_product_card(
+            location,
+            current,
+            key_scope="soluble_inventory_page",
+        )
+        return
+
+    if not rows:
+        st.warning("ソリュブルシートに表示できる日付がありません。")
+        return
+
     # 数値がまだ空の日も、ここから新しく入力できるように日付行はすべて表示対象にする。
     active_rows = list(rows)
     if not active_rows:
