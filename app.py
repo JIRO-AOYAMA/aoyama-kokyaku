@@ -5,6 +5,7 @@ import json
 import math
 import re
 import urllib.parse
+import uuid
 from datetime import date, datetime, timedelta, timezone
 from io import BytesIO
 from pathlib import Path
@@ -79,6 +80,10 @@ SUPABASE_SECRET_KEY = st.secrets.get("SUPABASE_SECRET_KEY", "")
 SUPABASE_SERVICE_ROLE_KEY = st.secrets.get("SUPABASE_SERVICE_ROLE_KEY", "")
 SUPABASE_ANON_KEY = st.secrets.get("SUPABASE_ANON_KEY", "")
 SUPABASE_NOTES_TABLE = st.secrets.get("SUPABASE_NOTES_TABLE", "notes")
+SUPABASE_CUSTOMER_INFO_TABLE = st.secrets.get(
+    "SUPABASE_CUSTOMER_INFO_TABLE",
+    "customer_information",
+)
 LINE_STATUS_NOTE_PREFIX = "line_status_"
 LINE_STATUS_BODY = "__LINE_CONNECTED__"
 VOICE_INPUT_HELP = "スマホではキーボードのマイクを押して音声入力できます。"
@@ -1951,6 +1956,408 @@ def show_notes_page(df):
         render_note_delete_controls(note)
 
 
+# =========================
+# 顧客情報（Supabase保存）
+# =========================
+def get_supabase_customer_information_table():
+    table_name = str(SUPABASE_CUSTOMER_INFO_TABLE or "customer_information").strip()
+    if not table_name.replace("_", "").isalnum():
+        raise RuntimeError("Supabaseの顧客情報テーブル名が正しくありません。")
+    return table_name
+
+
+def get_supabase_customer_information_url():
+    base_url = str(SUPABASE_URL or "").strip().rstrip("/")
+    table_name = urllib.parse.quote(get_supabase_customer_information_table(), safe="")
+    return f"{base_url}/rest/v1/{table_name}"
+
+
+def get_stable_customer_key(detail):
+    """同一顧客の全行でIDが1種類だけの場合に限り、安定キーとして使う。"""
+    if "ID" not in detail.columns:
+        return None
+    customer_ids = {
+        clean_value(value, blank_text="")
+        for value in detail["ID"].tolist()
+        if clean_value(value, blank_text="")
+    }
+    return next(iter(customer_ids)) if len(customer_ids) == 1 else None
+
+
+def customer_information_query(customer_name, customer_key=None):
+    params = {
+        "select": "id,customer_key,customer_name,field_name,content,sort_order,created_at,updated_at",
+        "order": "sort_order.asc,created_at.asc,id.asc",
+    }
+    if customer_key:
+        params["customer_key"] = f"eq.{customer_key}"
+    else:
+        params["customer_key"] = "is.null"
+        params["customer_name"] = f"eq.{customer_name}"
+    return params
+
+
+def check_customer_information_response(action, response, success_codes):
+    if response.status_code in success_codes:
+        return
+    detail = str(response.text or "").strip()[:500]
+    message = f"顧客情報を{action}できませんでした（{response.status_code}）。"
+    if detail:
+        message += f" {detail}"
+    raise RuntimeError(message)
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def load_customer_information(customer_name, customer_key=None):
+    """件数上限を設けず、Supabaseからページ単位で顧客情報を読む。"""
+    if not has_supabase_config():
+        raise RuntimeError("Supabase設定がありません。")
+
+    rows = []
+    page_size = 1000
+    offset = 0
+    while True:
+        params = customer_information_query(customer_name, customer_key)
+        params.update({"limit": str(page_size), "offset": str(offset)})
+        try:
+            response = requests.get(
+                get_supabase_customer_information_url(),
+                headers=get_supabase_headers(),
+                params=params,
+                timeout=30,
+            )
+        except Exception as exc:
+            raise RuntimeError("顧客情報の読み込み中にSupabaseへ接続できませんでした。") from exc
+        check_customer_information_response("読み込み", response, (200,))
+        page = response.json()
+        if not isinstance(page, list):
+            raise RuntimeError("Supabaseから返った顧客情報の形式が正しくありません。")
+        rows.extend(page)
+        if len(page) < page_size:
+            break
+        offset += page_size
+    return rows
+
+
+def clear_customer_information_cache():
+    load_customer_information.clear()
+
+
+def insert_customer_information(customer_name, customer_key, field_name, content, sort_order):
+    now = get_jst_now().isoformat()
+    payload = {
+        "id": str(uuid.uuid4()),
+        "customer_key": customer_key or None,
+        "customer_name": clean_value(customer_name, blank_text=""),
+        "field_name": str(field_name).strip(),
+        "content": str(content or ""),
+        "sort_order": int(sort_order),
+        "created_at": now,
+        "updated_at": now,
+    }
+    try:
+        response = requests.post(
+            get_supabase_customer_information_url(),
+            headers=get_supabase_headers(prefer="return=minimal"),
+            json=payload,
+            timeout=30,
+        )
+    except Exception as exc:
+        raise RuntimeError("顧客情報の保存中にSupabaseへ接続できませんでした。") from exc
+    check_customer_information_response("保存", response, (200, 201))
+    clear_customer_information_cache()
+
+
+def update_customer_information(item_id, field_name, content):
+    try:
+        response = requests.patch(
+            get_supabase_customer_information_url(),
+            headers=get_supabase_headers(prefer="return=minimal"),
+            params={"id": f"eq.{item_id}"},
+            json={
+                "field_name": str(field_name).strip(),
+                "content": str(content or ""),
+            },
+            timeout=30,
+        )
+    except Exception as exc:
+        raise RuntimeError("顧客情報の更新中にSupabaseへ接続できませんでした。") from exc
+    check_customer_information_response("更新", response, (200, 204))
+    clear_customer_information_cache()
+
+
+def delete_customer_information(item_id):
+    try:
+        response = requests.delete(
+            get_supabase_customer_information_url(),
+            headers=get_supabase_headers(prefer="return=minimal"),
+            params={"id": f"eq.{item_id}"},
+            timeout=30,
+        )
+    except Exception as exc:
+        raise RuntimeError("顧客情報の削除中にSupabaseへ接続できませんでした。") from exc
+    check_customer_information_response("削除", response, (200, 204))
+    clear_customer_information_cache()
+
+
+def reorder_customer_information(first_item, second_item):
+    """隣接2行を1回のupsertで入れ替え、並び順をまとめて保存する。"""
+    payload = []
+    for item, new_order in (
+        (first_item, second_item.get("sort_order", 0)),
+        (second_item, first_item.get("sort_order", 0)),
+    ):
+        payload.append(
+            {
+                "id": item["id"],
+                "customer_key": item.get("customer_key"),
+                "customer_name": item["customer_name"],
+                "field_name": item["field_name"],
+                "content": item.get("content", ""),
+                "sort_order": int(new_order),
+                "created_at": item["created_at"],
+            }
+        )
+    try:
+        response = requests.post(
+            get_supabase_customer_information_url(),
+            headers=get_supabase_headers(
+                prefer="resolution=merge-duplicates,return=minimal"
+            ),
+            params={"on_conflict": "id"},
+            json=payload,
+            timeout=30,
+        )
+    except Exception as exc:
+        raise RuntimeError("顧客情報の並び替え中にSupabaseへ接続できませんでした。") from exc
+    check_customer_information_response("並び替え", response, (200, 201))
+    clear_customer_information_cache()
+
+
+def render_customer_information_form(customer_name, customer_key, items, state_suffix):
+    add_key = f"customer_information_add_{state_suffix}"
+    if not st.session_state.get(add_key):
+        if st.button("＋ 項目を追加", key=f"customer_information_add_button_{state_suffix}"):
+            st.session_state[add_key] = True
+            st.rerun()
+        return
+
+    st.markdown("**新しい項目**")
+    with st.form(f"customer_information_add_form_{state_suffix}"):
+        field_name = st.text_input("項目名", placeholder="例：担当者")
+        content = st.text_area(
+            "内容",
+            placeholder="内容を入力（複数行可）",
+            height=120,
+        )
+        save_col, cancel_col = st.columns(2)
+        with save_col:
+            save = st.form_submit_button(
+                "保存", type="primary", use_container_width=True
+            )
+        with cancel_col:
+            cancel = st.form_submit_button("キャンセル", use_container_width=True)
+
+    if cancel:
+        st.session_state.pop(add_key, None)
+        st.rerun()
+    if save:
+        if not str(field_name).strip():
+            st.warning("項目名を入力してください。")
+            return
+        next_order = max(
+            (int(item.get("sort_order", 0)) for item in items),
+            default=0,
+        ) + 10
+        try:
+            insert_customer_information(
+                customer_name,
+                customer_key,
+                field_name,
+                content,
+                next_order,
+            )
+            st.session_state.pop(add_key, None)
+            st.session_state[f"customer_information_success_{state_suffix}"] = "項目を追加しました。"
+            st.rerun()
+        except RuntimeError as exc:
+            st.error(str(exc))
+
+
+def render_customer_information_card(customer_name, customer_key=None):
+    identity = customer_key or customer_name
+    state_suffix = hashlib.sha256(str(identity).encode("utf-8")).hexdigest()[:16]
+    edit_mode_key = f"customer_information_edit_mode_{state_suffix}"
+    editing_item_key = f"customer_information_editing_item_{state_suffix}"
+    deleting_item_key = f"customer_information_deleting_item_{state_suffix}"
+
+    with st.container(border=True):
+        title_col, action_col = st.columns([4, 1])
+        with title_col:
+            st.subheader("顧客情報")
+        with action_col:
+            edit_mode = bool(st.session_state.get(edit_mode_key))
+            if st.button(
+                "編集終了" if edit_mode else "編集モード",
+                key=f"customer_information_mode_button_{state_suffix}",
+                use_container_width=True,
+            ):
+                st.session_state[edit_mode_key] = not edit_mode
+                st.session_state.pop(editing_item_key, None)
+                st.session_state.pop(deleting_item_key, None)
+                st.rerun()
+
+        if not has_supabase_config():
+            st.warning("顧客情報を使うにはSupabase設定が必要です。")
+            return
+
+        try:
+            items = load_customer_information(customer_name, customer_key)
+        except Exception as exc:
+            st.warning(str(exc))
+            return
+
+        success_key = f"customer_information_success_{state_suffix}"
+        success_message = st.session_state.pop(success_key, None)
+        if success_message:
+            st.success(success_message)
+
+        if not items:
+            st.info("登録されている情報はありません。")
+
+        edit_mode = bool(st.session_state.get(edit_mode_key))
+        active_edit_id = st.session_state.get(editing_item_key)
+        active_delete_id = st.session_state.get(deleting_item_key)
+
+        for index, item in enumerate(items):
+            item_id = str(item.get("id", ""))
+            field_name = clean_value(item.get("field_name"), blank_text="")
+            content = clean_value(item.get("content"), blank_text="")
+
+            if edit_mode and active_edit_id == item_id:
+                with st.form(f"customer_information_edit_form_{item_id}"):
+                    edited_name = st.text_input("項目名", value=field_name)
+                    edited_content = st.text_area(
+                        "内容", value=content, height=120
+                    )
+                    save_col, cancel_col = st.columns(2)
+                    with save_col:
+                        save = st.form_submit_button(
+                            "保存", type="primary", use_container_width=True
+                        )
+                    with cancel_col:
+                        cancel = st.form_submit_button(
+                            "キャンセル", use_container_width=True
+                        )
+                if cancel:
+                    st.session_state.pop(editing_item_key, None)
+                    st.rerun()
+                if save:
+                    if not str(edited_name).strip():
+                        st.warning("項目名を入力してください。")
+                    else:
+                        try:
+                            update_customer_information(
+                                item_id, edited_name, edited_content
+                            )
+                            st.session_state.pop(editing_item_key, None)
+                            st.session_state[success_key] = "項目を更新しました。"
+                            st.rerun()
+                        except RuntimeError as exc:
+                            st.error(str(exc))
+                continue
+
+            if edit_mode and active_delete_id == item_id:
+                st.warning(f"「{field_name}」を削除しますか？")
+                delete_col, cancel_col = st.columns(2)
+                with delete_col:
+                    if st.button(
+                        "削除",
+                        key=f"customer_information_delete_confirm_{item_id}",
+                        type="primary",
+                        use_container_width=True,
+                    ):
+                        try:
+                            delete_customer_information(item_id)
+                            st.session_state.pop(deleting_item_key, None)
+                            st.session_state[success_key] = "項目を削除しました。"
+                            st.rerun()
+                        except RuntimeError as exc:
+                            st.error(str(exc))
+                with cancel_col:
+                    if st.button(
+                        "キャンセル",
+                        key=f"customer_information_delete_cancel_{item_id}",
+                        use_container_width=True,
+                    ):
+                        st.session_state.pop(deleting_item_key, None)
+                        st.rerun()
+                continue
+
+            if edit_mode:
+                up_col, down_col, name_col, content_col, edit_col, delete_col = st.columns(
+                    [0.55, 0.55, 1.5, 3, 0.8, 0.8]
+                )
+                with up_col:
+                    if st.button(
+                        "↑",
+                        key=f"customer_information_up_{item_id}",
+                        disabled=index == 0,
+                    ):
+                        try:
+                            reorder_customer_information(item, items[index - 1])
+                            st.rerun()
+                        except RuntimeError as exc:
+                            st.error(str(exc))
+                with down_col:
+                    if st.button(
+                        "↓",
+                        key=f"customer_information_down_{item_id}",
+                        disabled=index == len(items) - 1,
+                    ):
+                        try:
+                            reorder_customer_information(item, items[index + 1])
+                            st.rerun()
+                        except RuntimeError as exc:
+                            st.error(str(exc))
+                with name_col:
+                    st.markdown(f"**{html.escape(field_name)}**", unsafe_allow_html=True)
+                with content_col:
+                    safe_content = html.escape(content).replace("\n", "<br>")
+                    st.markdown(
+                        f'<div style="overflow-wrap:anywhere">{safe_content}</div>',
+                        unsafe_allow_html=True,
+                    )
+                with edit_col:
+                    if st.button("編集", key=f"customer_information_edit_{item_id}"):
+                        st.session_state[editing_item_key] = item_id
+                        st.session_state.pop(deleting_item_key, None)
+                        st.rerun()
+                with delete_col:
+                    if st.button("削除", key=f"customer_information_delete_{item_id}"):
+                        st.session_state[deleting_item_key] = item_id
+                        st.session_state.pop(editing_item_key, None)
+                        st.rerun()
+            else:
+                name_col, content_col = st.columns([1.4, 3])
+                with name_col:
+                    st.markdown(f"**{html.escape(field_name)}**", unsafe_allow_html=True)
+                with content_col:
+                    safe_content = html.escape(content).replace("\n", "<br>")
+                    st.markdown(
+                        f'<div style="overflow-wrap:anywhere">{safe_content}</div>',
+                        unsafe_allow_html=True,
+                    )
+
+        st.markdown("---")
+        render_customer_information_form(
+            customer_name,
+            customer_key,
+            items,
+            state_suffix,
+        )
+
+
 
 # =========================
 # Excel読み込み・整形
@@ -2702,6 +3109,9 @@ def show_customer_detail(df, customer_name):
         "顧客一致件数": len(detail),
     }
     render_customer_map_editor(customer_name, current_map_values)
+
+    customer_key = get_stable_customer_key(detail)
+    render_customer_information_card(customer_name, customer_key)
 
     if visible_detail.empty:
         st.info("表示対象の商品はありません。使用数量/日が0または空白の商品は非表示にしています。")
