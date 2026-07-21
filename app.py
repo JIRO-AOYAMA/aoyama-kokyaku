@@ -1355,6 +1355,44 @@ def confirm_dropbox_upload(target_path, access_token, changed_cells):
             + dropbox_error_text(response)
         )
     verify_remote_workbook_changes(uploaded_content, changed_cells)
+    return uploaded_content, get_download_revision(response)
+
+
+def refresh_fast_dropbox_cache_after_save(content, excel_revision, access_token):
+    """保存直後のExcelから表示用JSONを更新し、次の再表示で新しい値を出す。"""
+    try:
+        refreshed_df = rebuild_sheet1_from_formula_references(BytesIO(content))
+        if refreshed_df.empty:
+            return "保存は完了しましたが、表示用キャッシュを更新できませんでした。更新ボタンを押してください。"
+
+        records = json.loads(
+            refreshed_df.to_json(
+                orient="records",
+                date_format="iso",
+                force_ascii=False,
+            )
+        )
+        cache_payload = json.dumps(
+            {
+                "cache_version": DROPBOX_FAST_CACHE_VERSION,
+                "excel_revision": excel_revision,
+                "records": records,
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        cache_response = upload_dropbox_file(
+            DROPBOX_FAST_CACHE_FILE,
+            cache_payload,
+            access_token,
+            mode="overwrite",
+        )
+        if cache_response.status_code != 200:
+            return "保存は完了しましたが、表示用キャッシュを更新できませんでした。更新ボタンを押してください。"
+        return ""
+    except Exception:
+        # 本番Excelの保存と検証は完了しているため、キャッシュ更新失敗だけで保存失敗にはしない。
+        return "保存は完了しましたが、表示用キャッシュを更新できませんでした。更新ボタンを押してください。"
 
 
 def update_workbook_bytes(original_content, customer_name, product_name, proposed):
@@ -1465,15 +1503,28 @@ def save_customer_excel_changes(customer_name, product_name, proposed):
         raise RuntimeError("本番Excelを更新できませんでした。必要なDropbox権限は files.content.write です。\n" + dropbox_error_text(upload_response))
 
     # 「APIが200を返した」だけで成功扱いにせず、Dropbox上の実ファイルを再確認する。
-    confirm_dropbox_upload(target_path, access_token, changed_cells)
+    confirmed_content, confirmed_revision = confirm_dropbox_upload(
+        target_path,
+        access_token,
+        changed_cells,
+    )
+
+    # 保存済みの実ファイルから表示用JSONもその場で更新する。
+    # Dropboxの更新番号が画面再実行直後に切り替わるまで待たず、1回の保存で表示を更新する。
+    cache_warning = refresh_fast_dropbox_cache_after_save(
+        confirmed_content,
+        confirmed_revision,
+        access_token,
+    )
 
     cleanup_warning = trim_old_dropbox_backups(access_token, keep=30)
+    warnings = [warning for warning in (cleanup_warning, cache_warning) if warning]
     st.cache_data.clear()
     return {
         "backup_path": backup_path,
         "updated_at": get_jst_now(),
         "changed_cells": changed_cells,
-        "cleanup_warning": cleanup_warning,
+        "cleanup_warning": "\n".join(warnings),
     }
 
 
