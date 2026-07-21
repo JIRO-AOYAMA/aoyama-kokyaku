@@ -6,6 +6,7 @@ import json
 import math
 import posixpath
 import re
+import time
 import urllib.parse
 import uuid
 import zipfile
@@ -1168,10 +1169,41 @@ def ensure_dropbox_backup_folder(access_token):
     )
 
 
+def get_dropbox_backup_folder_cache_key():
+    """同じセッション内でバックアップフォルダ確認済みかを記録するキー。"""
+    return f"_dropbox_backup_folder_ready::{DROPBOX_BACKUP_FOLDER}"
+
+
+def ensure_dropbox_backup_folder_cached(access_token, force=False):
+    """最初の1回だけフォルダを確認し、消された場合は強制再確認できるようにする。"""
+    cache_key = get_dropbox_backup_folder_cache_key()
+    if not force and st.session_state.get(cache_key) is True:
+        return
+    ensure_dropbox_backup_folder(access_token)
+    st.session_state[cache_key] = True
+
+
+def dropbox_response_indicates_missing_path(response):
+    """Dropbox応答がフォルダ・パス不存在を示しているかを安全に判定する。"""
+    if response is None:
+        return False
+    try:
+        body = json.dumps(response.json(), ensure_ascii=False)
+    except Exception:
+        body = str(getattr(response, "text", ""))
+    return "not_found" in body.lower()
+
+
 def create_dropbox_backup(target_path, backup_path, original_content, access_token):
     """Create and verify the pre-save backup, preferring a fast server-side copy."""
-    ensure_dropbox_backup_folder(access_token)
+    ensure_dropbox_backup_folder_cached(access_token)
     copy_response = copy_dropbox_file(target_path, backup_path, access_token)
+
+    # 外部操作でBackupsフォルダが削除されていた場合だけ、再作成して1回再試行する。
+    if copy_response.status_code != 200 and dropbox_response_indicates_missing_path(copy_response):
+        st.session_state.pop(get_dropbox_backup_folder_cache_key(), None)
+        ensure_dropbox_backup_folder_cached(access_token, force=True)
+        copy_response = copy_dropbox_file(target_path, backup_path, access_token)
 
     if copy_response.status_code == 200:
         metadata = get_dropbox_response_metadata(copy_response)
@@ -1194,6 +1226,15 @@ def create_dropbox_backup(target_path, backup_path, original_content, access_tok
         access_token,
         mode="add",
     )
+    if backup_response.status_code != 200 and dropbox_response_indicates_missing_path(backup_response):
+        st.session_state.pop(get_dropbox_backup_folder_cache_key(), None)
+        ensure_dropbox_backup_folder_cached(access_token, force=True)
+        backup_response = upload_dropbox_file(
+            backup_path,
+            original_content,
+            access_token,
+            mode="add",
+        )
     if backup_response.status_code != 200:
         raise RuntimeError(
             "\u30d0\u30c3\u30af\u30a2\u30c3\u30d7\u3092\u4f5c\u6210\u3067\u304d\u306a\u3044\u305f\u3081\u3001\u672c\u756a\u30d5\u30a1\u30a4\u30eb\u306f\u66f4\u65b0\u3057\u307e\u305b\u3093\u3002\n"
@@ -1234,6 +1275,39 @@ def trim_old_dropbox_backups(access_token, keep=30):
         if delete_response.status_code != 200:
             warnings.append(item.get("name", "不明なファイル"))
     return "削除できなかった古いバックアップ: " + ", ".join(warnings) if warnings else ""
+
+
+def trim_old_dropbox_backups_if_due(access_token, keep=30):
+    """バックアップは毎回作り、古いファイルの整理だけを日本時間で1日1回にする。"""
+    today = get_jst_now().date().isoformat()
+    state_key = f"_dropbox_backup_cleanup_date::{DROPBOX_BACKUP_FOLDER}::{keep}"
+    if st.session_state.get(state_key) == today:
+        return ""
+
+    warning = trim_old_dropbox_backups(access_token, keep=keep)
+    # 整理に失敗しても本番保存とバックアップは完了している。再試行は翌日に行う。
+    st.session_state[state_key] = today
+    return warning
+
+
+def log_customer_excel_save_timings(timings):
+    """画面は変えず、StreamlitのRuntime logsへ保存処理時間を記録する。"""
+    order = (
+        "download_excel",
+        "create_backup",
+        "edit_and_validate_excel",
+        "upload_excel",
+        "verify_upload",
+        "refresh_display_cache",
+        "cleanup_backups",
+        "total",
+    )
+    parts = [
+        f"{name}={timings[name]:.3f}s"
+        for name in order
+        if name in timings
+    ]
+    print("[CUSTOMER_EXCEL_SAVE_TIMING] " + " ".join(parts), flush=True)
 
 
 def normalize_match_value(value):
@@ -1597,33 +1671,43 @@ def update_workbook_bytes(original_content, customer_name, product_name, propose
 
 def save_customer_excel_changes(customer_name, product_name, proposed):
     """Fast save path with backup, local validation, rev conflict protection, and hash verification."""
+    timings = {}
+    total_started = time.perf_counter()
+
+    stage_started = time.perf_counter()
     access_token = get_dropbox_access_token()
     target_path = get_dropbox_file_path()
     original_content, download_response = download_dropbox_file(target_path, access_token)
+    timings["download_excel"] = time.perf_counter() - stage_started
     if original_content is None:
-        raise RuntimeError("\u6700\u65b0\u306eExcel\u3092\u53d6\u5f97\u3067\u304d\u307e\u305b\u3093\u3067\u3057\u305f\u3002\n" + dropbox_error_text(download_response))
+        raise RuntimeError("最新のExcelを取得できませんでした。\n" + dropbox_error_text(download_response))
     revision = get_download_revision(download_response)
     if not revision:
-        raise RuntimeError("Dropbox\u306erev\u3092\u53d6\u5f97\u3067\u304d\u306a\u3044\u305f\u3081\u3001\u5b89\u5168\u306e\u305f\u3081\u66f4\u65b0\u3092\u4e2d\u6b62\u3057\u307e\u3057\u305f\u3002")
+        raise RuntimeError("Dropboxのrevを取得できないため、安全のため更新を中止しました。")
 
     timestamp = get_jst_now().strftime("%Y%m%d_%H%M%S_%f")
-    backup_path = f"{DROPBOX_BACKUP_FOLDER}/\u914d\u8eca\u4e88\u5b9a \u6b21\u90ce_{timestamp}.xlsm"
+    backup_path = f"{DROPBOX_BACKUP_FOLDER}/配車予定 次郎_{timestamp}.xlsm"
 
-    # Dropbox-internal copy avoids uploading the same 1.8 MB file a second time.
-    # The copied backup is hash-checked before the production file is touched.
+    # 保存前バックアップは従来どおり毎回必須。確認済みフォルダだけ再照会を省略する。
+    stage_started = time.perf_counter()
     create_dropbox_backup(
         target_path,
         backup_path,
         original_content,
         access_token,
     )
+    timings["create_backup"] = time.perf_counter() - stage_started
 
+    stage_started = time.perf_counter()
     saved_content, changed_cells = update_workbook_bytes(
         original_content,
         customer_name,
         product_name,
         proposed,
     )
+    timings["edit_and_validate_excel"] = time.perf_counter() - stage_started
+
+    stage_started = time.perf_counter()
     upload_response = upload_dropbox_file(
         target_path,
         saved_content,
@@ -1631,13 +1715,14 @@ def save_customer_excel_changes(customer_name, product_name, proposed):
         mode="update",
         rev=revision,
     )
+    timings["upload_excel"] = time.perf_counter() - stage_started
     if upload_response.status_code == 409:
-        raise RuntimeError("PC\u307e\u305f\u306f\u5225\u7aef\u672b\u3067Excel\u304c\u66f4\u65b0\u3055\u308c\u3066\u3044\u307e\u3059\u3002\u518d\u8aad\u307f\u8fbc\u307f\u3057\u3066\u304b\u3089\u3084\u308a\u76f4\u3057\u3066\u304f\u3060\u3055\u3044")
+        raise RuntimeError("PCまたは別端末でExcelが更新されています。再読み込みしてからやり直してください")
     if upload_response.status_code != 200:
-        raise RuntimeError("\u672c\u756aExcel\u3092\u66f4\u65b0\u3067\u304d\u307e\u305b\u3093\u3067\u3057\u305f\u3002\u5fc5\u8981\u306aDropbox\u6a29\u9650\u306f files.content.write \u3067\u3059\u3002\n" + dropbox_error_text(upload_response))
+        raise RuntimeError("本番Excelを更新できませんでした。必要なDropbox権限は files.content.write です。\n" + dropbox_error_text(upload_response))
 
-    # The upload response contains size, rev, and content_hash. Verifying those
-    # guarantees the bytes without downloading the full workbook again.
+    # Dropboxのサイズ・rev・content_hashによる確認は従来どおり維持する。
+    stage_started = time.perf_counter()
     upload_metadata = get_dropbox_response_metadata(upload_response)
     if not upload_metadata.get("content_hash") or upload_metadata.get("size") is None:
         upload_metadata = get_dropbox_file_metadata(target_path, access_token)
@@ -1646,18 +1731,26 @@ def save_customer_excel_changes(customer_name, product_name, proposed):
         saved_content,
         previous_revision=revision,
     )
+    timings["verify_upload"] = time.perf_counter() - stage_started
 
-    # Use the already verified local bytes to rebuild the immediate-display JSON.
+    # 保存後のExcel全体解析は、安全性とExcel表示との一致を優先して残す。
+    stage_started = time.perf_counter()
     cache_warning = refresh_fast_dropbox_cache_after_save(
         saved_content,
         confirmed_revision,
         access_token,
     )
+    timings["refresh_display_cache"] = time.perf_counter() - stage_started
 
-    # Keep the existing exact rule: retain the newest 30 backups.
-    cleanup_warning = trim_old_dropbox_backups(access_token, keep=30)
+    # バックアップ自体は毎回作成し、30件への整理だけを1日1回にする。
+    stage_started = time.perf_counter()
+    cleanup_warning = trim_old_dropbox_backups_if_due(access_token, keep=30)
+    timings["cleanup_backups"] = time.perf_counter() - stage_started
+
     warnings = [warning for warning in (cleanup_warning, cache_warning) if warning]
     st.cache_data.clear()
+    timings["total"] = time.perf_counter() - total_started
+    log_customer_excel_save_timings(timings)
     return {
         "backup_path": backup_path,
         "updated_at": get_jst_now(),
@@ -1757,7 +1850,7 @@ def save_customer_map_changes(customer_name, address, map_location):
     if not revision:
         raise RuntimeError("Dropboxのrevを取得できないため、安全のため更新を中止しました。")
 
-    ensure_dropbox_backup_folder(access_token)
+    ensure_dropbox_backup_folder_cached(access_token)
     timestamp = get_jst_now().strftime("%Y%m%d_%H%M%S_%f")
     backup_path = f"{DROPBOX_BACKUP_FOLDER}/配車予定 次郎_{timestamp}.xlsm"
     backup_response = upload_dropbox_file(
@@ -1766,6 +1859,15 @@ def save_customer_map_changes(customer_name, address, map_location):
         access_token,
         mode="add",
     )
+    if backup_response.status_code != 200 and dropbox_response_indicates_missing_path(backup_response):
+        st.session_state.pop(get_dropbox_backup_folder_cache_key(), None)
+        ensure_dropbox_backup_folder_cached(access_token, force=True)
+        backup_response = upload_dropbox_file(
+            backup_path,
+            original_content,
+            access_token,
+            mode="add",
+        )
     if backup_response.status_code != 200:
         raise RuntimeError(
             "バックアップを作成できないため、本番ファイルは更新しません。\n"
@@ -1798,7 +1900,7 @@ def save_customer_map_changes(customer_name, address, map_location):
     # Dropbox上のファイルを読み直し、住所・地図が正しいセルへ入ったことを確認する。
     confirm_dropbox_upload(target_path, access_token, changed_cells)
 
-    cleanup_warning = trim_old_dropbox_backups(access_token, keep=30)
+    cleanup_warning = trim_old_dropbox_backups_if_due(access_token, keep=30)
     st.cache_data.clear()
     return {
         "backup_path": backup_path,
