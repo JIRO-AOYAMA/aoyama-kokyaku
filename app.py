@@ -6824,8 +6824,10 @@ XLSX_REL_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationshi
 XLSX_PACKAGE_REL_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
 XLSX_XML_NS = "http://www.w3.org/XML/1998/namespace"
 
-# Excelの拡張データ検証やリビジョン情報を壊さないよう、元と同じ名前空間接頭辞を保つ。
-for _prefix, _namespace in {
+# ElementTreeは、要素名・属性名で直接使われていない名前空間宣言を
+# 再シリアライズ時に省略する。Excelはmc:Ignorableに記載された接頭辞の
+# xmlns宣言が欠けるとワークシートを破損扱いにするため、宣言一覧を明示的に保持する。
+XLSX_NAMESPACE_DECLARATIONS = {
     "": XLSX_MAIN_NS,
     "r": XLSX_REL_NS,
     "mc": "http://schemas.openxmlformats.org/markup-compatibility/2006",
@@ -6835,7 +6837,10 @@ for _prefix, _namespace in {
     "xr3": "http://schemas.microsoft.com/office/spreadsheetml/2016/revision3",
     "x14": "http://schemas.microsoft.com/office/spreadsheetml/2009/9/main",
     "xm": "http://schemas.microsoft.com/office/excel/2006/main",
-}.items():
+}
+
+# Excelの拡張データ検証やリビジョン情報を壊さないよう、元と同じ名前空間接頭辞を保つ。
+for _prefix, _namespace in XLSX_NAMESPACE_DECLARATIONS.items():
     try:
         ET.register_namespace(_prefix, _namespace)
     except Exception:
@@ -6865,6 +6870,93 @@ def xlsx_column_number(cell_reference):
     return result
 
 
+def extract_worksheet_namespace_declarations(xml_content):
+    """worksheetルートにあるxmlns宣言を接頭辞別に取り出す。"""
+    try:
+        text = xml_content.decode("utf-8")
+    except Exception:
+        return {}
+    root_match = re.search(r"<worksheet\b[^>]*>", text, re.DOTALL)
+    if not root_match:
+        return {}
+    declarations = {}
+    for prefix, uri in re.findall(
+        r"\bxmlns(?::([A-Za-z_][\w.-]*))?=[\"']([^\"']+)[\"']",
+        root_match.group(0),
+    ):
+        declarations[prefix or ""] = uri
+    return declarations
+
+
+def ensure_worksheet_namespace_declarations(xml_content, original_declarations=None):
+    """
+    元のxmlns宣言とmc:Ignorableが要求する宣言をworksheetへ戻す。
+
+    ElementTreeはmc:Ignorableの値にだけ登場するx14ac/xr2/xr3などを
+    未使用と判断して削るため、Excelで開く前に必ず宣言を復元する。
+    """
+    try:
+        text = xml_content.decode("utf-8")
+    except Exception as error:
+        raise ValueError("ワークシートXMLをUTF-8として確認できません。") from error
+
+    root_match = re.search(r"<worksheet\b[^>]*>", text, re.DOTALL)
+    if not root_match:
+        raise ValueError("ワークシートXMLのルート要素を確認できません。")
+
+    root_tag = root_match.group(0)
+    required = dict(original_declarations or {})
+    ignorable_match = re.search(
+        r"\bmc:Ignorable=[\"']([^\"']*)[\"']",
+        root_tag,
+    )
+    if ignorable_match:
+        for prefix in ignorable_match.group(1).split():
+            uri = XLSX_NAMESPACE_DECLARATIONS.get(prefix)
+            if uri:
+                required.setdefault(prefix, uri)
+
+    additions = []
+    for prefix, uri in required.items():
+        attribute_name = "xmlns" if not prefix else f"xmlns:{prefix}"
+        if re.search(
+            rf"\b{re.escape(attribute_name)}=[\"']",
+            root_tag,
+        ):
+            continue
+        additions.append(f' {attribute_name}="{uri}"')
+
+    if additions:
+        root_tag = root_tag[:-1] + "".join(additions) + ">"
+        text = text[:root_match.start()] + root_tag + text[root_match.end():]
+
+    return text.encode("utf-8")
+
+
+def missing_worksheet_ignorable_namespaces(xml_content):
+    """mc:Ignorableにあるのにxmlns宣言がない接頭辞を返す。"""
+    try:
+        text = xml_content.decode("utf-8")
+    except Exception:
+        return ["XMLをUTF-8として読めません"]
+    root_match = re.search(r"<worksheet\b[^>]*>", text, re.DOTALL)
+    if not root_match:
+        return ["worksheetルートがありません"]
+    root_tag = root_match.group(0)
+    ignorable_match = re.search(
+        r"\bmc:Ignorable=[\"']([^\"']*)[\"']",
+        root_tag,
+    )
+    if not ignorable_match:
+        return []
+    declared = extract_worksheet_namespace_declarations(xml_content)
+    return [
+        prefix
+        for prefix in ignorable_match.group(1).split()
+        if prefix not in declared
+    ]
+
+
 class TradePartnerXlsxEditor:
     """セル値だけをXMLで差し替え、入力規則・書式・数式をそのまま保持する。"""
 
@@ -6878,6 +6970,11 @@ class TradePartnerXlsxEditor:
 
         self.shared_strings = self._read_shared_strings()
         self.sheet_paths = self._read_sheet_paths()
+        self.sheet_namespace_declarations = {
+            path: extract_worksheet_namespace_declarations(self.parts[path])
+            for path in self.sheet_paths.values()
+            if path in self.parts
+        }
         self.sheet_roots = {}
         self.changed_sheet_names = set()
 
@@ -7090,14 +7187,46 @@ class TradePartnerXlsxEditor:
             rows.append(row)
         return {"headers": headers, "rows": rows}
 
+    def validate_worksheet_namespaces(self):
+        problems = []
+        for sheet_name, path in self.sheet_paths.items():
+            if path not in self.parts:
+                problems.append(f"{sheet_name}: XMLがありません")
+                continue
+            missing = missing_worksheet_ignorable_namespaces(self.parts[path])
+            if missing:
+                problems.append(f"{sheet_name}: " + "、".join(missing))
+        if problems:
+            raise ValueError(
+                "Excel互換性の確認で名前空間宣言が不足しています。保存を中止しました。\n"
+                + "\n".join(problems)
+            )
+
     def to_bytes(self):
         for sheet_name in self.changed_sheet_names:
             path = self.sheet_paths[sheet_name]
-            self.parts[path] = ET.tostring(
+            serialized = ET.tostring(
                 self.get_sheet_root(sheet_name),
                 encoding="utf-8",
                 xml_declaration=True,
             )
+            self.parts[path] = ensure_worksheet_namespace_declarations(
+                serialized,
+                self.sheet_namespace_declarations.get(path),
+            )
+
+        # 以前のアプリ保存で名前空間宣言が欠けたファイルも、次の保存時に
+        # 全ワークシートを安全な状態へ戻す。セル値や書式・数式は変更しない。
+        for path in set(self.sheet_paths.values()):
+            if path not in self.parts:
+                continue
+            self.parts[path] = ensure_worksheet_namespace_declarations(
+                self.parts[path],
+                self.sheet_namespace_declarations.get(path),
+            )
+
+        self.validate_worksheet_namespaces()
+
         output = BytesIO()
         with zipfile.ZipFile(output, "w") as archive:
             for info in self.original_infos:
