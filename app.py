@@ -8125,7 +8125,7 @@ def show_trade_partner_detail(partner_type, partner_id):
         return
     label = trade_partner_type_label(partner_type)
     company = trade_partner_text(master.get("会社名"))
-    st.header(f"{'🏢' if partner_type == 'supplier' else '🚚'} {company}")
+    st.title(f"{'🏢' if partner_type == 'supplier' else '🚚'} {company}")
     st.caption(f"{label}ID：{trade_partner_text(master.get('取引先ID'))}")
 
     map_value = trade_partner_text(master.get("マップ位置")) or trade_partner_text(master.get("住所"))
@@ -8139,7 +8139,7 @@ def show_trade_partner_detail(partner_type, partner_id):
     render_trade_partner_fields(
         master,
         master_headers,
-        excluded={"取引先ID", "仕入先区分", "運送会社区分", "会社名"},
+        excluded={"取引先ID", "仕入先区分", "運送会社区分", "会社名", "会社名かな"},
     )
     render_trade_partner_row_editor(
         TRADE_PARTNER_MASTER_SHEET,
