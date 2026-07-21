@@ -7,6 +7,7 @@ import math
 import posixpath
 import re
 import urllib.parse
+import unicodedata
 import uuid
 import zipfile
 from datetime import date, datetime, timedelta, timezone
@@ -3829,6 +3830,9 @@ def show_customer_detail(df, customer_name):
     customer_key = get_stable_customer_key(detail)
     render_customer_information_card(customer_name, customer_key)
 
+    # WATER itのポイント名と顧客名が一致する場合だけ、最新値を読み取り専用で表示する。
+    render_customer_water_it_card(customer_name)
+
     if visible_detail.empty:
         st.info("表示対象の商品はありません。使用数量/日が0または空白の商品は非表示にしています。")
 
@@ -6922,6 +6926,92 @@ def get_water_it_latest_rows(dataframe):
     )
 
 
+def normalize_water_it_customer_key(value):
+    """WATER itのポイント名と顧客名を安全に照合するための最小正規化。
+
+    表記ゆれを広く吸収すると別顧客を誤って結び付ける可能性があるため、
+    Unicode正規化と空白除去だけを行う。
+    """
+    text = clean_value(value, blank_text="").strip()
+    text = unicodedata.normalize("NFKC", text)
+    text = re.sub(r"[\s\u3000]+", "", text)
+    return text.casefold()
+
+
+def get_water_it_customer_rows(dataframe, customer_name):
+    """顧客名と同名のWATER itポイントだけを返す（読み取り専用）。"""
+    if dataframe is None or dataframe.empty:
+        return dataframe.iloc[0:0].copy() if dataframe is not None else pd.DataFrame()
+    target = normalize_water_it_customer_key(customer_name)
+    if not target:
+        return dataframe.iloc[0:0].copy()
+    point_keys = dataframe["ポイント"].map(normalize_water_it_customer_key)
+    return dataframe[point_keys == target].copy()
+
+
+def render_customer_water_it_card(customer_name):
+    """顧客詳細にWATER itの最新値を読み取り専用で表示する。
+
+    ポイント名と顧客名が一致しない顧客には何も表示しない。
+    ExcelやWATER itへの書き込み処理は行わない。
+    """
+    try:
+        dataframe, source = load_water_it_data()
+    except Exception:
+        # WATER it側が一時的に読めなくても、既存の顧客詳細は通常どおり表示する。
+        return
+
+    customer_rows = get_water_it_customer_rows(dataframe, customer_name)
+    if customer_rows.empty:
+        return
+
+    latest_rows = get_water_it_latest_rows(customer_rows)
+    if latest_rows.empty:
+        return
+
+    newest = latest_rows["測定日時_解析"].max()
+    point_names = latest_rows["ポイント"].drop_duplicates().tolist()
+    areas = [
+        clean_value(value, blank_text="")
+        for value in latest_rows["エリア"].drop_duplicates().tolist()
+        if clean_value(value, blank_text="")
+    ]
+
+    st.markdown("---")
+    with st.container(border=True):
+        st.subheader("💧 WATER it タンク情報")
+        st.caption(
+            "読み取り専用表示です。ここからExcelやWATER itへの書き込みは行いません。"
+        )
+        st.caption(
+            f"ポイント：{' / '.join(point_names)}"
+            + (f"　｜　エリア：{' / '.join(areas)}" if areas else "")
+            + f"　｜　最終受信：{newest.strftime('%Y/%m/%d %H:%M')}"
+        )
+
+        rows = list(latest_rows.iterrows())
+        for start in range(0, len(rows), 3):
+            group = rows[start:start + 3]
+            columns = st.columns(len(group))
+            for display_column, (_, row) in zip(columns, group):
+                with display_column:
+                    label = clean_value(row.get("測定項目"))
+                    value = format_water_it_value(row.get("測定値_数値"))
+                    unit = normalize_water_it_unit(row.get("単位_表示"))
+                    st.metric(label, f"{value} {unit}".strip())
+                    st.caption(row["測定日時_解析"].strftime("%m/%d %H:%M"))
+
+        alert_messages = []
+        for _, row in latest_rows.iterrows():
+            item_name = clean_value(row.get("測定項目"))
+            for alert in get_water_it_alerts(row):
+                alert_messages.append(f"{item_name}｜{alert}")
+        if alert_messages:
+            st.warning(" / ".join(alert_messages))
+        else:
+            st.caption(f"状態：異常表示なし　｜　参照：{source}")
+
+
 def format_water_it_value(value):
     if value is None or pd.isna(value):
         return "未設定"
@@ -7037,7 +7127,7 @@ def show_water_it_test_page():
     st.header("💧 WATER it接続テスト")
     show_back_home_button("water_it_back_home")
     st.caption(
-        "WATER itのdata.csvを読み取り専用で表示します。このテスト画面からExcelへの書き込みは行いません。"
+        "WATER itのdata.csvを読み取り専用で表示します。ポイント名と顧客名が一致する場合は、顧客詳細にも最新値を表示します。Excelへの書き込みは行いません。"
     )
 
     if st.button("🔄 WATER itデータを再読込", key="water_it_reload"):
