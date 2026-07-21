@@ -7058,6 +7058,41 @@ def water_it_script_diagnostics(session, base_url, parser):
     return details
 
 
+def water_it_inline_script_diagnostics(base_url, parser):
+    """ログイン画面内のJavaScriptから、秘密情報を含まない構造情報だけを返す。"""
+    keyword_pattern = re.compile(
+        r"login|signin|password|passwd|user|account|ajax|fetch|post|wia0101|index0|location|click",
+        flags=re.IGNORECASE,
+    )
+    quoted_pattern = re.compile(r"[\"']([^\"']{1,240})[\"']")
+    result = []
+    for index, parts in enumerate(parser.scripts[:20], start=1):
+        script_text = "".join(parts or [])
+        if not script_text.strip():
+            continue
+        relevant_lines = []
+        for raw_line in script_text.splitlines():
+            line = re.sub(r"\s+", " ", raw_line).strip()
+            if line and keyword_pattern.search(line):
+                relevant_lines.append(line[:500])
+        url_candidates = []
+        for match in quoted_pattern.finditer(script_text):
+            candidate = match.group(1).strip()
+            if not candidate or not keyword_pattern.search(candidate):
+                continue
+            if candidate.startswith(("/", "http://", "https://")) or "wia" in candidate.casefold():
+                url_candidates.append(
+                    water_it_safe_url(urllib.parse.urljoin(base_url, candidate))
+                )
+        if relevant_lines or url_candidates:
+            result.append({
+                "script番号": index,
+                "関連行": relevant_lines[:30],
+                "URL候補": list(dict.fromkeys(url_candidates))[:20],
+            })
+    return result
+
+
 def water_it_get_login_document(session, diagnostics):
     """JavaScript遷移やframeを追い、実際のログイン入力画面を探す。"""
     next_url = WATER_IT_LOGIN_URL
@@ -7462,7 +7497,27 @@ def download_water_it_csv_direct():
             WATER_IT_LOGIN_PASSWORD,
         )
     except WaterItConnectionError as exc:
-        diagnostics.append({"ログインフォーム項目": water_it_field_summary(login_form)})
+        diagnostics.append({
+            "段階": "ログイン送信構造の追加診断",
+            "入力欄": water_it_safe_control_summary(login_parser),
+            "ボタン": water_it_safe_button_summary(login_parser),
+            "通常フォーム項目": water_it_field_summary(login_form),
+            "script_src": [
+                water_it_safe_url(urllib.parse.urljoin(login_page.url, value))
+                for value in login_parser.script_sources[:20]
+            ],
+            "インラインJavaScript": water_it_inline_script_diagnostics(
+                login_page.url, login_parser
+            ),
+        })
+        script_details = water_it_script_diagnostics(
+            session, login_page.url, login_parser
+        )
+        if script_details:
+            diagnostics.append({
+                "段階": "外部JavaScript診断",
+                "scripts": script_details,
+            })
         exc.diagnostics = diagnostics + list(getattr(exc, "diagnostics", []))
         raise
 
@@ -7900,7 +7955,7 @@ def show_water_it_diagnostics(diagnostics):
 
 def show_water_it_test_page():
     st.markdown("---")
-    st.header("💧 WATER it直接接続テスト 第2段階")
+    st.header("💧 WATER it直接接続テスト 第3段階")
     show_back_home_button("water_it_back_home")
     st.caption(
         "WATER itへ直接ログインし、ダウンロードした最新CSVを読み取り専用で表示します。GitHubのdata.csvやDropboxは使いません。ExcelおよびWATER itへの登録・変更・削除は行いません。"
