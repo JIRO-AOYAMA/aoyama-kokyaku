@@ -1177,6 +1177,21 @@ def find_header_column_in_worksheet(ws, candidates, max_rows=50):
     return None
 
 
+def find_product_rows_by_usage(ws, customer_name, product_name):
+    """同一顧客・同一商品の行を、使用中行と過去行に分けて返す。"""
+    matched_rows = [
+        row for row in range(1, ws.max_row + 1)
+        if normalize_match_value(ws.cell(row, 2).value) == customer_name
+        and normalize_match_value(ws.cell(row, 5).value) == product_name
+    ]
+    active_rows = [
+        row for row in matched_rows
+        if not is_blank_or_zero(ws.cell(row, 7).value)
+    ]
+    inactive_rows = [row for row in matched_rows if row not in active_rows]
+    return matched_rows, active_rows, inactive_rows
+
+
 @st.cache_data(ttl=60, show_spinner=False)
 def read_edit_values_from_bytes(content, customer_name, product_name):
     """最新ブックから編集欄の現在値を取得する。"""
@@ -1185,14 +1200,12 @@ def read_edit_values_from_bytes(content, customer_name, product_name):
         if DELIVERY_SHEET_NAME not in workbook.sheetnames or SHEET_NAME not in workbook.sheetnames:
             raise ValueError("必要なシート（次回配達日 または Sheet1）が見つかりません。")
         delivery_ws = workbook[DELIVERY_SHEET_NAME]
-        matches = [
-            row for row in range(1, delivery_ws.max_row + 1)
-            if normalize_match_value(delivery_ws.cell(row, 2).value) == customer_name
-            and normalize_match_value(delivery_ws.cell(row, 5).value) == product_name
-        ]
+        matches, active_rows, _ = find_product_rows_by_usage(
+            delivery_ws, customer_name, product_name
+        )
         product_values = {}
-        if len(matches) == 1:
-            row = matches[0]
+        if len(active_rows) == 1:
+            row = active_rows[0]
             product_values = {
                 "メーカー": delivery_ws.cell(row, 6).value,
                 "本数": delivery_ws.cell(row, 8).value,
@@ -1207,7 +1220,8 @@ def read_edit_values_from_bytes(content, customer_name, product_name):
             **product_values,
             "住所": customer_ws.cell(first_row, SHEET1_ADDRESS_COLUMN).value if first_row else None,
             "マップ位置": customer_ws.cell(first_row, SHEET1_MAP_COLUMN).value if first_row else None,
-            "商品一致件数": len(matches),
+            "商品一致件数": len(active_rows),
+            "商品全行件数": len(matches),
             "顧客一致件数": len(customer_rows),
         }
     finally:
@@ -1234,13 +1248,18 @@ def read_customer_edit_bundle_from_bytes(content, customer_name):
 
         products = {}
         for product, rows in product_rows.items():
-            first_row = rows[0]
+            active_rows = [
+                row for row in rows
+                if not is_blank_or_zero(delivery_ws.cell(row, 7).value)
+            ]
+            selected_row = active_rows[0] if len(active_rows) == 1 else None
             products[product] = {
-                "メーカー": delivery_ws.cell(first_row, 6).value,
-                "本数": delivery_ws.cell(first_row, 8).value,
-                "kg/本": delivery_ws.cell(first_row, 9).value,
-                "配達日": delivery_ws.cell(first_row, 10).value,
-                "商品一致件数": len(rows),
+                "メーカー": delivery_ws.cell(selected_row, 6).value if selected_row else None,
+                "本数": delivery_ws.cell(selected_row, 8).value if selected_row else None,
+                "kg/本": delivery_ws.cell(selected_row, 9).value if selected_row else None,
+                "配達日": delivery_ws.cell(selected_row, 10).value if selected_row else None,
+                "商品一致件数": len(active_rows),
+                "商品全行件数": len(rows),
             }
 
         customer_rows = find_sheet1_customer_rows(workbook, customer_name)
@@ -1347,17 +1366,17 @@ def update_workbook_bytes(original_content, customer_name, product_name, propose
         if DELIVERY_SHEET_NAME not in workbook.sheetnames or SHEET_NAME not in workbook.sheetnames:
             raise ValueError("必要なシート（次回配達日 または Sheet1）が見つかりません。")
         delivery_ws = workbook[DELIVERY_SHEET_NAME]
-        product_rows = [
-            row for row in range(1, delivery_ws.max_row + 1)
-            if normalize_match_value(delivery_ws.cell(row, 2).value) == customer_name
-            and normalize_match_value(delivery_ws.cell(row, 5).value) == product_name
-        ]
+        product_rows, active_rows, _ = find_product_rows_by_usage(
+            delivery_ws, customer_name, product_name
+        )
         if not product_rows:
             raise ValueError("顧客名・商品名が一致する行が見つかりません。")
-        if len(product_rows) > 1:
-            raise ValueError("同じ顧客名・商品名の行が複数見つかりました。")
+        if len(active_rows) > 1:
+            raise ValueError("同じ顧客名・商品名の行が複数見つかりました。確認してください。")
+        if not active_rows:
+            raise ValueError("使用数量/日に値が入っている行が見つからないため編集できません。")
 
-        product_row = product_rows[0]
+        product_row = active_rows[0]
         for label, column in {"メーカー": 6, "本数": 8, "kg/本": 9, "配達日": 10}.items():
             cell = delivery_ws.cell(product_row, column)
             new_value = proposed[label]
@@ -3139,7 +3158,7 @@ def render_customer_excel_editor(customer_name, product_name, current):
         st.error("顧客名・商品名が一致する行が見つからないため編集できません。")
         return
     if current.get("商品一致件数", 0) > 1:
-        st.error("同じ顧客名・商品名の行が複数見つかりました")
+        st.error("同じ顧客名・商品名の行が複数見つかりました。確認してください。")
         return
 
     st.caption("メーカー")
@@ -3479,7 +3498,18 @@ def show_customer_detail(df, customer_name):
     if visible_detail.empty:
         st.info("表示対象の商品はありません。使用数量/日が0または空白の商品は非表示にしています。")
 
-    for _, row in visible_detail.iterrows():
+    # 同じ商品に使用中行が複数あっても、商品カードは1つだけ表示する。
+    # 複数の使用中行がある場合はカード内で警告し、編集を停止する。
+    visible_products = []
+    seen_products = set()
+    for _, candidate_row in visible_detail.iterrows():
+        candidate_product = clean_value(candidate_row["商品名"], blank_text="").strip()
+        if not candidate_product or candidate_product in seen_products:
+            continue
+        seen_products.add(candidate_product)
+        visible_products.append(candidate_row)
+
+    for row in visible_products:
         product_name = clean_value(row["商品名"])
         customer_id = clean_value(row["ID"])
         usage = format_number(row["使用数量/日"])
@@ -3505,7 +3535,12 @@ def show_customer_detail(df, customer_name):
                 st.caption("残数")
                 st.markdown(f"**{remaining}**")
 
-            product_match_count = int((detail["商品名"].astype(str).str.strip() == product_name).sum())
+            product_match_count = int(
+                (
+                    (detail["商品名"].astype(str).str.strip() == product_name)
+                    & (~detail["使用数量/日"].apply(is_blank_or_zero))
+                ).sum()
+            )
             current_edit_values = {
                 "メーカー": row.get("メーカー"),
                 "本数": row.get("本数"),
