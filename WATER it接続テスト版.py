@@ -6974,7 +6974,7 @@ def water_it_safe_button_summary(parser):
             "name": str(attrs.get("name", "")),
             "id": str(attrs.get("id", "")),
             "class": str(attrs.get("class", ""))[:120],
-            "text": re.sub(r"\\s+", " ", " ".join(button.get("text", []))).strip()[:120],
+            "text": re.sub(r"\s+", " ", " ".join(button.get("text", []))).strip()[:120],
             "onclick": str(attrs.get("onclick", ""))[:200],
         })
     return result
@@ -6992,13 +6992,13 @@ def water_it_client_page_targets(base_url, parser, html_text):
         if str(meta.get("http-equiv", "")).casefold() != "refresh":
             continue
         content = str(meta.get("content", ""))
-        match = re.search(r"url\\s*=\\s*['\\\"]?([^'\\\";]+)", content, flags=re.IGNORECASE)
+        match = re.search(r"url\s*=\s*['\"]?([^'\";]+)", content, flags=re.IGNORECASE)
         if match:
             candidates.append(("meta refresh", urllib.parse.urljoin(base_url, match.group(1).strip())))
 
     patterns = (
-        r"(?:window\\.)?location(?:\\.href)?\\s*=\\s*['\\\"]([^'\\\"]+)['\\\"]",
-        r"(?:window\\.)?location\\.(?:replace|assign)\\(\\s*['\\\"]([^'\\\"]+)['\\\"]",
+        r"(?:window\.)?location(?:\.href)?\s*=\s*['\"]([^'\"]+)['\"]",
+        r"(?:window\.)?location\.(?:replace|assign)\(\s*['\"]([^'\"]+)['\"]",
     )
     for pattern in patterns:
         for match in re.finditer(pattern, html_text or "", flags=re.IGNORECASE):
@@ -7043,7 +7043,7 @@ def water_it_script_diagnostics(session, base_url, parser):
             })
             script_text = water_it_response_text(response)
             url_candidates = []
-            for match in re.finditer(r"['\\\"]([^'\\\"]{1,240})['\\\"]", script_text):
+            for match in re.finditer(r"['\"]([^'\"]{1,240})['\"]", script_text):
                 candidate = match.group(1).strip()
                 lowered = candidate.casefold()
                 if not any(token in lowered for token in ("login", "auth", "signin", "wia0101", "index")):
@@ -7099,7 +7099,7 @@ def water_it_get_login_document(session, diagnostics):
             "url": water_it_safe_url(response.url),
             "content_type": str(response.headers.get("Content-Type", "")),
             "bytes": len(response.content),
-            "title": re.sub(r"\\s+", " ", " ".join(parser.title)).strip()[:120],
+            "title": re.sub(r"\s+", " ", " ".join(parser.title)).strip()[:120],
             "form数": len(parser.forms),
             "入力欄数": len(parser.fields),
             "password欄数": len(password_fields),
