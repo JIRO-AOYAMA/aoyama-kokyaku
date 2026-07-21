@@ -1060,6 +1060,82 @@ def call_dropbox_rpc(endpoint, payload, access_token):
         raise RuntimeError(f"Dropbox APIへの接続に失敗しました: {exc}") from exc
 
 
+def get_dropbox_response_metadata(response):
+    """Return FileMetadata from an upload/copy response."""
+    try:
+        payload = response.json()
+    except Exception:
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    metadata = payload.get("metadata")
+    return metadata if isinstance(metadata, dict) else payload
+
+
+def calculate_dropbox_content_hash(content):
+    """Calculate Dropbox content_hash without downloading the remote file again."""
+    block_size = 4 * 1024 * 1024
+    combined = hashlib.sha256()
+    for offset in range(0, len(content), block_size):
+        combined.update(hashlib.sha256(content[offset:offset + block_size]).digest())
+    return combined.hexdigest()
+
+
+def verify_dropbox_file_metadata(metadata, expected_content, previous_revision=""):
+    """Verify size, content hash, and revision from Dropbox FileMetadata."""
+    if not isinstance(metadata, dict):
+        raise RuntimeError("Dropbox\u306e\u4fdd\u5b58\u7d50\u679c\u3092\u78ba\u8a8d\u3067\u304d\u307e\u305b\u3093\u3067\u3057\u305f\u3002")
+
+    expected_size = len(expected_content)
+    expected_hash = calculate_dropbox_content_hash(expected_content)
+    remote_size = metadata.get("size")
+    remote_hash = str(metadata.get("content_hash") or "")
+    remote_revision = str(metadata.get("rev") or "")
+
+    try:
+        size_matches = int(remote_size) == expected_size
+    except Exception:
+        size_matches = False
+    if not size_matches:
+        raise RuntimeError("Dropbox\u4fdd\u5b58\u5f8c\u306e\u30d5\u30a1\u30a4\u30eb\u30b5\u30a4\u30ba\u304c\u4e00\u81f4\u3057\u307e\u305b\u3093\u3002")
+    if not remote_hash or remote_hash != expected_hash:
+        raise RuntimeError("Dropbox\u4fdd\u5b58\u5f8c\u306e\u30d5\u30a1\u30a4\u30eb\u5185\u5bb9\u304c\u4e00\u81f4\u3057\u307e\u305b\u3093\u3002")
+    if not remote_revision:
+        raise RuntimeError("Dropbox\u4fdd\u5b58\u5f8c\u306erev\u3092\u78ba\u8a8d\u3067\u304d\u307e\u305b\u3093\u3002")
+    if previous_revision and remote_revision == previous_revision:
+        raise RuntimeError("Dropbox\u306e\u66f4\u65b0\u756a\u53f7\u304c\u5909\u308f\u3063\u3066\u3044\u306a\u3044\u305f\u3081\u3001\u4fdd\u5b58\u3092\u5b8c\u4e86\u3067\u304d\u307e\u305b\u3093\u3002")
+    return remote_revision
+
+
+def get_dropbox_file_metadata(path, access_token):
+    """Fetch only metadata; this does not download the Excel bytes."""
+    response = call_dropbox_rpc("files/get_metadata", {"path": path}, access_token)
+    if response.status_code != 200:
+        raise RuntimeError(
+            "Dropbox\u306e\u30d5\u30a1\u30a4\u30eb\u60c5\u5831\u3092\u53d6\u5f97\u3067\u304d\u307e\u305b\u3093\u3067\u3057\u305f\u3002\n"
+            + dropbox_error_text(response)
+        )
+    metadata = get_dropbox_response_metadata(response)
+    if not metadata:
+        raise RuntimeError("Dropbox\u306e\u30d5\u30a1\u30a4\u30eb\u60c5\u5831\u3092\u8aad\u307f\u53d6\u308c\u307e\u305b\u3093\u3067\u3057\u305f\u3002")
+    return metadata
+
+
+def copy_dropbox_file(from_path, to_path, access_token):
+    """Create a server-side Dropbox copy without re-uploading the Excel bytes."""
+    return call_dropbox_rpc(
+        "files/copy_v2",
+        {
+            "from_path": from_path,
+            "to_path": to_path,
+            "allow_shared_folder": False,
+            "autorename": False,
+            "allow_ownership_transfer": False,
+        },
+        access_token,
+    )
+
+
 def get_dropbox_revision(path, access_token):
     """Dropboxファイルの現在のrevだけを軽量に取得する。"""
     response = call_dropbox_rpc("files/get_metadata", {"path": path}, access_token)
@@ -1090,6 +1166,43 @@ def ensure_dropbox_backup_folder(access_token):
         "Dropboxにバックアップフォルダを作成できませんでした。\n"
         + dropbox_error_text(response)
     )
+
+
+def create_dropbox_backup(target_path, backup_path, original_content, access_token):
+    """Create and verify the pre-save backup, preferring a fast server-side copy."""
+    ensure_dropbox_backup_folder(access_token)
+    copy_response = copy_dropbox_file(target_path, backup_path, access_token)
+
+    if copy_response.status_code == 200:
+        metadata = get_dropbox_response_metadata(copy_response)
+        if not metadata.get("content_hash") or metadata.get("size") is None:
+            metadata = get_dropbox_file_metadata(backup_path, access_token)
+        try:
+            verify_dropbox_file_metadata(metadata, original_content)
+            return
+        except Exception:
+            call_dropbox_rpc("files/delete_v2", {"path": backup_path}, access_token)
+            raise RuntimeError(
+                "PC\u307e\u305f\u306f\u5225\u7aef\u672b\u3067Excel\u304c\u66f4\u65b0\u3055\u308c\u305f\u53ef\u80fd\u6027\u304c\u3042\u308a\u307e\u3059\u3002"
+                "\u518d\u8aad\u307f\u8fbc\u307f\u3057\u3066\u304b\u3089\u3084\u308a\u76f4\u3057\u3066\u304f\u3060\u3055\u3044\u3002"
+            )
+
+    # Fallback keeps the previous behavior if server-side copy is unavailable.
+    backup_response = upload_dropbox_file(
+        backup_path,
+        original_content,
+        access_token,
+        mode="add",
+    )
+    if backup_response.status_code != 200:
+        raise RuntimeError(
+            "\u30d0\u30c3\u30af\u30a2\u30c3\u30d7\u3092\u4f5c\u6210\u3067\u304d\u306a\u3044\u305f\u3081\u3001\u672c\u756a\u30d5\u30a1\u30a4\u30eb\u306f\u66f4\u65b0\u3057\u307e\u305b\u3093\u3002\n"
+            + dropbox_error_text(backup_response)
+        )
+    metadata = get_dropbox_response_metadata(backup_response)
+    if not metadata.get("content_hash") or metadata.get("size") is None:
+        metadata = get_dropbox_file_metadata(backup_path, access_token)
+    verify_dropbox_file_metadata(metadata, original_content)
 
 
 def trim_old_dropbox_backups(access_token, keep=30):
@@ -1478,45 +1591,65 @@ def update_workbook_bytes(original_content, customer_name, product_name, propose
 
 
 def save_customer_excel_changes(customer_name, product_name, proposed):
-    """バックアップ、検証、rev競合防止を含む一連の保存処理。"""
+    """Fast save path with backup, local validation, rev conflict protection, and hash verification."""
     access_token = get_dropbox_access_token()
     target_path = get_dropbox_file_path()
     original_content, download_response = download_dropbox_file(target_path, access_token)
     if original_content is None:
-        raise RuntimeError("最新のExcelを取得できませんでした。\n" + dropbox_error_text(download_response))
+        raise RuntimeError("\u6700\u65b0\u306eExcel\u3092\u53d6\u5f97\u3067\u304d\u307e\u305b\u3093\u3067\u3057\u305f\u3002\n" + dropbox_error_text(download_response))
     revision = get_download_revision(download_response)
     if not revision:
-        raise RuntimeError("Dropboxのrevを取得できないため、安全のため更新を中止しました。")
+        raise RuntimeError("Dropbox\u306erev\u3092\u53d6\u5f97\u3067\u304d\u306a\u3044\u305f\u3081\u3001\u5b89\u5168\u306e\u305f\u3081\u66f4\u65b0\u3092\u4e2d\u6b62\u3057\u307e\u3057\u305f\u3002")
 
-    ensure_dropbox_backup_folder(access_token)
     timestamp = get_jst_now().strftime("%Y%m%d_%H%M%S_%f")
-    backup_path = f"{DROPBOX_BACKUP_FOLDER}/配車予定 次郎_{timestamp}.xlsm"
-    backup_response = upload_dropbox_file(backup_path, original_content, access_token, mode="add")
-    if backup_response.status_code != 200:
-        raise RuntimeError("バックアップを作成できないため、本番ファイルは更新しません。\n" + dropbox_error_text(backup_response))
+    backup_path = f"{DROPBOX_BACKUP_FOLDER}/\u914d\u8eca\u4e88\u5b9a \u6b21\u90ce_{timestamp}.xlsm"
 
-    saved_content, changed_cells = update_workbook_bytes(original_content, customer_name, product_name, proposed)
-    upload_response = upload_dropbox_file(target_path, saved_content, access_token, mode="update", rev=revision)
-    if upload_response.status_code == 409:
-        raise RuntimeError("PCまたは別端末でExcelが更新されています。再読み込みしてからやり直してください")
-    if upload_response.status_code != 200:
-        raise RuntimeError("本番Excelを更新できませんでした。必要なDropbox権限は files.content.write です。\n" + dropbox_error_text(upload_response))
-
-    # 「APIが200を返した」だけで成功扱いにせず、Dropbox上の実ファイルを再確認する。
-    confirmed_content, confirmed_revision = confirm_dropbox_upload(
+    # Dropbox-internal copy avoids uploading the same 1.8 MB file a second time.
+    # The copied backup is hash-checked before the production file is touched.
+    create_dropbox_backup(
         target_path,
+        backup_path,
+        original_content,
         access_token,
-        changed_cells,
     )
 
-    # 保存済みの実ファイルから表示用JSONもその場で更新する。
-    # Dropboxの更新番号が画面再実行直後に切り替わるまで待たず、1回の保存で表示を更新する。
+    saved_content, changed_cells = update_workbook_bytes(
+        original_content,
+        customer_name,
+        product_name,
+        proposed,
+    )
+    upload_response = upload_dropbox_file(
+        target_path,
+        saved_content,
+        access_token,
+        mode="update",
+        rev=revision,
+    )
+    if upload_response.status_code == 409:
+        raise RuntimeError("PC\u307e\u305f\u306f\u5225\u7aef\u672b\u3067Excel\u304c\u66f4\u65b0\u3055\u308c\u3066\u3044\u307e\u3059\u3002\u518d\u8aad\u307f\u8fbc\u307f\u3057\u3066\u304b\u3089\u3084\u308a\u76f4\u3057\u3066\u304f\u3060\u3055\u3044")
+    if upload_response.status_code != 200:
+        raise RuntimeError("\u672c\u756aExcel\u3092\u66f4\u65b0\u3067\u304d\u307e\u305b\u3093\u3067\u3057\u305f\u3002\u5fc5\u8981\u306aDropbox\u6a29\u9650\u306f files.content.write \u3067\u3059\u3002\n" + dropbox_error_text(upload_response))
+
+    # The upload response contains size, rev, and content_hash. Verifying those
+    # guarantees the bytes without downloading the full workbook again.
+    upload_metadata = get_dropbox_response_metadata(upload_response)
+    if not upload_metadata.get("content_hash") or upload_metadata.get("size") is None:
+        upload_metadata = get_dropbox_file_metadata(target_path, access_token)
+    confirmed_revision = verify_dropbox_file_metadata(
+        upload_metadata,
+        saved_content,
+        previous_revision=revision,
+    )
+
+    # Use the already verified local bytes to rebuild the immediate-display JSON.
     cache_warning = refresh_fast_dropbox_cache_after_save(
-        confirmed_content,
+        saved_content,
         confirmed_revision,
         access_token,
     )
 
+    # Keep the existing exact rule: retain the newest 30 backups.
     cleanup_warning = trim_old_dropbox_backups(access_token, keep=30)
     warnings = [warning for warning in (cleanup_warning, cache_warning) if warning]
     st.cache_data.clear()
