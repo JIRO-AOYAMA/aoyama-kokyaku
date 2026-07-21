@@ -4020,7 +4020,7 @@ def get_active_product_search_rows(df):
         "商品名",
         "使用数量/日",
         "次回配達予定",
-        "残数",
+        "メーカー",
     }
     if not required_columns.issubset(df.columns):
         return pd.DataFrame(columns=list(required_columns))
@@ -4088,7 +4088,10 @@ def build_exact_product_search_results(active_rows, product_name):
         if duplicate_count == 1:
             next_delivery_text = format_date(source_row["次回配達予定"])
             usage_text = format_number(source_row["使用数量/日"])
-            remaining_text = format_number(source_row["残数"])
+            maker_text = clean_value(
+                source_row.get("メーカー"),
+                blank_text="未設定",
+            ).strip() or "未設定"
         else:
             next_delivery_text = (
                 format_date(earliest_timestamp)
@@ -4098,7 +4101,7 @@ def build_exact_product_search_results(active_rows, product_name):
             if next_delivery_text != "未設定":
                 next_delivery_text += "（複数行）"
             usage_text = "複数行（確認が必要）"
-            remaining_text = "複数行（確認が必要）"
+            maker_text = "複数行（確認が必要）"
 
         region_values = [
             clean_value(value, blank_text="").strip()
@@ -4112,7 +4115,7 @@ def build_exact_product_search_results(active_rows, product_name):
                 "地域": region,
                 "次回配達予定": next_delivery_text,
                 "使用数量/日": usage_text,
-                "残数": remaining_text,
+                "メーカー": maker_text,
                 "重複件数": duplicate_count,
                 "並び順日付": earliest_timestamp,
                 # 重複行では、すべての日付が古い場合だけ非表示にする。
@@ -4184,7 +4187,12 @@ def render_product_search_results(active_rows, product_name, keyword, age_limit_
             )
 
             st.caption("次回配達予定")
-            st.markdown(f"### {html.escape(item['次回配達予定'])}")
+            st.markdown(
+                '<div style="font-size:2.25rem;font-weight:800;line-height:1.15;'
+                'margin:0.05rem 0 0.8rem 0;">'
+                f"{html.escape(item['次回配達予定'])}</div>",
+                unsafe_allow_html=True,
+            )
 
             col_left, col_right = st.columns(2)
             with col_left:
@@ -4193,8 +4201,8 @@ def render_product_search_results(active_rows, product_name, keyword, age_limit_
                 st.caption("使用数量/日")
                 st.markdown(f"**{html.escape(item['使用数量/日'])}**")
             with col_right:
-                st.caption("残数")
-                st.markdown(f"**{html.escape(item['残数'])}**")
+                st.caption("メーカー")
+                st.markdown(f"**{html.escape(item['メーカー'])}**")
 
             if item["重複件数"] > 1:
                 st.warning(
