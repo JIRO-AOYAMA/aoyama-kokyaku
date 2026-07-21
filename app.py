@@ -1358,7 +1358,7 @@ def confirm_dropbox_upload(target_path, access_token, changed_cells):
 
 
 def update_workbook_bytes(original_content, customer_name, product_name, proposed):
-    """指定された6列の値だけ変更し、再オープン検証したbytesを返す。"""
+    """指定項目とK列の配達数量だけを変更し、再オープン検証したbytesを返す。"""
     workbook = load_workbook(BytesIO(original_content), keep_vba=True, data_only=False, read_only=False)
     original_sheets = list(workbook.sheetnames)
     changed_cells = []
@@ -1383,6 +1383,23 @@ def update_workbook_bytes(original_content, customer_name, product_name, propose
             if not same_excel_value(cell.value, new_value):
                 cell.value = new_value
                 changed_cells.append((DELIVERY_SHEET_NAME, product_row, column, new_value))
+
+        # PC版ExcelではマクロがK列「配達数量」を本数×kg/本で記載する。
+        # アプリ保存時も同じ値をK列へ入れ、Excelとアプリの次回配達予定を一致させる。
+        try:
+            delivery_quantity = float(proposed.get("本数")) * float(proposed.get("kg/本"))
+            if math.isfinite(delivery_quantity):
+                if delivery_quantity.is_integer():
+                    delivery_quantity = int(delivery_quantity)
+                quantity_cell = delivery_ws.cell(product_row, 11)
+                if not same_excel_value(quantity_cell.value, delivery_quantity):
+                    quantity_cell.value = delivery_quantity
+                    changed_cells.append(
+                        (DELIVERY_SHEET_NAME, product_row, 11, delivery_quantity)
+                    )
+        except (TypeError, ValueError, OverflowError):
+            # 既存データで本数またはkg/本が数値でない場合は、従来どおり他項目の保存を続ける。
+            pass
 
         customer_ws = workbook[SHEET_NAME]
         customer_rows = find_sheet1_customer_rows(workbook, customer_name)
@@ -2698,36 +2715,13 @@ def calculate_delivery_values(delivery_row_values):
         return delivery_row_values[index] if index < len(delivery_row_values) else None
 
     usage = column_value(7)
-    bottle_count = column_value(8)
     kg_per_bottle = column_value(9)
     delivery_date = column_value(10)
     stored_delivery_quantity = column_value(11)
     remaining = column_value(15)
 
-    # K列（配達数量）が未計算・古い場合でも、H列×I列から最新数量を使う。
+    # ExcelのL列と同じく、K列「配達数量」を使って次回配達予定を計算する。
     effective_delivery_quantity = stored_delivery_quantity
-    try:
-        calculated_quantity = float(bottle_count) * float(kg_per_bottle)
-        stored_quantity_number = float(stored_delivery_quantity)
-        if not math.isclose(
-            stored_quantity_number,
-            calculated_quantity,
-            rel_tol=0,
-            abs_tol=1e-9,
-        ):
-            effective_delivery_quantity = calculated_quantity
-    except Exception:
-        try:
-            if (
-                stored_delivery_quantity is None
-                or (
-                    isinstance(stored_delivery_quantity, str)
-                    and stored_delivery_quantity.startswith("=")
-                )
-            ):
-                effective_delivery_quantity = float(bottle_count) * float(kg_per_bottle)
-        except Exception:
-            pass
 
     next_delivery = None
     try:
