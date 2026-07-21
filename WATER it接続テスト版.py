@@ -101,6 +101,10 @@ SOLUBLE_LOCATIONS = {
     "ノベルズ": {"usage": 3, "delivery": 4, "inventory": 5},
     "コスモアグリ": {"usage": 6, "delivery": 7, "inventory": 8},
 }
+# Excel内の識別名・既存ロジックは変えず、画面表示だけを分かりやすい名称にする。
+SOLUBLE_LOCATION_DISPLAY_NAMES = {
+    "ノベルズ": "ノベルズデイリー",
+}
 SOLUBLE_CUSTOMER_NAMES = ("三谷牧場", "熊林牧場")
 SOLUBLE_CUSTOMER_COLUMNS = {
     "customer_name": 2,       # B列
@@ -215,6 +219,10 @@ WATER_IT_ALERT_COLUMNS = [
     "通信不良または断線",
     "状態",
 ]
+# WATER it側の元名称は変更せず、画面表示と顧客照合だけを統一する。
+WATER_IT_POINT_DISPLAY_NAMES = {
+    "ノベルズデイリーファーム": "ノベルズデイリー",
+}
 
 
 # =========================
@@ -6541,6 +6549,7 @@ def show_soluble_inventory_page():
         list(SOLUBLE_LOCATIONS.keys()) + list(SOLUBLE_CUSTOMER_NAMES),
         horizontal=True,
         key="soluble_location",
+        format_func=lambda name: SOLUBLE_LOCATION_DISPLAY_NAMES.get(name, name),
     )
 
     if location in SOLUBLE_CUSTOMER_NAMES:
@@ -6938,14 +6947,26 @@ def normalize_water_it_customer_key(value):
     return text.casefold()
 
 
+def water_it_display_name(value):
+    """WATER itの元データを変えず、画面上だけ名称を統一する。"""
+    text = clean_value(value, blank_text="").strip()
+    return WATER_IT_POINT_DISPLAY_NAMES.get(text, text)
+
+
+def canonical_water_it_customer_key(value):
+    """明示した別名だけを同一顧客として扱う。曖昧な部分一致は行わない。"""
+    display_name = water_it_display_name(value)
+    return normalize_water_it_customer_key(display_name)
+
+
 def get_water_it_customer_rows(dataframe, customer_name):
-    """顧客名と同名のWATER itポイントだけを返す（読み取り専用）。"""
+    """顧客名と対応するWATER itポイントだけを返す（読み取り専用）。"""
     if dataframe is None or dataframe.empty:
         return dataframe.iloc[0:0].copy() if dataframe is not None else pd.DataFrame()
-    target = normalize_water_it_customer_key(customer_name)
+    target = canonical_water_it_customer_key(customer_name)
     if not target:
         return dataframe.iloc[0:0].copy()
-    point_keys = dataframe["ポイント"].map(normalize_water_it_customer_key)
+    point_keys = dataframe["ポイント"].map(canonical_water_it_customer_key)
     return dataframe[point_keys == target].copy()
 
 
@@ -6970,7 +6991,10 @@ def render_customer_water_it_card(customer_name):
         return
 
     newest = latest_rows["測定日時_解析"].max()
-    point_names = latest_rows["ポイント"].drop_duplicates().tolist()
+    point_names = [
+        water_it_display_name(value)
+        for value in latest_rows["ポイント"].drop_duplicates().tolist()
+    ]
     areas = [
         clean_value(value, blank_text="")
         for value in latest_rows["エリア"].drop_duplicates().tolist()
@@ -7047,7 +7071,7 @@ def show_water_it_latest_cards(latest_rows):
         newest = point_rows["測定日時_解析"].max()
 
         with st.container(border=True):
-            st.subheader(f"💧 {point}")
+            st.subheader(f"💧 {water_it_display_name(point)}")
             st.caption(f"エリア：{area}　｜　最新：{newest.strftime('%Y/%m/%d %H:%M')}")
 
             rows = list(point_rows.iterrows())
@@ -7080,6 +7104,7 @@ def show_water_it_history(dataframe):
         "ポイント",
         points,
         key="water_it_history_point",
+        format_func=water_it_display_name,
     )
     point_rows = dataframe[dataframe["ポイント"] == selected_point].copy()
     items = point_rows["測定項目"].drop_duplicates().tolist()
@@ -7115,6 +7140,7 @@ def show_water_it_history(dataframe):
         display["測定日時"] = display["測定日時_解析"].dt.strftime("%Y/%m/%d %H:%M")
         display["測定値"] = display["測定値_数値"].apply(format_water_it_value)
         display["単位"] = display["単位_表示"]
+        display["ポイント"] = display["ポイント"].map(water_it_display_name)
         st.dataframe(
             display[["測定日時", "エリア", "ポイント", "測定項目", "測定値", "単位"]],
             use_container_width=True,
@@ -7127,7 +7153,7 @@ def show_water_it_test_page():
     st.header("💧 WATER it接続テスト")
     show_back_home_button("water_it_back_home")
     st.caption(
-        "WATER itのdata.csvを読み取り専用で表示します。ポイント名と顧客名が一致する場合は、顧客詳細にも最新値を表示します。Excelへの書き込みは行いません。"
+        "WATER itのdata.csvを読み取り専用で表示します。ポイント名と顧客名が一致する場合、または登録済みの別名に対応する場合は、顧客詳細にも最新値を表示します。Excelへの書き込みは行いません。"
     )
 
     if st.button("🔄 WATER itデータを再読込", key="water_it_reload"):
