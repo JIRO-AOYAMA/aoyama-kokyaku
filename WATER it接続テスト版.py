@@ -6839,17 +6839,24 @@ class WaterItConnectionError(RuntimeError):
 
 
 class WaterItHTMLParser(HTMLParser):
-    """ログインフォームとダウンロード候補だけを調べる最小HTML解析。"""
+    """WATER it画面のフォーム、入力欄、フレーム、スクリプトを安全に調べる。"""
 
     def __init__(self):
         super().__init__(convert_charrefs=True)
         self.forms = []
+        self.fields = []
+        self.buttons = []
         self.links = []
         self.scripts = []
+        self.script_sources = []
+        self.frames = []
+        self.metas = []
+        self.title = []
         self._form = None
         self._button = None
         self._link = None
         self._script = None
+        self._in_title = False
 
     @staticmethod
     def _attrs(attrs):
@@ -6868,13 +6875,16 @@ class WaterItHTMLParser(HTMLParser):
                 "text": [],
             }
             self.forms.append(self._form)
-        elif tag in {"input", "select", "textarea"} and self._form is not None:
+        elif tag in {"input", "select", "textarea"}:
             field = dict(attr)
             field["tag"] = tag
             field.setdefault("type", "text" if tag == "input" else tag)
-            self._form["fields"].append(field)
+            self.fields.append(field)
+            if self._form is not None:
+                self._form["fields"].append(field)
         elif tag == "button":
             self._button = {"attrs": attr, "text": []}
+            self.buttons.append(self._button)
             if self._form is not None:
                 self._form["buttons"].append(self._button)
         elif tag == "a":
@@ -6883,6 +6893,17 @@ class WaterItHTMLParser(HTMLParser):
         elif tag == "script":
             self._script = []
             self.scripts.append(self._script)
+            source = str(attr.get("src", "")).strip()
+            if source:
+                self.script_sources.append(source)
+        elif tag in {"iframe", "frame"}:
+            source = str(attr.get("src", "")).strip()
+            if source:
+                self.frames.append({"tag": tag, "src": source})
+        elif tag == "meta":
+            self.metas.append(attr)
+        elif tag == "title":
+            self._in_title = True
 
     def handle_data(self, data):
         if self._form is not None:
@@ -6893,6 +6914,8 @@ class WaterItHTMLParser(HTMLParser):
             self._link["text"].append(data)
         if self._script is not None:
             self._script.append(data)
+        if self._in_title:
+            self.title.append(data)
 
     def handle_endtag(self, tag):
         tag = tag.lower()
@@ -6904,7 +6927,8 @@ class WaterItHTMLParser(HTMLParser):
             self._link = None
         elif tag == "script":
             self._script = None
-
+        elif tag == "title":
+            self._in_title = False
 
 def parse_water_it_html(text):
     parser = WaterItHTMLParser()
@@ -6923,6 +6947,177 @@ def water_it_safe_url(value):
     except Exception:
         return str(value)
 
+
+
+def water_it_safe_control_summary(parser):
+    """入力値は出さず、画面構造だけを診断表示する。"""
+    controls = []
+    for field in parser.fields[:30]:
+        controls.append({
+            "tag": str(field.get("tag", "input")),
+            "type": str(field.get("type", "text")),
+            "name": str(field.get("name", "")),
+            "id": str(field.get("id", "")),
+            "class": str(field.get("class", ""))[:120],
+            "autocomplete": str(field.get("autocomplete", "")),
+            "placeholder": str(field.get("placeholder", ""))[:120],
+        })
+    return controls
+
+
+def water_it_safe_button_summary(parser):
+    result = []
+    for button in parser.buttons[:20]:
+        attrs = button.get("attrs", {})
+        result.append({
+            "type": str(attrs.get("type", "")),
+            "name": str(attrs.get("name", "")),
+            "id": str(attrs.get("id", "")),
+            "class": str(attrs.get("class", ""))[:120],
+            "text": re.sub(r"\\s+", " ", " ".join(button.get("text", []))).strip()[:120],
+            "onclick": str(attrs.get("onclick", ""))[:200],
+        })
+    return result
+
+
+def water_it_client_page_targets(base_url, parser, html_text):
+    """requestsでは追えないmeta refresh、frame、JavaScript遷移を抽出する。"""
+    candidates = []
+    for frame in parser.frames:
+        source = str(frame.get("src", "")).strip()
+        if source:
+            candidates.append(("frame", urllib.parse.urljoin(base_url, source)))
+
+    for meta in parser.metas:
+        if str(meta.get("http-equiv", "")).casefold() != "refresh":
+            continue
+        content = str(meta.get("content", ""))
+        match = re.search(r"url\\s*=\\s*['\\\"]?([^'\\\";]+)", content, flags=re.IGNORECASE)
+        if match:
+            candidates.append(("meta refresh", urllib.parse.urljoin(base_url, match.group(1).strip())))
+
+    patterns = (
+        r"(?:window\\.)?location(?:\\.href)?\\s*=\\s*['\\\"]([^'\\\"]+)['\\\"]",
+        r"(?:window\\.)?location\\.(?:replace|assign)\\(\\s*['\\\"]([^'\\\"]+)['\\\"]",
+    )
+    for pattern in patterns:
+        for match in re.finditer(pattern, html_text or "", flags=re.IGNORECASE):
+            candidates.append(("JavaScript遷移", urllib.parse.urljoin(base_url, match.group(1).strip())))
+
+    base_host = urllib.parse.urlsplit(base_url).netloc.casefold()
+    result = []
+    seen = set()
+    for source, url in candidates:
+        parsed = urllib.parse.urlsplit(url)
+        if parsed.scheme not in {"http", "https"} or parsed.netloc.casefold() != base_host:
+            continue
+        safe = water_it_safe_url(url)
+        if safe in seen or safe == water_it_safe_url(base_url):
+            continue
+        seen.add(safe)
+        result.append((source, url))
+    return result[:10]
+
+
+def water_it_script_diagnostics(session, base_url, parser):
+    """公開JavaScriptからログイン関連のURL候補だけを取得する。"""
+    base_host = urllib.parse.urlsplit(base_url).netloc.casefold()
+    details = []
+    for source in parser.script_sources[:12]:
+        url = urllib.parse.urljoin(base_url, source)
+        parsed = urllib.parse.urlsplit(url)
+        if parsed.scheme not in {"http", "https"} or parsed.netloc.casefold() != base_host:
+            continue
+        item = {"url": water_it_safe_url(url)}
+        try:
+            response = session.get(
+                url,
+                timeout=WATER_IT_REQUEST_TIMEOUT,
+                allow_redirects=True,
+                headers={"Referer": base_url},
+            )
+            item.update({
+                "status": response.status_code,
+                "content_type": str(response.headers.get("Content-Type", "")),
+                "bytes": len(response.content),
+            })
+            script_text = water_it_response_text(response)
+            url_candidates = []
+            for match in re.finditer(r"['\\\"]([^'\\\"]{1,240})['\\\"]", script_text):
+                candidate = match.group(1).strip()
+                lowered = candidate.casefold()
+                if not any(token in lowered for token in ("login", "auth", "signin", "wia0101", "index")):
+                    continue
+                if candidate.startswith(("/", "http://", "https://")) or "wia" in lowered:
+                    url_candidates.append(water_it_safe_url(urllib.parse.urljoin(url, candidate)))
+            item["ログイン関連URL候補"] = list(dict.fromkeys(url_candidates))[:20]
+            item["login語あり"] = bool(re.search(r"login|signin|password|wia0101", script_text, flags=re.IGNORECASE))
+        except Exception as exc:
+            item["error"] = str(exc)[:200]
+        details.append(item)
+    return details
+
+
+def water_it_get_login_document(session, diagnostics):
+    """JavaScript遷移やframeを追い、実際のログイン入力画面を探す。"""
+    next_url = WATER_IT_LOGIN_URL
+    visited = set()
+    last_result = None
+    for hop in range(4):
+        safe_next = water_it_safe_url(next_url)
+        if safe_next in visited:
+            break
+        visited.add(safe_next)
+        try:
+            response = session.get(
+                next_url,
+                timeout=WATER_IT_REQUEST_TIMEOUT,
+                allow_redirects=True,
+            )
+        except requests.RequestException as exc:
+            raise WaterItConnectionError(f"WATER itログイン画面へ接続できませんでした：{exc}", diagnostics) from exc
+        try:
+            response.raise_for_status()
+        except requests.RequestException as exc:
+            diagnostics.append({
+                "段階": f"ログイン画面取得{hop + 1}",
+                "status": response.status_code,
+                "url": water_it_safe_url(response.url),
+            })
+            raise WaterItConnectionError("WATER itログイン画面の取得に失敗しました。", diagnostics) from exc
+
+        html_text = water_it_response_text(response)
+        parser = parse_water_it_html(html_text)
+        password_fields = [
+            field for field in parser.fields
+            if str(field.get("type", "")).casefold() == "password"
+        ]
+        targets = water_it_client_page_targets(response.url, parser, html_text)
+        diagnostics.append({
+            "段階": f"ログイン画面取得{hop + 1}",
+            "status": response.status_code,
+            "url": water_it_safe_url(response.url),
+            "content_type": str(response.headers.get("Content-Type", "")),
+            "bytes": len(response.content),
+            "title": re.sub(r"\\s+", " ", " ".join(parser.title)).strip()[:120],
+            "form数": len(parser.forms),
+            "入力欄数": len(parser.fields),
+            "password欄数": len(password_fields),
+            "frame数": len(parser.frames),
+            "script_src数": len(parser.script_sources),
+            "画面遷移候補": [
+                {"種類": source, "url": water_it_safe_url(url)}
+                for source, url in targets
+            ],
+        })
+        last_result = (response, html_text, parser)
+        if password_fields:
+            return last_result
+        if len(targets) == 1:
+            next_url = targets[0][1]
+            continue
+        break
+    return last_result
 
 def water_it_response_text(response):
     content_type = str(response.headers.get("Content-Type", ""))
@@ -7206,36 +7401,58 @@ def download_water_it_csv_direct():
         "Accept-Language": "ja,en-US;q=0.8,en;q=0.6",
     })
 
-    try:
-        login_page = session.get(
-            WATER_IT_LOGIN_URL,
-            timeout=WATER_IT_REQUEST_TIMEOUT,
-            allow_redirects=True,
-        )
-    except requests.RequestException as exc:
-        raise WaterItConnectionError(f"WATER itログイン画面へ接続できませんでした：{exc}", diagnostics) from exc
+    login_document = water_it_get_login_document(session, diagnostics)
+    if not login_document:
+        raise WaterItConnectionError("WATER itログイン画面を確認できませんでした。", diagnostics)
+    login_page, login_html, login_parser = login_document
 
-    diagnostics.append({
-        "段階": "ログイン画面取得",
-        "status": login_page.status_code,
-        "url": water_it_safe_url(login_page.url),
-        "content_type": str(login_page.headers.get("Content-Type", "")),
-        "bytes": len(login_page.content),
-    })
-    try:
-        login_page.raise_for_status()
-    except requests.RequestException as exc:
-        raise WaterItConnectionError("WATER itログイン画面の取得に失敗しました。", diagnostics) from exc
-
-    login_html = water_it_response_text(login_page)
-    login_parser = parse_water_it_html(login_html)
     login_forms = [
         form for form in login_parser.forms
         if any(str(field.get("type", "")).lower() == "password" for field in form.get("fields", []))
     ]
+    if not login_forms and any(
+        str(field.get("type", "")).lower() == "password"
+        for field in login_parser.fields
+    ):
+        # WATER itはformタグを使わず、JavaScriptでログイン送信する画面の場合がある。
+        # まず入力欄の構造をそのまま使うが、送信先を推測して複数回試すことはしない。
+        explicit_action = ""
+        explicit_method = "post"
+        for button in login_parser.buttons:
+            attrs = button.get("attrs", {})
+            explicit_action = str(attrs.get("formaction", "")).strip() or explicit_action
+            explicit_method = str(attrs.get("formmethod", "")).strip().lower() or explicit_method
+        login_forms = [{
+            "action": explicit_action or login_page.url,
+            "method": explicit_method if explicit_method in {"get", "post"} else "post",
+            "attrs": {},
+            "fields": login_parser.fields,
+            "buttons": login_parser.buttons,
+            "text": [],
+        }]
+        diagnostics.append({"ログイン入力構造": "formタグ外の入力欄を検出"})
+
     if not login_forms:
-        diagnostics.append({"ログインフォーム数": len(login_parser.forms)})
-        raise WaterItConnectionError("ログイン画面でID・パスワードのフォームを確認できませんでした。", diagnostics)
+        diagnostics.append({
+            "段階": "ログイン画面構造診断",
+            "入力欄": water_it_safe_control_summary(login_parser),
+            "ボタン": water_it_safe_button_summary(login_parser),
+            "frames": [
+                {"tag": item.get("tag"), "url": water_it_safe_url(urllib.parse.urljoin(login_page.url, item.get("src", "")))}
+                for item in login_parser.frames[:20]
+            ],
+            "script_src": [
+                water_it_safe_url(urllib.parse.urljoin(login_page.url, value))
+                for value in login_parser.script_sources[:20]
+            ],
+        })
+        script_details = water_it_script_diagnostics(session, login_page.url, login_parser)
+        if script_details:
+            diagnostics.append({"段階": "ログイン用JavaScript診断", "scripts": script_details})
+        raise WaterItConnectionError(
+            "ログイン画面は取得できましたが、ID・パスワード入力欄が別画面またはJavaScript内にあります。",
+            diagnostics,
+        )
 
     login_form = login_forms[0]
     try:
@@ -7683,7 +7900,7 @@ def show_water_it_diagnostics(diagnostics):
 
 def show_water_it_test_page():
     st.markdown("---")
-    st.header("💧 WATER it直接接続テスト")
+    st.header("💧 WATER it直接接続テスト 第2段階")
     show_back_home_button("water_it_back_home")
     st.caption(
         "WATER itへ直接ログインし、ダウンロードした最新CSVを読み取り専用で表示します。GitHubのdata.csvやDropboxは使いません。ExcelおよびWATER itへの登録・変更・削除は行いません。"
@@ -7703,7 +7920,7 @@ def show_water_it_test_page():
         st.error("WATER itの直接取得テストは、まだ完了していません。")
         st.write(str(exc))
         show_water_it_diagnostics(getattr(exc, "diagnostics", []))
-        st.info("この診断結果の画面を送ってください。IDやパスワードは表示されません。次の修正版でダウンロード通信を確定します。")
+        st.info("接続診断の詳細を開き、表示されたJSONを送ってください。ID・パスワードやCookie値は表示しません。")
         return
     except Exception as exc:
         st.error("WATER itデータを読み込めませんでした。")
