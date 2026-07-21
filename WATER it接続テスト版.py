@@ -11,6 +11,7 @@ import unicodedata
 import uuid
 import zipfile
 from datetime import date, datetime, timedelta, timezone
+from html.parser import HTMLParser
 from io import BytesIO
 from pathlib import Path
 from xml.etree import ElementTree as ET
@@ -192,14 +193,59 @@ MAP_LOCATION_COLUMN_CANDIDATES = [
 
 
 # =========================
-# WATER it接続テスト（読み取り専用）
+# WATER it直接接続テスト（読み取り専用）
 # =========================
-# data.csvをこのPythonファイルと同じフォルダに置くと、そのまま読み込む。
-# 将来WATER it側からCSVを直接取得できるURLが用意できた場合は、
-# Streamlit Secretsの WATER_IT_CSV_URL に設定すれば同じ画面で確認できる。
-WATER_IT_CSV_PATH = st.secrets.get("WATER_IT_CSV_PATH", "data.csv")
-WATER_IT_CSV_URL = st.secrets.get("WATER_IT_CSV_URL", "")
-WATER_IT_REQUEST_TIMEOUT = 20
+def _water_it_secret(*names, default=""):
+    """複数のSecrets名と [WATER_IT] セクションを安全に確認する。"""
+    for name in names:
+        try:
+            value = st.secrets.get(name, "")
+        except Exception:
+            value = ""
+        if value is not None and str(value).strip():
+            return str(value).strip()
+
+    try:
+        section = st.secrets.get("WATER_IT", {})
+    except Exception:
+        section = {}
+    if hasattr(section, "get"):
+        for name in names:
+            short_name = name
+            for prefix in ("WATER_IT_", "WATERIT_"):
+                if short_name.startswith(prefix):
+                    short_name = short_name[len(prefix):]
+                    break
+            value = section.get(short_name, "")
+            if value is not None and str(value).strip():
+                return str(value).strip()
+    return default
+
+
+WATER_IT_LOGIN_URL = _water_it_secret(
+    "WATER_IT_LOGIN_URL",
+    default="https://www.dms2.waterit.optex.net/WIA0101/Index01",
+)
+WATER_IT_LIST_URL = _water_it_secret(
+    "WATER_IT_LIST_URL",
+    default="https://www.dms2.waterit.optex.net/WIA1501/Index03",
+)
+WATER_IT_LOGIN_ID = _water_it_secret(
+    "WATER_IT_ID",
+    "WATER_IT_LOGIN_ID",
+    "WATER_IT_USER_ID",
+    "WATERIT_ID",
+    "WATERIT_LOGIN_ID",
+    "WATERIT_USER",
+)
+WATER_IT_LOGIN_PASSWORD = _water_it_secret(
+    "WATER_IT_PASSWORD",
+    "WATER_IT_LOGIN_PASSWORD",
+    "WATER_IT_PASS",
+    "WATERIT_PASSWORD",
+    "WATERIT_PASS",
+)
+WATER_IT_REQUEST_TIMEOUT = 30
 WATER_IT_REQUIRED_COLUMNS = [
     "測定日時",
     "測定項目",
@@ -6784,47 +6830,534 @@ def show_soluble_inventory_page():
 
 
 # =========================
-# WATER it接続テスト（読み取り専用）
+# WATER it直接接続テスト（読み取り専用）
 # =========================
-def resolve_water_it_csv_path():
-    """data.csvの場所を、このPythonファイル基準で解決する。"""
-    configured = str(WATER_IT_CSV_PATH).strip() or "data.csv"
-    path = Path(configured).expanduser()
-    if not path.is_absolute():
-        path = Path(__file__).resolve().parent / path
-    return path
+class WaterItConnectionError(RuntimeError):
+    def __init__(self, message, diagnostics=None):
+        super().__init__(message)
+        self.diagnostics = diagnostics or []
 
 
-def read_water_it_source_bytes():
-    """WATER itのCSVを読み取る。書き込み処理は行わない。"""
-    csv_url = str(WATER_IT_CSV_URL).strip()
-    if csv_url:
+class WaterItHTMLParser(HTMLParser):
+    """ログインフォームとダウンロード候補だけを調べる最小HTML解析。"""
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.forms = []
+        self.links = []
+        self.scripts = []
+        self._form = None
+        self._button = None
+        self._link = None
+        self._script = None
+
+    @staticmethod
+    def _attrs(attrs):
+        return {str(key).lower(): ("" if value is None else str(value)) for key, value in attrs}
+
+    def handle_starttag(self, tag, attrs):
+        tag = tag.lower()
+        attr = self._attrs(attrs)
+        if tag == "form":
+            self._form = {
+                "action": attr.get("action", ""),
+                "method": attr.get("method", "post").lower(),
+                "attrs": attr,
+                "fields": [],
+                "buttons": [],
+                "text": [],
+            }
+            self.forms.append(self._form)
+        elif tag in {"input", "select", "textarea"} and self._form is not None:
+            field = dict(attr)
+            field["tag"] = tag
+            field.setdefault("type", "text" if tag == "input" else tag)
+            self._form["fields"].append(field)
+        elif tag == "button":
+            self._button = {"attrs": attr, "text": []}
+            if self._form is not None:
+                self._form["buttons"].append(self._button)
+        elif tag == "a":
+            self._link = {"attrs": attr, "text": []}
+            self.links.append(self._link)
+        elif tag == "script":
+            self._script = []
+            self.scripts.append(self._script)
+
+    def handle_data(self, data):
+        if self._form is not None:
+            self._form["text"].append(data)
+        if self._button is not None:
+            self._button["text"].append(data)
+        if self._link is not None:
+            self._link["text"].append(data)
+        if self._script is not None:
+            self._script.append(data)
+
+    def handle_endtag(self, tag):
+        tag = tag.lower()
+        if tag == "form":
+            self._form = None
+        elif tag == "button":
+            self._button = None
+        elif tag == "a":
+            self._link = None
+        elif tag == "script":
+            self._script = None
+
+
+def parse_water_it_html(text):
+    parser = WaterItHTMLParser()
+    try:
+        parser.feed(text or "")
+    except Exception:
+        pass
+    return parser
+
+
+def water_it_safe_url(value):
+    """診断表示ではクエリとフラグメントを出さない。"""
+    try:
+        parsed = urllib.parse.urlsplit(str(value))
+        return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", ""))
+    except Exception:
+        return str(value)
+
+
+def water_it_response_text(response):
+    content_type = str(response.headers.get("Content-Type", ""))
+    match = re.search(r"charset\s*=\s*([^;\s]+)", content_type, flags=re.IGNORECASE)
+    encodings = []
+    if match:
+        encodings.append(match.group(1).strip('"\''))
+    if response.encoding:
+        encodings.append(response.encoding)
+    encodings.extend(["utf-8", "cp932", "shift_jis"])
+    for encoding in encodings:
         try:
-            response = requests.get(
-                csv_url,
-                timeout=WATER_IT_REQUEST_TIMEOUT,
-                headers={"User-Agent": "Aoyama-WATER-it-readonly-test/1.0"},
-            )
-            response.raise_for_status()
-        except requests.RequestException as exc:
-            raise RuntimeError(f"WATER it CSV URLから取得できませんでした：{exc}") from exc
+            return response.content.decode(encoding)
+        except Exception:
+            continue
+    return response.text
 
-        content_type = str(response.headers.get("Content-Type", "")).lower()
-        if "text/html" in content_type:
-            raise RuntimeError(
-                "WATER_IT_CSV_URLからCSVではなくHTMLが返されました。CSVを直接取得できるURLを設定してください。"
-            )
-        hostname = urllib.parse.urlparse(csv_url).hostname or "設定URL"
-        return response.content, f"WATER_IT_CSV_URL（{hostname}）"
 
-    path = resolve_water_it_csv_path()
-    if not path.exists():
-        raise RuntimeError(
-            f"{path.name} が見つかりません。このPythonファイルと同じフォルダに data.csv を置いてください。"
+def water_it_field_summary(form):
+    summary = []
+    for field in form.get("fields", []):
+        name = str(field.get("name", "")).strip()
+        if not name:
+            continue
+        summary.append({"name": name, "type": str(field.get("type", "text")).lower()})
+    return summary
+
+
+def water_it_form_text(form):
+    button_texts = []
+    for button in form.get("buttons", []):
+        attrs = button.get("attrs", {})
+        button_texts.extend(button.get("text", []))
+        button_texts.extend([attrs.get("value", ""), attrs.get("name", ""), attrs.get("id", "")])
+    return " ".join(form.get("text", []) + button_texts)
+
+
+def water_it_score_login_name(name):
+    lowered = str(name).casefold()
+    score = 0
+    for token, points in (
+        ("login", 8), ("user", 7), ("account", 6), ("member", 5),
+        ("userid", 10), ("user_id", 10), ("id", 3), ("mail", 2),
+    ):
+        if token in lowered:
+            score += points
+    return score
+
+
+def water_it_build_login_payload(form, login_id, password):
+    payload = {}
+    password_fields = []
+    user_fields = []
+
+    for field in form.get("fields", []):
+        name = str(field.get("name", "")).strip()
+        if not name:
+            continue
+        field_type = str(field.get("type", "text")).lower()
+        value = field.get("value", "")
+        if field_type == "hidden":
+            payload[name] = value
+        elif field_type == "password":
+            password_fields.append(field)
+        elif field_type not in {"submit", "button", "reset", "file", "checkbox", "radio"}:
+            user_fields.append(field)
+
+    if not password_fields:
+        raise WaterItConnectionError("ログイン画面でパスワード欄を確認できませんでした。")
+
+    password_name = str(password_fields[0].get("name", "")).strip()
+    if not password_name:
+        raise WaterItConnectionError("ログイン画面のパスワード欄に送信名がありません。")
+    payload[password_name] = password
+
+    named_user_fields = [field for field in user_fields if str(field.get("name", "")).strip()]
+    if not named_user_fields:
+        raise WaterItConnectionError("ログイン画面でID入力欄を確認できませんでした。")
+    user_field = max(
+        named_user_fields,
+        key=lambda field: water_it_score_login_name(field.get("name", "")),
+    )
+    user_name = str(user_field.get("name", "")).strip()
+    payload[user_name] = login_id
+
+    submit_candidates = []
+    for field in form.get("fields", []):
+        field_type = str(field.get("type", "")).lower()
+        if field_type in {"submit", "image"} and str(field.get("name", "")).strip():
+            submit_candidates.append((field, " ".join([field.get("value", ""), field.get("id", "")])) )
+    for button in form.get("buttons", []):
+        attrs = button.get("attrs", {})
+        if str(attrs.get("name", "")).strip():
+            submit_candidates.append((attrs, " ".join(button.get("text", []) + [attrs.get("value", ""), attrs.get("id", "")])) )
+
+    if submit_candidates:
+        preferred = max(
+            submit_candidates,
+            key=lambda pair: 5 if any(token in pair[1].casefold() for token in ("ログイン", "login", "sign in", "signin")) else 0,
+        )[0]
+        submit_name = str(preferred.get("name", "")).strip()
+        if submit_name:
+            payload[submit_name] = preferred.get("value", "")
+
+    return payload, user_name, password_name
+
+
+def water_it_looks_like_login_page(html_text, final_url=""):
+    parser = parse_water_it_html(html_text)
+    has_password = any(
+        str(field.get("type", "")).lower() == "password"
+        for form in parser.forms
+        for field in form.get("fields", [])
+    )
+    login_path = "/wia0101/" in str(final_url).casefold()
+    return has_password or login_path
+
+
+def water_it_looks_like_list_page(html_text):
+    compact = re.sub(r"\s+", "", html_text or "")
+    return (
+        ("リストでみる" in compact or "測定日時" in compact)
+        and "ポイント" in compact
+        and "測定値" in compact
+    )
+
+
+def water_it_is_download_text(value):
+    text = unicodedata.normalize("NFKC", str(value or "")).casefold()
+    blocked = ("登録", "削除", "アップロード", "import", "upload", "delete")
+    if any(token.casefold() in text for token in blocked):
+        return False
+    return "ダウンロード" in text or "download" in text or "export" in text
+
+
+def water_it_extract_onclick_url(onclick):
+    text = str(onclick or "")
+    for match in re.finditer(r"['\"]([^'\"]+)['\"]", text):
+        candidate = match.group(1).strip()
+        if water_it_is_download_text(candidate) or candidate.startswith(("/", "http://", "https://")):
+            return candidate
+    return ""
+
+
+def water_it_basic_form_payload(form):
+    payload = {}
+    for field in form.get("fields", []):
+        name = str(field.get("name", "")).strip()
+        if not name:
+            continue
+        field_type = str(field.get("type", "text")).lower()
+        if field_type == "hidden":
+            payload[name] = field.get("value", "")
+        elif field_type in {"checkbox", "radio"} and "checked" in field:
+            payload[name] = field.get("value", "on")
+        elif field_type in {"text", "search", "date", "number", "select", "textarea"}:
+            value = field.get("value", "")
+            if value:
+                payload[name] = value
+    return payload
+
+
+def water_it_download_candidates(list_url, html_text):
+    parser = parse_water_it_html(html_text)
+    candidates = []
+
+    for link in parser.links:
+        attrs = link.get("attrs", {})
+        label = " ".join(link.get("text", []) + [attrs.get("title", ""), attrs.get("aria-label", ""), attrs.get("id", ""), attrs.get("class", "")])
+        href = attrs.get("href", "")
+        onclick_url = water_it_extract_onclick_url(attrs.get("onclick", ""))
+        if water_it_is_download_text(label) or water_it_is_download_text(href):
+            target = href or onclick_url
+            if target and not target.lower().startswith("javascript:"):
+                candidates.append({"method": "get", "url": urllib.parse.urljoin(list_url, target), "label": label.strip() or target, "data": {}})
+        elif onclick_url and water_it_is_download_text(label + " " + onclick_url):
+            candidates.append({"method": "get", "url": urllib.parse.urljoin(list_url, onclick_url), "label": label.strip() or onclick_url, "data": {}})
+
+    for form in parser.forms:
+        form_label = water_it_form_text(form)
+        form_action = form.get("action", "")
+        form_attrs = form.get("attrs", {})
+        form_download = water_it_is_download_text(form_label + " " + form_action + " " + form_attrs.get("id", "") + " " + form_attrs.get("class", ""))
+        controls = []
+        for field in form.get("fields", []):
+            label = " ".join([field.get("value", ""), field.get("name", ""), field.get("id", ""), field.get("class", ""), field.get("onclick", "")])
+            if water_it_is_download_text(label):
+                controls.append((field, label))
+        for button in form.get("buttons", []):
+            attrs = button.get("attrs", {})
+            label = " ".join(button.get("text", []) + [attrs.get("value", ""), attrs.get("name", ""), attrs.get("id", ""), attrs.get("class", ""), attrs.get("onclick", "")])
+            if water_it_is_download_text(label):
+                controls.append((attrs, label))
+
+        if not controls and form_download:
+            controls = [({}, form_label or form_action)]
+
+        for control, label in controls:
+            payload = water_it_basic_form_payload(form)
+            name = str(control.get("name", "")).strip()
+            if name:
+                payload[name] = control.get("value", "")
+            action = control.get("formaction", "") or form_action or list_url
+            onclick_url = water_it_extract_onclick_url(control.get("onclick", ""))
+            if onclick_url:
+                action = onclick_url
+            method = str(control.get("formmethod", "") or form.get("method", "post")).lower()
+            if method not in {"get", "post"}:
+                method = "post"
+            candidates.append({
+                "method": method,
+                "url": urllib.parse.urljoin(list_url, action),
+                "label": label.strip() or "ダウンロード",
+                "data": payload,
+            })
+
+    script_text = "\n".join("".join(parts) for parts in parser.scripts)
+    for match in re.finditer(r"['\"]([^'\"]*(?:download|export)[^'\"]*)['\"]", script_text, flags=re.IGNORECASE):
+        candidate = match.group(1).strip()
+        if candidate:
+            candidates.append({"method": "get", "url": urllib.parse.urljoin(list_url, candidate), "label": candidate, "data": {}})
+
+    unique = []
+    seen = set()
+    for candidate in candidates:
+        key = (candidate["method"], water_it_safe_url(candidate["url"]), tuple(sorted(candidate.get("data", {}).keys())))
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(candidate)
+    return unique[:10]
+
+
+def water_it_response_is_csv(response):
+    content_type = str(response.headers.get("Content-Type", "")).casefold()
+    disposition = str(response.headers.get("Content-Disposition", "")).casefold()
+    if "text/html" in content_type:
+        return False
+    if "csv" in content_type or ".csv" in disposition:
+        return True
+    sample = response.content[:8192]
+    for encoding in ("utf-8-sig", "utf-8", "cp932", "shift_jis"):
+        try:
+            header = sample.decode(encoding, errors="strict").splitlines()[0]
+        except Exception:
+            continue
+        normalized = header.replace('"', "")
+        if all(column in normalized for column in WATER_IT_REQUIRED_COLUMNS[:3]) and "ポイント" in normalized:
+            return True
+    return False
+
+
+def water_it_request_download_candidate(session, candidate, referer):
+    headers = {"Referer": referer}
+    method = candidate.get("method", "get")
+    url = candidate.get("url", referer)
+    data = candidate.get("data", {})
+    if method == "post":
+        return session.post(url, data=data, timeout=WATER_IT_REQUEST_TIMEOUT, allow_redirects=True, headers=headers)
+    return session.get(url, params=data or None, timeout=WATER_IT_REQUEST_TIMEOUT, allow_redirects=True, headers=headers)
+
+
+def download_water_it_csv_direct():
+    diagnostics = []
+    if not WATER_IT_LOGIN_ID or not WATER_IT_LOGIN_PASSWORD:
+        raise WaterItConnectionError(
+            "WATER itのIDまたはパスワードをSecretsから確認できませんでした。",
+            diagnostics=[{
+                "確認したSecrets名": [
+                    "WATER_IT_ID / WATER_IT_PASSWORD",
+                    "WATER_IT_LOGIN_ID / WATER_IT_LOGIN_PASSWORD",
+                    "WATERIT_ID / WATERIT_PASSWORD",
+                    "[WATER_IT] ID / PASSWORD",
+                ]
+            }],
         )
-    if not path.is_file():
-        raise RuntimeError(f"WATER_IT_CSV_PATH がファイルではありません：{path.name}")
-    return path.read_bytes(), path.name
+
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/142 Safari/537.36",
+        "Accept-Language": "ja,en-US;q=0.8,en;q=0.6",
+    })
+
+    try:
+        login_page = session.get(
+            WATER_IT_LOGIN_URL,
+            timeout=WATER_IT_REQUEST_TIMEOUT,
+            allow_redirects=True,
+        )
+    except requests.RequestException as exc:
+        raise WaterItConnectionError(f"WATER itログイン画面へ接続できませんでした：{exc}", diagnostics) from exc
+
+    diagnostics.append({
+        "段階": "ログイン画面取得",
+        "status": login_page.status_code,
+        "url": water_it_safe_url(login_page.url),
+        "content_type": str(login_page.headers.get("Content-Type", "")),
+        "bytes": len(login_page.content),
+    })
+    try:
+        login_page.raise_for_status()
+    except requests.RequestException as exc:
+        raise WaterItConnectionError("WATER itログイン画面の取得に失敗しました。", diagnostics) from exc
+
+    login_html = water_it_response_text(login_page)
+    login_parser = parse_water_it_html(login_html)
+    login_forms = [
+        form for form in login_parser.forms
+        if any(str(field.get("type", "")).lower() == "password" for field in form.get("fields", []))
+    ]
+    if not login_forms:
+        diagnostics.append({"ログインフォーム数": len(login_parser.forms)})
+        raise WaterItConnectionError("ログイン画面でID・パスワードのフォームを確認できませんでした。", diagnostics)
+
+    login_form = login_forms[0]
+    try:
+        payload, user_field_name, password_field_name = water_it_build_login_payload(
+            login_form,
+            WATER_IT_LOGIN_ID,
+            WATER_IT_LOGIN_PASSWORD,
+        )
+    except WaterItConnectionError as exc:
+        diagnostics.append({"ログインフォーム項目": water_it_field_summary(login_form)})
+        exc.diagnostics = diagnostics + list(getattr(exc, "diagnostics", []))
+        raise
+
+    login_action = urllib.parse.urljoin(login_page.url, login_form.get("action", "") or login_page.url)
+    diagnostics.append({
+        "段階": "ログインフォーム確認",
+        "method": login_form.get("method", "post"),
+        "action": water_it_safe_url(login_action),
+        "ID欄": user_field_name,
+        "パスワード欄": password_field_name,
+        "送信項目名": sorted(payload.keys()),
+    })
+
+    try:
+        if login_form.get("method", "post") == "get":
+            login_result = session.get(
+                login_action,
+                params=payload,
+                timeout=WATER_IT_REQUEST_TIMEOUT,
+                allow_redirects=True,
+                headers={"Referer": login_page.url},
+            )
+        else:
+            login_result = session.post(
+                login_action,
+                data=payload,
+                timeout=WATER_IT_REQUEST_TIMEOUT,
+                allow_redirects=True,
+                headers={"Referer": login_page.url},
+            )
+    except requests.RequestException as exc:
+        raise WaterItConnectionError(f"WATER itへのログイン送信に失敗しました：{exc}", diagnostics) from exc
+
+    diagnostics.append({
+        "段階": "ログイン送信",
+        "status": login_result.status_code,
+        "url": water_it_safe_url(login_result.url),
+        "content_type": str(login_result.headers.get("Content-Type", "")),
+        "bytes": len(login_result.content),
+    })
+
+    try:
+        list_response = session.get(
+            WATER_IT_LIST_URL,
+            timeout=WATER_IT_REQUEST_TIMEOUT,
+            allow_redirects=True,
+            headers={"Referer": login_result.url},
+        )
+    except requests.RequestException as exc:
+        raise WaterItConnectionError(f"WATER itのリスト画面を取得できませんでした：{exc}", diagnostics) from exc
+
+    list_html = water_it_response_text(list_response)
+    diagnostics.append({
+        "段階": "リスト画面取得",
+        "status": list_response.status_code,
+        "url": water_it_safe_url(list_response.url),
+        "content_type": str(list_response.headers.get("Content-Type", "")),
+        "bytes": len(list_response.content),
+        "リスト画面判定": water_it_looks_like_list_page(list_html),
+    })
+
+    if water_it_looks_like_login_page(list_html, list_response.url):
+        raise WaterItConnectionError(
+            "WATER itへログインできませんでした。ID・パスワードまたはログイン送信方式を確認してください。",
+            diagnostics,
+        )
+    if not water_it_looks_like_list_page(list_html):
+        raise WaterItConnectionError(
+            "ログイン後のリスト画面を確認できませんでした。",
+            diagnostics,
+        )
+
+    candidates = water_it_download_candidates(list_response.url, list_html)
+    diagnostics.append({
+        "段階": "ダウンロード候補確認",
+        "候補数": len(candidates),
+        "候補": [
+            {
+                "method": candidate.get("method"),
+                "url": water_it_safe_url(candidate.get("url")),
+                "label": candidate.get("label", "")[:100],
+                "送信項目名": sorted(candidate.get("data", {}).keys()),
+            }
+            for candidate in candidates
+        ],
+    })
+
+    for index, candidate in enumerate(candidates, start=1):
+        try:
+            response = water_it_request_download_candidate(session, candidate, list_response.url)
+        except requests.RequestException as exc:
+            diagnostics.append({"段階": f"ダウンロード候補{index}", "error": str(exc)})
+            continue
+
+        attempt = {
+            "段階": f"ダウンロード候補{index}",
+            "method": candidate.get("method"),
+            "url": water_it_safe_url(response.url),
+            "status": response.status_code,
+            "content_type": str(response.headers.get("Content-Type", "")),
+            "content_disposition": str(response.headers.get("Content-Disposition", ""))[:200],
+            "bytes": len(response.content),
+            "CSV判定": water_it_response_is_csv(response),
+        }
+        diagnostics.append(attempt)
+        if response.ok and water_it_response_is_csv(response):
+            return response.content, "WATER it直接取得", diagnostics
+
+    raise WaterItConnectionError(
+        "WATER itへのログインとリスト表示には成功しましたが、ダウンロード通信をまだ特定できませんでした。",
+        diagnostics,
+    )
 
 
 def normalize_water_it_unit(value):
@@ -6861,7 +7394,7 @@ def water_it_nonblank(value):
 
 
 def parse_water_it_csv(content):
-    """WATER itのCSVを画面表示用に整形する。"""
+    """WATER itから直接取得したCSVを画面表示用に整形する。"""
     dataframe = None
     errors = []
     for encoding in ("utf-8-sig", "utf-8", "cp932", "shift_jis"):
@@ -6876,13 +7409,13 @@ def parse_water_it_csv(content):
 
     if dataframe is None:
         detail = " / ".join(errors[:2])
-        raise RuntimeError(f"data.csvを読み込めませんでした。{detail}")
+        raise RuntimeError(f"WATER itのCSVを読み込めませんでした。{detail}")
 
     dataframe.columns = [str(column).replace("\ufeff", "").strip() for column in dataframe.columns]
     missing = [column for column in WATER_IT_REQUIRED_COLUMNS if column not in dataframe.columns]
     if missing:
         raise RuntimeError(
-            "data.csvに必要な列がありません：" + "、".join(missing)
+            "WATER itのCSVに必要な列がありません：" + "、".join(missing)
         )
 
     dataframe = dataframe.copy()
@@ -6920,8 +7453,8 @@ def parse_water_it_csv(content):
 
 @st.cache_data(ttl=60, show_spinner=False)
 def load_water_it_data():
-    content, source = read_water_it_source_bytes()
-    return parse_water_it_csv(content), source
+    content, source, diagnostics = download_water_it_csv_direct()
+    return parse_water_it_csv(content), source, diagnostics
 
 
 def get_water_it_latest_rows(dataframe):
@@ -6936,11 +7469,7 @@ def get_water_it_latest_rows(dataframe):
 
 
 def normalize_water_it_customer_key(value):
-    """WATER itのポイント名と顧客名を安全に照合するための最小正規化。
-
-    表記ゆれを広く吸収すると別顧客を誤って結び付ける可能性があるため、
-    Unicode正規化と空白除去だけを行う。
-    """
+    """WATER itのポイント名と顧客名を安全に照合するための最小正規化。"""
     text = clean_value(value, blank_text="").strip()
     text = unicodedata.normalize("NFKC", text)
     text = re.sub(r"[\s\u3000]+", "", text)
@@ -6971,13 +7500,9 @@ def get_water_it_customer_rows(dataframe, customer_name):
 
 
 def render_customer_water_it_card(customer_name):
-    """顧客詳細にWATER itの最新値を読み取り専用で表示する。
-
-    ポイント名と顧客名が一致しない顧客には何も表示しない。
-    ExcelやWATER itへの書き込み処理は行わない。
-    """
+    """顧客詳細にWATER itの最新値を読み取り専用で表示する。"""
     try:
-        dataframe, source = load_water_it_data()
+        dataframe, source, _ = load_water_it_data()
     except Exception:
         # WATER it側が一時的に読めなくても、既存の顧客詳細は通常どおり表示する。
         return
@@ -7005,7 +7530,7 @@ def render_customer_water_it_card(customer_name):
     with st.container(border=True):
         st.subheader("💧 WATER it タンク情報")
         st.caption(
-            "読み取り専用表示です。ここからExcelやWATER itへの書き込みは行いません。"
+            "WATER itから直接取得した読み取り専用表示です。ExcelやWATER itへの書き込みは行いません。"
         )
         st.caption(
             f"ポイント：{' / '.join(point_names)}"
@@ -7148,38 +7673,53 @@ def show_water_it_history(dataframe):
         )
 
 
+def show_water_it_diagnostics(diagnostics):
+    if not diagnostics:
+        return
+    with st.expander("接続診断の詳細"):
+        st.caption("ID・パスワード、Cookie、認証トークンの値は表示しません。")
+        st.code(json.dumps(diagnostics, ensure_ascii=False, indent=2), language="json")
+
+
 def show_water_it_test_page():
     st.markdown("---")
-    st.header("💧 WATER it接続テスト")
+    st.header("💧 WATER it直接接続テスト")
     show_back_home_button("water_it_back_home")
     st.caption(
-        "WATER itのdata.csvを読み取り専用で表示します。ポイント名と顧客名が一致する場合、または登録済みの別名に対応する場合は、顧客詳細にも最新値を表示します。Excelへの書き込みは行いません。"
+        "WATER itへ直接ログインし、ダウンロードした最新CSVを読み取り専用で表示します。GitHubのdata.csvやDropboxは使いません。ExcelおよびWATER itへの登録・変更・削除は行いません。"
     )
 
-    if st.button("🔄 WATER itデータを再読込", key="water_it_reload"):
+    secret_status = "確認済み" if WATER_IT_LOGIN_ID and WATER_IT_LOGIN_PASSWORD else "未確認"
+    st.caption(f"SecretsのID・パスワード：{secret_status}")
+
+    if st.button("🔄 WATER itから最新データを取得", key="water_it_reload"):
         load_water_it_data.clear()
         st.rerun()
 
     try:
-        with st.spinner("WATER itデータを読み込んでいます…"):
-            dataframe, source = load_water_it_data()
+        with st.spinner("WATER itへログインし、最新データを取得しています…"):
+            dataframe, source, diagnostics = load_water_it_data()
+    except WaterItConnectionError as exc:
+        st.error("WATER itの直接取得テストは、まだ完了していません。")
+        st.write(str(exc))
+        show_water_it_diagnostics(getattr(exc, "diagnostics", []))
+        st.info("この診断結果の画面を送ってください。IDやパスワードは表示されません。次の修正版でダウンロード通信を確定します。")
+        return
     except Exception as exc:
         st.error("WATER itデータを読み込めませんでした。")
         st.write(str(exc))
-        st.info(
-            "data.csvをこのPythonファイルと同じフォルダに置いてください。将来CSV直リンクを使う場合は、SecretsにWATER_IT_CSV_URLを設定します。"
-        )
         return
 
     if dataframe.empty:
-        st.warning("data.csvに表示できる測定データがありません。")
+        st.warning("WATER itから取得したCSVに表示できる測定データがありません。")
+        show_water_it_diagnostics(diagnostics)
         return
 
     latest_rows = get_water_it_latest_rows(dataframe)
     latest_time = dataframe["測定日時_解析"].max()
     oldest_time = dataframe["測定日時_解析"].min()
 
-    st.success(f"接続確認OK　｜　参照：{source}")
+    st.success(f"直接接続OK　｜　参照：{source}")
     metric1, metric2, metric3 = st.columns(3)
     with metric1:
         st.metric("最新測定日時", latest_time.strftime("%Y/%m/%d %H:%M"))
@@ -7193,6 +7733,7 @@ def show_water_it_test_page():
 
     show_water_it_latest_cards(latest_rows)
     show_water_it_history(dataframe)
+    show_water_it_diagnostics(diagnostics)
 
 
 # =========================
