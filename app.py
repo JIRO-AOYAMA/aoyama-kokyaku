@@ -2686,29 +2686,25 @@ def render_customer_information_card(customer_name, customer_key=None):
 # =========================
 # Excel読み込み・整形
 # =========================
-def calculate_delivery_values(delivery_formula_ws, row, delivery_value_ws=None):
+def calculate_delivery_values(delivery_row_values):
     """
-    次回配達予定と残数を表示用に取得する。
+    最新の入力値から、次回配達予定と残数をアプリ表示用に計算する。
 
-    ・PCのExcelで計算・保存された値があり、現在の入力値からの計算と一致する場合は
-      Excel側の計算結果を採用する。
-    ・アプリから本数・kg/本・配達日などを変更した直後で、Excelの計算キャッシュが
-      未更新または古い場合は、Excelと同じ式をPythonで計算して即時表示する。
-    ・Excel内の数式セル自体は変更しない。
+    Excel内の数式セルは変更しない。PCでExcelを編集した場合も、保存された
+    配達日・配達数量・使用数量/日などの最新入力値を読み、同じ計算を行う。
     """
-    usage = delivery_formula_ws.cell(row, 7).value
-    bottle_count = delivery_formula_ws.cell(row, 8).value
-    kg_per_bottle = delivery_formula_ws.cell(row, 9).value
-    delivery_date = delivery_formula_ws.cell(row, 10).value
-    stored_delivery_quantity = delivery_formula_ws.cell(row, 11).value
-    remaining = delivery_formula_ws.cell(row, 15).value
+    def column_value(column_number):
+        index = column_number - 1
+        return delivery_row_values[index] if index < len(delivery_row_values) else None
 
-    cached_next_delivery = None
-    if delivery_value_ws is not None:
-        cached_next_delivery = delivery_value_ws.cell(row, 12).value
+    usage = column_value(7)
+    bottle_count = column_value(8)
+    kg_per_bottle = column_value(9)
+    delivery_date = column_value(10)
+    stored_delivery_quantity = column_value(11)
+    remaining = column_value(15)
 
-    # アプリはH列（本数）とI列（kg/本）を直接編集するため、K列の保存値がまだ古い場合は
-    # H×Iを表示計算用の配達数量として使う。PCのExcelで更新済みなら両者は一致する。
+    # K列（配達数量）が未計算・古い場合でも、H列×I列から最新数量を使う。
     effective_delivery_quantity = stored_delivery_quantity
     try:
         calculated_quantity = float(bottle_count) * float(kg_per_bottle)
@@ -2722,29 +2718,25 @@ def calculate_delivery_values(delivery_formula_ws, row, delivery_value_ws=None):
             effective_delivery_quantity = calculated_quantity
     except Exception:
         try:
-            if isinstance(stored_delivery_quantity, str) and stored_delivery_quantity.startswith("="):
-                effective_delivery_quantity = float(bottle_count) * float(kg_per_bottle)
-            elif stored_delivery_quantity is None:
+            if (
+                stored_delivery_quantity is None
+                or (
+                    isinstance(stored_delivery_quantity, str)
+                    and stored_delivery_quantity.startswith("=")
+                )
+            ):
                 effective_delivery_quantity = float(bottle_count) * float(kg_per_bottle)
         except Exception:
             pass
 
-    calculated_next_delivery = None
+    next_delivery = None
     try:
         if delivery_date is not None:
-            calculated_next_delivery = delivery_date + timedelta(
+            next_delivery = delivery_date + timedelta(
                 days=math.floor(float(effective_delivery_quantity) / float(usage))
             )
     except Exception:
-        calculated_next_delivery = None
-
-    # PCのExcelで計算して保存された値がある場合は、そのExcel値を優先する。
-    # アプリ保存後はopenpyxlによって数式キャッシュが空になるため、その場合だけ
-    # Python計算の値を表示する。Excel内のL列数式自体は変更しない。
-    if to_date(cached_next_delivery) is not None:
-        next_delivery = cached_next_delivery
-    else:
-        next_delivery = calculated_next_delivery
+        next_delivery = None
 
     if isinstance(remaining, str) and remaining.startswith("="):
         remaining = None
@@ -2760,30 +2752,42 @@ def calculate_delivery_values(delivery_formula_ws, row, delivery_value_ws=None):
 
 
 def rebuild_sheet1_from_formula_references(excel_source):
-    """openpyxl保存後に数式キャッシュが消えても、参照元からSheet1相当を復元する。"""
+    """数式参照元を1回だけ走査し、顧客検索用のSheet1相当データを復元する。"""
     if isinstance(excel_source, BytesIO):
         content = excel_source.getvalue()
     else:
         content = Path(excel_source).read_bytes()
 
-    formula_wb = load_workbook(BytesIO(content), keep_vba=True, data_only=False, read_only=True)
-    value_wb = load_workbook(BytesIO(content), keep_vba=False, data_only=True, read_only=True)
+    # 顧客検索時に同じExcelを二重に開かない。read_onlyシートはcell()で
+    # 飛び飛びに読むと非常に遅いため、iter_rows()で各シートを1回だけ走査する。
+    workbook = load_workbook(
+        BytesIO(content),
+        keep_vba=True,
+        data_only=False,
+        read_only=True,
+    )
     try:
-        if SHEET_NAME not in formula_wb.sheetnames or DELIVERY_SHEET_NAME not in formula_wb.sheetnames:
+        if SHEET_NAME not in workbook.sheetnames or DELIVERY_SHEET_NAME not in workbook.sheetnames:
             return pd.DataFrame()
 
-        sheet1 = formula_wb[SHEET_NAME]
-        # 入力値と数式はformula側から読み、PC版Excelが保存した計算結果がある場合だけ
-        # data_only側のキャッシュも参照する。アプリ保存後にキャッシュが空ならPython計算へ戻る。
-        delivery = formula_wb[DELIVERY_SHEET_NAME]
-        delivery_values = value_wb[DELIVERY_SHEET_NAME]
-        rows = []
-        for sheet1_row in range(2, sheet1.max_row + 1):
+        sheet1 = workbook[SHEET_NAME]
+        delivery = workbook[DELIVERY_SHEET_NAME]
+
+        sheet1_records = []
+        sheet1_max_column = max(
+            2,
+            SHEET1_HIRAGANA_COLUMN,
+            SHEET1_ADDRESS_COLUMN,
+            SHEET1_MAP_COLUMN,
+        )
+        for values in sheet1.iter_rows(
+            min_row=2,
+            max_col=sheet1_max_column,
+            values_only=True,
+        ):
             source_row = None
-            for column in (1, 2):
-                formula = sheet1.cell(sheet1_row, column).value
+            for formula in values[:2]:
                 if isinstance(formula, str) and formula.startswith("="):
-                    # シート名の引用符・全角文字に依存せず、参照式末尾の行番号を使う。
                     match = re.search(r"(\d+)\s*$", formula.strip())
                     if match:
                         source_row = int(match.group(1))
@@ -2791,37 +2795,69 @@ def rebuild_sheet1_from_formula_references(excel_source):
             if source_row is None:
                 continue
 
-            customer_name = delivery.cell(source_row, 2).value
-            product_name = delivery.cell(source_row, 5).value
+            sheet1_records.append(
+                {
+                    "source_row": source_row,
+                    "ひらがな": values[SHEET1_HIRAGANA_COLUMN - 1]
+                    if len(values) >= SHEET1_HIRAGANA_COLUMN
+                    else None,
+                    "住所": values[SHEET1_ADDRESS_COLUMN - 1]
+                    if len(values) >= SHEET1_ADDRESS_COLUMN
+                    else None,
+                    "マップ位置": values[SHEET1_MAP_COLUMN - 1]
+                    if len(values) >= SHEET1_MAP_COLUMN
+                    else None,
+                }
+            )
+
+        if not sheet1_records:
+            return pd.DataFrame()
+
+        required_source_rows = {record["source_row"] for record in sheet1_records}
+        delivery_rows = {}
+        for row_number, values in enumerate(
+            delivery.iter_rows(min_row=1, max_col=15, values_only=True),
+            start=1,
+        ):
+            if row_number in required_source_rows:
+                delivery_rows[row_number] = values
+                if len(delivery_rows) == len(required_source_rows):
+                    break
+
+        rows = []
+        for sheet1_record in sheet1_records:
+            source_row = sheet1_record["source_row"]
+            delivery_values = delivery_rows.get(source_row)
+            if delivery_values is None:
+                continue
+
+            customer_name = delivery_values[1] if len(delivery_values) >= 2 else None
+            product_name = delivery_values[4] if len(delivery_values) >= 5 else None
             if not normalize_match_value(customer_name) or not normalize_match_value(product_name):
                 continue
 
-            next_delivery, remaining = calculate_delivery_values(
-                delivery,
-                source_row,
-                delivery_values,
+            next_delivery, remaining = calculate_delivery_values(delivery_values)
+            rows.append(
+                {
+                    "ID": delivery_values[0] if len(delivery_values) >= 1 else None,
+                    "顧客名": customer_name,
+                    "地域": delivery_values[2] if len(delivery_values) >= 3 else None,
+                    "商品名": product_name,
+                    "使用数量/日": delivery_values[6] if len(delivery_values) >= 7 else None,
+                    "次回配達予定": next_delivery,
+                    "残数": remaining,
+                    "ひらがな": sheet1_record["ひらがな"],
+                    "住所": sheet1_record["住所"],
+                    "マップ位置": sheet1_record["マップ位置"],
+                    "メーカー": delivery_values[5] if len(delivery_values) >= 6 else None,
+                    "本数": delivery_values[7] if len(delivery_values) >= 8 else None,
+                    "kg/本": delivery_values[8] if len(delivery_values) >= 9 else None,
+                    "配達日": delivery_values[9] if len(delivery_values) >= 10 else None,
+                }
             )
-            rows.append({
-                "ID": delivery.cell(source_row, 1).value,
-                "顧客名": customer_name,
-                "地域": delivery.cell(source_row, 3).value,
-                "商品名": product_name,
-                "使用数量/日": delivery.cell(source_row, 7).value,
-                "次回配達予定": next_delivery,
-                "残数": remaining,
-                "ひらがな": sheet1.cell(sheet1_row, SHEET1_HIRAGANA_COLUMN).value,
-                "住所": sheet1.cell(sheet1_row, SHEET1_ADDRESS_COLUMN).value,
-                "マップ位置": sheet1.cell(sheet1_row, SHEET1_MAP_COLUMN).value,
-                "メーカー": delivery.cell(source_row, 6).value,
-                "本数": delivery.cell(source_row, 8).value,
-                "kg/本": delivery.cell(source_row, 9).value,
-                "配達日": delivery.cell(source_row, 10).value,
-            })
         return pd.DataFrame(rows)
     finally:
-        formula_wb.close()
-        value_wb.close()
-
+        workbook.close()
 
 def normalize_excel_table(excel_source):
     """
