@@ -4008,7 +4008,7 @@ def show_customer_search(df=None, show_home_link=False):
         show_back_home_button("customer_back_home")
     st.caption(f"🎤 {VOICE_INPUT_HELP} 漢字の顧客名でも検索できます。")
 
-    page_name = "customer" if show_home_link else "home"
+    page_name = "customer" if show_home_link else "customer_home"
 
     default_keyword = str(get_query_value("customer_search", "")).strip()
     if st_keyup is not None:
