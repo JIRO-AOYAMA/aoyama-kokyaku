@@ -6957,6 +6957,127 @@ def missing_worksheet_ignorable_namespaces(xml_content):
     ]
 
 
+def remove_calc_chain_relationship(xml_content):
+    """workbook.xml.relsから古いcalcChain参照だけを取り除く。"""
+    try:
+        text = xml_content.decode("utf-8")
+    except Exception as error:
+        raise ValueError("Excelの計算関係情報を読み取れませんでした。") from error
+
+    relationship_pattern = re.compile(
+        r"<(?:[A-Za-z_][\w.-]*:)?Relationship\b"
+        r"(?=[^>]*(?:"
+        r"\bType\s*=\s*[\"'][^\"']*/calcChain[\"']"
+        r"|\bTarget\s*=\s*[\"'][^\"']*calcChain\.xml[\"']"
+        r"))[^>]*(?:/>|>\s*</(?:[A-Za-z_][\w.-]*:)?Relationship\s*>)",
+        re.IGNORECASE | re.DOTALL,
+    )
+    return relationship_pattern.sub("", text).encode("utf-8")
+
+
+def remove_calc_chain_content_type(xml_content):
+    """[Content_Types].xmlからcalcChainの登録だけを取り除く。"""
+    try:
+        text = xml_content.decode("utf-8")
+    except Exception as error:
+        raise ValueError("Excelのコンテンツ種類情報を読み取れませんでした。") from error
+
+    override_pattern = re.compile(
+        r"<(?:[A-Za-z_][\w.-]*:)?Override\b"
+        r"(?=[^>]*\bPartName\s*=\s*[\"']/xl/calcChain\.xml[\"'])"
+        r"[^>]*(?:/>|>\s*</(?:[A-Za-z_][\w.-]*:)?Override\s*>)",
+        re.IGNORECASE | re.DOTALL,
+    )
+    return override_pattern.sub("", text).encode("utf-8")
+
+
+def set_xml_tag_attribute(tag_text, attribute_name, value):
+    """XML開始タグの既存属性を更新し、なければ末尾へ追加する。"""
+    pattern = re.compile(
+        rf"(\s{re.escape(attribute_name)}\s*=\s*)([\"'])(.*?)(\2)",
+        re.IGNORECASE | re.DOTALL,
+    )
+    if pattern.search(tag_text):
+        return pattern.sub(
+            lambda match: match.group(1) + match.group(2) + str(value) + match.group(2),
+            tag_text,
+            count=1,
+        )
+
+    closing = "/>" if tag_text.rstrip().endswith("/>") else ">"
+    position = tag_text.rfind(closing)
+    if position < 0:
+        raise ValueError("Excelの再計算設定を更新できませんでした。")
+    return tag_text[:position] + f' {attribute_name}="{value}"' + tag_text[position:]
+
+
+def force_workbook_recalculation(xml_content):
+    """Excelを開いた時に数式を自動で全再計算する設定へ更新する。"""
+    try:
+        text = xml_content.decode("utf-8")
+    except Exception as error:
+        raise ValueError("Excelのブック設定を読み取れませんでした。") from error
+
+    calc_pattern = re.compile(
+        r"<(?:[A-Za-z_][\w.-]*:)?calcPr\b[^>]*>",
+        re.IGNORECASE | re.DOTALL,
+    )
+    match = calc_pattern.search(text)
+    if match:
+        tag = match.group(0)
+        for name, value in (
+            ("calcMode", "auto"),
+            ("fullCalcOnLoad", "1"),
+            ("forceFullCalc", "1"),
+        ):
+            tag = set_xml_tag_attribute(tag, name, value)
+        text = text[:match.start()] + tag + text[match.end():]
+    else:
+        closing_match = re.search(
+            r"</(?:[A-Za-z_][\w.-]*:)?workbook\s*>",
+            text,
+            re.IGNORECASE,
+        )
+        if not closing_match:
+            raise ValueError("Excelのブック設定にworkbook要素が見つかりません。")
+        calc_tag = (
+            '<calcPr calcMode="auto" fullCalcOnLoad="1" forceFullCalc="1"/>'
+        )
+        text = text[:closing_match.start()] + calc_tag + text[closing_match.start():]
+
+    return text.encode("utf-8")
+
+
+def workbook_recalculation_is_forced(xml_content):
+    """保存後のworkbook.xmlに全再計算設定があるか確認する。"""
+    try:
+        text = xml_content.decode("utf-8")
+    except Exception:
+        return False
+    match = re.search(
+        r"<(?:[A-Za-z_][\w.-]*:)?calcPr\b[^>]*>",
+        text,
+        re.IGNORECASE | re.DOTALL,
+    )
+    if not match:
+        return False
+    tag = match.group(0)
+    required = {
+        "calcMode": "auto",
+        "fullCalcOnLoad": "1",
+        "forceFullCalc": "1",
+    }
+    for name, expected in required.items():
+        attribute = re.search(
+            rf"\b{re.escape(name)}\s*=\s*[\"']([^\"']*)[\"']",
+            tag,
+            re.IGNORECASE,
+        )
+        if not attribute or attribute.group(1).lower() != expected.lower():
+            return False
+    return True
+
+
 class TradePartnerXlsxEditor:
     """セル値だけをXMLで差し替え、入力規則・書式・数式をそのまま保持する。"""
 
@@ -7202,6 +7323,50 @@ class TradePartnerXlsxEditor:
                 + "\n".join(problems)
             )
 
+    def remove_stale_calculation_chain(self):
+        """セル変更前のcalcChainを除去し、Excelへ安全に再計算させる。"""
+        self.parts.pop("xl/calcChain.xml", None)
+
+        relationships_path = "xl/_rels/workbook.xml.rels"
+        if relationships_path in self.parts:
+            self.parts[relationships_path] = remove_calc_chain_relationship(
+                self.parts[relationships_path]
+            )
+
+        content_types_path = "[Content_Types].xml"
+        if content_types_path in self.parts:
+            self.parts[content_types_path] = remove_calc_chain_content_type(
+                self.parts[content_types_path]
+            )
+
+        workbook_path = "xl/workbook.xml"
+        if workbook_path not in self.parts:
+            raise ValueError("Excelのworkbook.xmlが見つかりません。")
+        self.parts[workbook_path] = force_workbook_recalculation(
+            self.parts[workbook_path]
+        )
+
+    def validate_calculation_state(self):
+        """古いcalcChain参照が残らず、全再計算設定が有効か確認する。"""
+        if "xl/calcChain.xml" in self.parts:
+            raise ValueError("Excelの古い計算順序情報が残っています。保存を中止しました。")
+
+        relationships = self.parts.get("xl/_rels/workbook.xml.rels", b"")
+        if re.search(
+            rb'(?:relationships/calcChain|Target\s*=\s*["\'][^"\']*calcChain\.xml)',
+            relationships,
+            re.IGNORECASE,
+        ):
+            raise ValueError("Excelの計算順序への参照が残っています。保存を中止しました。")
+
+        content_types = self.parts.get("[Content_Types].xml", b"")
+        if re.search(rb"/xl/calcChain\.xml", content_types, re.IGNORECASE):
+            raise ValueError("Excelの計算順序の種類登録が残っています。保存を中止しました。")
+
+        workbook = self.parts.get("xl/workbook.xml", b"")
+        if not workbook_recalculation_is_forced(workbook):
+            raise ValueError("Excelの自動再計算設定を確認できません。保存を中止しました。")
+
     def to_bytes(self):
         for sheet_name in self.changed_sheet_names:
             path = self.sheet_paths[sheet_name]
@@ -7227,9 +7392,18 @@ class TradePartnerXlsxEditor:
 
         self.validate_worksheet_namespaces()
 
+        # セルを書き換えた後に古いcalcChainを残すと、Excelが修復画面を出す。
+        # 本体・関連付け・Content Typesの3か所をそろえて除去し、開いた時に
+        # Excel自身が数式を全再計算する設定へ更新する。
+        self.remove_stale_calculation_chain()
+        self.validate_calculation_state()
+
         output = BytesIO()
         with zipfile.ZipFile(output, "w") as archive:
             for info in self.original_infos:
+                # calcChain.xmlは意図的に削除しているため、元のZIP一覧にあっても書き戻さない。
+                if info.filename not in self.parts:
+                    continue
                 archive.writestr(info, self.parts[info.filename])
         return output.getvalue()
 
