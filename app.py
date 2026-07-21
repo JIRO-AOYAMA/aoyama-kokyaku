@@ -7445,6 +7445,33 @@ def trade_partner_detail_link(row, partner_type, label=None, class_name="dispatc
     )
 
 
+def render_trade_partner_directory_cards(rows, partner_type):
+    """仕入先一覧・検索結果を、顧客名一覧と同じ押しやすいカードで表示する。"""
+    parts = ['<div class="customer-directory">']
+    for row in rows:
+        partner_id = trade_partner_text(row.get("取引先ID"))
+        company = trade_partner_text(row.get("会社名")) or "名称未設定"
+        region = trade_partner_text(row.get("地域")) or "未設定"
+        url = html.escape(
+            make_app_url(
+                page="partner_detail",
+                partner_id=partner_id,
+                partner_type=partner_type,
+            ),
+            quote=True,
+        )
+        parts.append(
+            (
+                f'<a class="customer-directory-item" href="{url}" target="_self">'
+                f'<span class="customer-directory-name">{html.escape(company)}</span>'
+                f'<span class="customer-directory-meta">地域：{html.escape(region)}</span>'
+                '</a>'
+            )
+        )
+    parts.append("</div>")
+    st.markdown("".join(parts), unsafe_allow_html=True)
+
+
 def show_trade_partner_home(partner_type):
     show_top_home_link()
     label = trade_partner_type_label(partner_type)
@@ -7492,6 +7519,9 @@ def show_trade_partner_directory(partner_type):
         st.info(f"登録されている{label}はありません。")
         return
     st.caption(f"{len(rows)}件")
+    if partner_type == "supplier":
+        render_trade_partner_directory_cards(rows, partner_type)
+        return
     for row in rows:
         company = trade_partner_text(row.get("会社名"))
         region = trade_partner_text(row.get("地域"))
@@ -7534,6 +7564,9 @@ def show_trade_partner_search(partner_type):
         st.warning("一致する会社が見つかりません。")
         return
     st.caption(f"{len(matches)}件")
+    if partner_type == "supplier":
+        render_trade_partner_directory_cards(matches, partner_type)
+        return
     for row in matches:
         with st.container(border=True):
             st.markdown(trade_partner_detail_link(row, partner_type), unsafe_allow_html=True)
@@ -8080,6 +8113,18 @@ with col_logout:
         except Exception:
             pass
         st.rerun()
+
+# 各機能ページから、区分メニューを経由せずトップへ直接戻れるようにする。
+# 顧客・仕入先・運送会社の各ホームと取引先メモは、従来から同じリンクを
+# 表示しているため、二重表示にならないようここでは除外する。
+pages_with_existing_top_link = {
+    "customer_home",
+    "supplier_home",
+    "carrier_home",
+    "trade_notes",
+}
+if current_page != "home" and current_page not in pages_with_existing_top_link:
+    show_top_home_link()
 
 try:
     if st.session_state["page"] == "home":
