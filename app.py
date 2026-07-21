@@ -3234,7 +3234,13 @@ def update_query_params(**params):
 
 
 
-def make_app_url(page="home", customer=None, customer_search=None, region_search=None):
+def make_app_url(
+    page="home",
+    customer=None,
+    customer_search=None,
+    region_search=None,
+    product_search=None,
+):
     """ブラウザの戻るボタンで戻れるように、通常リンク用URLを作る。"""
     params = {"logged_in": "1", "page": page}
     if customer:
@@ -3243,16 +3249,27 @@ def make_app_url(page="home", customer=None, customer_search=None, region_search
         params["customer_search"] = str(customer_search)
     if region_search:
         params["region_search"] = str(region_search)
+    if product_search:
+        params["product_search"] = str(product_search)
     return "?" + urllib.parse.urlencode(params)
 
 
-def render_page_link(label, page="home", customer=None, customer_search=None, region_search=None, class_name="app-nav-link"):
+def render_page_link(
+    label,
+    page="home",
+    customer=None,
+    customer_search=None,
+    region_search=None,
+    product_search=None,
+    class_name="app-nav-link",
+):
     """st.buttonではなくHTMLリンクで画面遷移する。これによりブラウザ戻るが効く。"""
     url = make_app_url(
         page=page,
         customer=customer,
         customer_search=customer_search,
         region_search=region_search,
+        product_search=product_search,
     )
     return f'<a class="{class_name}" href="{url}" target="_self">{html.escape(str(label))}</a>'
 
@@ -3266,6 +3283,7 @@ def sync_page_from_query_params():
         "customer_list",
         "customer",
         "region",
+        "product",
         "calendar",
         "dispatch_table",
         "soluble_inventory",
@@ -3989,6 +4007,224 @@ def show_customer_search(df=None, show_home_link=False):
                 render_page_link("この顧客を見る", page="detail", customer=name, customer_search=keyword),
                 unsafe_allow_html=True,
             )
+
+
+# =========================
+# 商品検索
+# =========================
+def get_active_product_search_rows(df):
+    """使用数量/日が0・空白ではなく、商品名と顧客名がある行だけを返す。"""
+    required_columns = {
+        "顧客名",
+        "地域",
+        "商品名",
+        "使用数量/日",
+        "次回配達予定",
+        "残数",
+    }
+    if not required_columns.issubset(df.columns):
+        return pd.DataFrame(columns=list(required_columns))
+
+    active = df[~df["使用数量/日"].apply(is_blank_or_zero)].copy()
+    active["_商品名検索"] = active["商品名"].apply(
+        lambda value: clean_value(value, blank_text="").strip()
+    )
+    active["_顧客名検索"] = active["顧客名"].apply(
+        lambda value: clean_value(value, blank_text="").strip()
+    )
+    active = active[
+        (active["_商品名検索"] != "")
+        & (active["_顧客名検索"] != "")
+    ].copy()
+    return active
+
+
+def get_product_search_candidates(active_rows, keyword):
+    """入力文字を含む、現在使用中の商品名を候補タブ用に返す。"""
+    keyword = str(keyword or "").strip()
+    if active_rows.empty or not keyword:
+        return []
+
+    matches = active_rows[
+        active_rows["_商品名検索"].str.contains(
+            keyword,
+            case=False,
+            na=False,
+            regex=False,
+        )
+    ]
+    candidates = matches["_商品名検索"].drop_duplicates().tolist()
+    keyword_folded = keyword.casefold()
+    return sorted(
+        candidates,
+        key=lambda product_name: (
+            product_name.casefold() != keyword_folded,
+            not product_name.casefold().startswith(keyword_folded),
+            product_name.casefold().find(keyword_folded),
+            len(product_name),
+            product_name,
+        ),
+    )
+
+
+def build_exact_product_search_results(active_rows, product_name):
+    """商品名の完全一致結果を顧客単位にまとめ、次回配達予定の早い順にする。"""
+    exact = active_rows[active_rows["_商品名検索"] == product_name].copy()
+    if exact.empty:
+        return []
+
+    results = []
+    for customer_name, group in exact.groupby("_顧客名検索", sort=False):
+        group = group.copy()
+        parsed_dates = pd.to_datetime(group["次回配達予定"], errors="coerce")
+        valid_dates = parsed_dates.dropna()
+        earliest_timestamp = valid_dates.min() if not valid_dates.empty else pd.NaT
+
+        # 既存の商品カードと同じく、同じ顧客・商品に使用中行が複数あれば
+        # 1件にまとめて警告し、値を断定しない。
+        duplicate_count = len(group)
+        source_row = group.iloc[0]
+        if duplicate_count == 1:
+            next_delivery_text = format_date(source_row["次回配達予定"])
+            usage_text = format_number(source_row["使用数量/日"])
+            remaining_text = format_number(source_row["残数"])
+        else:
+            next_delivery_text = (
+                format_date(earliest_timestamp)
+                if not pd.isna(earliest_timestamp)
+                else "未設定"
+            )
+            if next_delivery_text != "未設定":
+                next_delivery_text += "（複数行）"
+            usage_text = "複数行（確認が必要）"
+            remaining_text = "複数行（確認が必要）"
+
+        region_values = [
+            clean_value(value, blank_text="").strip()
+            for value in group["地域"].tolist()
+        ]
+        region = next((value for value in region_values if value), "未設定")
+
+        results.append(
+            {
+                "顧客名": customer_name,
+                "地域": region,
+                "次回配達予定": next_delivery_text,
+                "使用数量/日": usage_text,
+                "残数": remaining_text,
+                "重複件数": duplicate_count,
+                "並び順日付": earliest_timestamp,
+            }
+        )
+
+    return sorted(
+        results,
+        key=lambda item: (
+            pd.isna(item["並び順日付"]),
+            item["並び順日付"] if not pd.isna(item["並び順日付"]) else pd.Timestamp.max,
+            item["顧客名"],
+        ),
+    )
+
+
+def render_product_search_results(active_rows, product_name, keyword):
+    """選択した商品名の完全一致結果を表示する。"""
+    results = build_exact_product_search_results(active_rows, product_name)
+    st.write(f"該当顧客：{len(results)}件")
+
+    if not results:
+        st.info("この商品を現在使用している顧客は見つかりませんでした。")
+        return
+
+    for index, item in enumerate(results):
+        customer_name = item["顧客名"]
+        with st.container(border=True):
+            st.caption("次回配達予定")
+            st.markdown(f"### {html.escape(item['次回配達予定'])}")
+
+            # 顧客名そのものを押すと、既存の顧客詳細画面へ移動する。
+            st.markdown(
+                render_page_link(
+                    f"👤 {customer_name}",
+                    page="detail",
+                    customer=customer_name,
+                    product_search=keyword,
+                ),
+                unsafe_allow_html=True,
+            )
+
+            col_left, col_right = st.columns(2)
+            with col_left:
+                st.caption("地域")
+                st.markdown(f"**{html.escape(item['地域'])}**")
+                st.caption("使用数量/日")
+                st.markdown(f"**{html.escape(item['使用数量/日'])}**")
+            with col_right:
+                st.caption("残数")
+                st.markdown(f"**{html.escape(item['残数'])}**")
+
+            if item["重複件数"] > 1:
+                st.warning(
+                    "同じ顧客名・商品名の使用中行が複数見つかりました。"
+                    "顧客詳細で確認してください。"
+                )
+
+
+def show_product_search(df=None):
+    st.subheader("🔎 商品検索")
+    show_back_home_button("product_back_home")
+    st.caption(
+        "商品名の一部を入力し、候補タブを選んでください。"
+        "結果は選んだ商品名との完全一致で、次回配達予定の早い順に表示します。"
+    )
+
+    default_keyword = str(get_query_value("product_search", "")).strip()
+    if st_keyup is not None:
+        keyword = str(
+            st_keyup(
+                "商品名で検索",
+                value=default_keyword,
+                placeholder="例：酒 と入力すると酒粕などが候補に出ます",
+                debounce=250,
+                key="product_search_live",
+            )
+            or ""
+        ).strip()
+    else:
+        keyword = st.text_input(
+            "商品名で検索",
+            value=default_keyword,
+            placeholder="例：酒 と入力すると酒粕などが候補に出ます",
+            key="product_search_input",
+            help=VOICE_INPUT_HELP,
+        ).strip()
+
+    if keyword:
+        update_query_params(page="product", product_search=keyword)
+    else:
+        update_query_params(page="product", product_search=None)
+
+    if not keyword:
+        st.info("商品名を入力してください。")
+        return
+
+    if df is None:
+        with st.spinner("商品データを読み込んでいます…"):
+            df = load_data()
+
+    active_rows = get_active_product_search_rows(df)
+    candidates = get_product_search_candidates(active_rows, keyword)
+
+    if not candidates:
+        st.warning("現在使用中の商品に、該当する商品名がありません。")
+        return
+
+    st.write(f"商品候補：{len(candidates)}件")
+    tabs = st.tabs([f"📦 {product_name}" for product_name in candidates])
+    for product_name, tab in zip(candidates, tabs):
+        with tab:
+            st.markdown(f"#### {html.escape(product_name)}")
+            render_product_search_results(active_rows, product_name, keyword)
 
 
 # =========================
@@ -6394,16 +6630,18 @@ def show_home_menu():
     with col3:
         st.markdown(render_page_link("📍 地域検索", page="region"), unsafe_allow_html=True)
     with col4:
-        st.markdown(render_page_link("🗓 配車カレンダー", page="calendar"), unsafe_allow_html=True)
+        st.markdown(render_page_link("🔎 商品検索", page="product"), unsafe_allow_html=True)
 
     col5, col6 = st.columns(2)
     with col5:
-        st.markdown(render_page_link("🚚 配車表", page="dispatch_table"), unsafe_allow_html=True)
+        st.markdown(render_page_link("🗓 配車カレンダー", page="calendar"), unsafe_allow_html=True)
     with col6:
-        st.markdown(render_page_link("🧪 ソリュブル在庫", page="soluble_inventory"), unsafe_allow_html=True)
+        st.markdown(render_page_link("🚚 配車表", page="dispatch_table"), unsafe_allow_html=True)
 
-    col7, _ = st.columns(2)
+    col7, col8 = st.columns(2)
     with col7:
+        st.markdown(render_page_link("🧪 ソリュブル在庫", page="soluble_inventory"), unsafe_allow_html=True)
+    with col8:
         st.markdown(render_page_link("📝 メモ帳", page="notes"), unsafe_allow_html=True)
 
     st.markdown("---")
@@ -6425,6 +6663,7 @@ MENU_OPTIONS = {
     "👥 顧客名一覧": "customer_list",
     "🔍 顧客検索": "customer",
     "📍 地域検索": "region",
+    "🔎 商品検索": "product",
     "🗓 配車カレンダー": "calendar",
     "🚚 配車表": "dispatch_table",
     "🧪 ソリュブル在庫": "soluble_inventory",
@@ -6439,6 +6678,7 @@ with st.sidebar:
     st.markdown(render_page_link("👥 顧客名一覧", page="customer_list"), unsafe_allow_html=True)
     st.markdown(render_page_link("🔍 顧客検索", page="customer"), unsafe_allow_html=True)
     st.markdown(render_page_link("📍 地域検索", page="region"), unsafe_allow_html=True)
+    st.markdown(render_page_link("🔎 商品検索", page="product"), unsafe_allow_html=True)
     st.markdown(render_page_link("🗓 配車カレンダー", page="calendar"), unsafe_allow_html=True)
     st.markdown(render_page_link("🚚 配車表", page="dispatch_table"), unsafe_allow_html=True)
     st.markdown(render_page_link("🧪 ソリュブル在庫", page="soluble_inventory"), unsafe_allow_html=True)
@@ -6454,7 +6694,7 @@ col_title, col_logout = st.columns([3, 1])
 
 with col_title:
     st.title(f"🚚 {APP_TITLE}")
-    st.caption("顧客名一覧・顧客検索・地域検索・配車カレンダー・配車表・ソリュブル在庫・メモ帳")
+    st.caption("顧客名一覧・顧客検索・地域検索・商品検索・配車カレンダー・配車表・ソリュブル在庫・メモ帳")
 
 with col_logout:
     st.write("")
@@ -6482,6 +6722,9 @@ try:
     elif st.session_state["page"] == "region":
         df = load_data()
         show_region_search(df)
+
+    elif st.session_state["page"] == "product":
+        show_product_search()
 
     elif st.session_state["page"] == "calendar":
         df = load_data()
