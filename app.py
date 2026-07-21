@@ -1478,6 +1478,11 @@ def refresh_fast_dropbox_cache_after_save(content, excel_revision, access_token)
         if refreshed_df.empty:
             return "保存は完了しましたが、表示用キャッシュを更新できませんでした。更新ボタンを押してください。"
 
+        # Dropbox側の更新番号やJSONの反映待ちに左右されず、保存直後の1回目の
+        # 再表示では、今保存したExcelから作った最新データをそのまま使用する。
+        # 次の画面実行で1度だけ取り出し、その後は従来どおりDropboxキャッシュを使う。
+        st.session_state["customer_excel_immediate_df"] = refreshed_df.copy()
+
         records = json.loads(
             refreshed_df.to_json(
                 orient="records",
@@ -6494,7 +6499,13 @@ try:
     elif st.session_state["page"] == "detail":
         selected = st.session_state.get("selected_customer")
         if selected:
-            df = load_data()
+            # 商品カード保存直後だけ、保存済みExcelから作った最新データを直接使う。
+            # Dropboxのメタデータ反映が一瞬遅れても、保存ボタン1回で日付を更新する。
+            immediate_df = st.session_state.pop("customer_excel_immediate_df", None)
+            if isinstance(immediate_df, pd.DataFrame) and not immediate_df.empty:
+                df = immediate_df
+            else:
+                df = load_data()
             show_customer_detail(df, selected)
         else:
             set_page("home")
