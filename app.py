@@ -4079,6 +4079,7 @@ def build_exact_product_search_results(active_rows, product_name):
         parsed_dates = pd.to_datetime(group["次回配達予定"], errors="coerce")
         valid_dates = parsed_dates.dropna()
         earliest_timestamp = valid_dates.min() if not valid_dates.empty else pd.NaT
+        latest_timestamp = valid_dates.max() if not valid_dates.empty else pd.NaT
 
         # 既存の商品カードと同じく、同じ顧客・商品に使用中行が複数あれば
         # 1件にまとめて警告し、値を断定しない。
@@ -4114,6 +4115,9 @@ def build_exact_product_search_results(active_rows, product_name):
                 "残数": remaining_text,
                 "重複件数": duplicate_count,
                 "並び順日付": earliest_timestamp,
+                # 重複行では、すべての日付が古い場合だけ非表示にする。
+                # 1行でも期間内または未来の日付があれば、確認できるよう残す。
+                "古い予定判定日付": latest_timestamp,
             }
         )
 
@@ -4127,21 +4131,47 @@ def build_exact_product_search_results(active_rows, product_name):
     )
 
 
-def render_product_search_results(active_rows, product_name, keyword):
-    """選択した商品名の完全一致結果を表示する。"""
-    results = build_exact_product_search_results(active_rows, product_name)
-    st.write(f"該当顧客：{len(results)}件")
+def filter_old_product_search_results(results, age_limit_days, search_date=None):
+    """検索日より指定日数を超えて古い予定だけを非表示にする。日付未設定は残す。"""
+    if search_date is None:
+        search_date = get_jst_now().date()
+    cutoff = pd.Timestamp(search_date) - pd.Timedelta(days=int(age_limit_days))
 
-    if not results:
+    visible = []
+    hidden_count = 0
+    for item in results:
+        comparison_date = item.get("古い予定判定日付", item.get("並び順日付"))
+        if not pd.isna(comparison_date) and pd.Timestamp(comparison_date) < cutoff:
+            hidden_count += 1
+            continue
+        visible.append(item)
+    return visible, hidden_count
+
+
+def render_product_search_results(active_rows, product_name, keyword, age_limit_days):
+    """選択した商品名の完全一致結果を表示する。"""
+    all_results = build_exact_product_search_results(active_rows, product_name)
+    results, hidden_count = filter_old_product_search_results(
+        all_results,
+        age_limit_days,
+    )
+    st.write(f"該当顧客：{len(results)}件")
+    if hidden_count:
+        st.caption(
+            f"検索日から{age_limit_days}日より前の古い予定{hidden_count}件を"
+            "非表示にしています。"
+        )
+
+    if not all_results:
         st.info("この商品を現在使用している顧客は見つかりませんでした。")
+        return
+    if not results:
+        st.info("指定した期間内の予定、または日付未設定の顧客はありません。")
         return
 
     for index, item in enumerate(results):
         customer_name = item["顧客名"]
         with st.container(border=True):
-            st.caption("次回配達予定")
-            st.markdown(f"### {html.escape(item['次回配達予定'])}")
-
             # 顧客名そのものを押すと、既存の顧客詳細画面へ移動する。
             st.markdown(
                 render_page_link(
@@ -4152,6 +4182,9 @@ def render_product_search_results(active_rows, product_name, keyword):
                 ),
                 unsafe_allow_html=True,
             )
+
+            st.caption("次回配達予定")
+            st.markdown(f"### {html.escape(item['次回配達予定'])}")
 
             col_left, col_right = st.columns(2)
             with col_left:
@@ -4204,6 +4237,16 @@ def show_product_search(df=None):
     else:
         update_query_params(page="product", product_search=None)
 
+    age_limit_days = st.radio(
+        "古い予定を非表示",
+        options=[30, 60, 90],
+        index=1,
+        format_func=lambda days: f"{days}日",
+        horizontal=True,
+        key="product_search_age_limit_days",
+        help="検索日から選択した日数より前の予定を非表示にします。日付未設定は表示します。",
+    )
+
     if not keyword:
         st.info("商品名を入力してください。")
         return
@@ -4224,7 +4267,12 @@ def show_product_search(df=None):
     for product_name, tab in zip(candidates, tabs):
         with tab:
             st.markdown(f"#### {html.escape(product_name)}")
-            render_product_search_results(active_rows, product_name, keyword)
+            render_product_search_results(
+                active_rows,
+                product_name,
+                keyword,
+                age_limit_days,
+            )
 
 
 # =========================
