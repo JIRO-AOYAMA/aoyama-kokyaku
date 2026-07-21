@@ -3353,6 +3353,7 @@ def sync_page_from_query_params():
         "calendar",
         "dispatch_table",
         "soluble_inventory",
+        "water_it_test",
         "notes",
         "trade_notes",
         "detail",
