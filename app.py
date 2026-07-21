@@ -29,7 +29,7 @@ except ImportError:
 # =========================
 # 基本設定
 # =========================
-APP_TITLE = "顧客カルテ"
+APP_TITLE = "取引先カルテ"
 
 # Streamlitでは、st.set_page_config は他の st.* 呼び出しより先に実行する
 st.set_page_config(
@@ -78,6 +78,24 @@ SOLUBLE_LOCAL_FILE = st.secrets.get(
     r"C:\Users\jiroa\Aoyama Dropbox\bulu jack\1共有　青山商店　本社\配車表-北海道-\aoベンチャーグレイン配車表.xlsx",
 )
 SOLUBLE_BACKUP_FOLDER = str(SOLUBLE_DROPBOX_FILE_PATH).rsplit("/", 1)[0] + "/Backups"
+
+# 仕入先・運送会社の基本情報を保存する別ブック。
+# 配車予定 次郎.xlsm と同じDropboxフォルダに置く。
+TRADE_PARTNER_FILE_NAME = "取引先カルテ.xlsx"
+TRADE_PARTNER_DROPBOX_DEFAULT_FILE_PATH = (
+    str(DROPBOX_DEFAULT_FILE_PATH).rsplit("/", 1)[0] + "/" + TRADE_PARTNER_FILE_NAME
+)
+TRADE_PARTNER_DROPBOX_FILE_PATH = st.secrets.get(
+    "TRADE_PARTNER_DROPBOX_FILE_PATH",
+    str(DROPBOX_FILE_PATH).rsplit("/", 1)[0] + "/" + TRADE_PARTNER_FILE_NAME,
+)
+TRADE_PARTNER_BACKUP_FOLDER = (
+    str(TRADE_PARTNER_DROPBOX_FILE_PATH).rsplit("/", 1)[0] + "/取引先カルテ_Backups"
+)
+TRADE_PARTNER_MASTER_SHEET = "取引先マスター"
+TRADE_PARTNER_CONTACT_SHEET = "担当者"
+TRADE_PARTNER_PRODUCT_SHEET = "仕入商品"
+TRADE_PARTNER_TRANSPORT_SHEET = "運送条件"
 SOLUBLE_LOCATIONS = {
     "ノベルズ": {"usage": 3, "delivery": 4, "inventory": 5},
     "コスモアグリ": {"usage": 6, "delivery": 7, "inventory": 8},
@@ -183,7 +201,7 @@ except Exception:
     pass
 
 if not st.session_state.authenticated:
-    st.title("🔒 顧客カルテ")
+    st.title("🔒 取引先カルテ")
 
     # ログイン画面は下の共通CSSより前に停止するため、パスワード欄の枠線だけここで指定する。
     st.markdown(
@@ -3240,6 +3258,9 @@ def make_app_url(
     customer_search=None,
     region_search=None,
     product_search=None,
+    partner_id=None,
+    partner_type=None,
+    partner_search=None,
 ):
     """ブラウザの戻るボタンで戻れるように、通常リンク用URLを作る。"""
     params = {"logged_in": "1", "page": page}
@@ -3251,6 +3272,12 @@ def make_app_url(
         params["region_search"] = str(region_search)
     if product_search:
         params["product_search"] = str(product_search)
+    if partner_id:
+        params["partner_id"] = str(partner_id)
+    if partner_type:
+        params["partner_type"] = str(partner_type)
+    if partner_search:
+        params["partner_search"] = str(partner_search)
     return "?" + urllib.parse.urlencode(params)
 
 
@@ -3261,6 +3288,9 @@ def render_page_link(
     customer_search=None,
     region_search=None,
     product_search=None,
+    partner_id=None,
+    partner_type=None,
+    partner_search=None,
     class_name="app-nav-link",
 ):
     """st.buttonではなくHTMLリンクで画面遷移する。これによりブラウザ戻るが効く。"""
@@ -3270,16 +3300,22 @@ def render_page_link(
         customer_search=customer_search,
         region_search=region_search,
         product_search=product_search,
+        partner_id=partner_id,
+        partner_type=partner_type,
+        partner_search=partner_search,
     )
     return f'<a class="{class_name}" href="{url}" target="_self">{html.escape(str(label))}</a>'
 
 def sync_page_from_query_params():
-    """URLのpage/customerを読んで、ブラウザ戻る・進むに追従する"""
+    """URLの画面情報を読み、ブラウザ戻る・進むに追従する。"""
     page = str(get_query_value("page", "home")).strip() or "home"
     customer = str(get_query_value("customer", "")).strip()
+    partner_id = str(get_query_value("partner_id", "")).strip()
+    partner_type = str(get_query_value("partner_type", "")).strip()
 
     valid_pages = {
         "home",
+        "customer_home",
         "customer_list",
         "customer",
         "region",
@@ -3288,7 +3324,19 @@ def sync_page_from_query_params():
         "dispatch_table",
         "soluble_inventory",
         "notes",
+        "trade_notes",
         "detail",
+        "supplier_home",
+        "supplier_list",
+        "supplier_search",
+        "supplier_product",
+        "supplier_register",
+        "carrier_home",
+        "carrier_list",
+        "carrier_search",
+        "carrier_condition",
+        "carrier_register",
+        "partner_detail",
     }
 
     raw_page = str(get_query_value("page", "")).strip()
@@ -3304,14 +3352,29 @@ def sync_page_from_query_params():
     elif page != "detail":
         st.session_state["selected_customer"] = None
 
+    if page == "partner_detail" and partner_id:
+        st.session_state["selected_partner_id"] = partner_id
+        st.session_state["selected_partner_type"] = partner_type
+    elif page != "partner_detail":
+        st.session_state["selected_partner_id"] = None
+        st.session_state["selected_partner_type"] = None
+
 
 def set_page(page_name, rerun=False):
     st.session_state["page"] = page_name
 
     if page_name != "detail":
         st.session_state["selected_customer"] = None
+    if page_name != "partner_detail":
+        st.session_state["selected_partner_id"] = None
+        st.session_state["selected_partner_type"] = None
 
-    update_query_params(page=page_name, customer=None)
+    update_query_params(
+        page=page_name,
+        customer=None,
+        partner_id=None,
+        partner_type=None,
+    )
 
     if rerun:
         st.rerun()
@@ -3324,8 +3387,11 @@ def select_customer(customer_name, page_name="detail"):
 
 
 def show_back_home_button(key):
-    """各画面からホームへ戻るための共通リンク。ブラウザ履歴にも残る。"""
-    st.markdown(render_page_link("← ホームへ戻る", page="home"), unsafe_allow_html=True)
+    """既存の顧客画面から顧客メニューへ戻る共通リンク。"""
+    st.markdown(
+        render_page_link("← 顧客メニューへ戻る", page="customer_home"),
+        unsafe_allow_html=True,
+    )
 
 
 def show_detail_search_shortcuts():
@@ -6670,11 +6736,1231 @@ def show_soluble_inventory_page():
 
 
 
+
+
+# =========================
+# 仕入先・運送会社（取引先カルテ.xlsx）
+# =========================
+TRADE_PARTNER_HEADER_ALIASES = {
+    "連絡方法レンラクホウホウ": "連絡方法",
+    "納品先ノウヒンサキ": "納品先",
+    "運賃ウンチン": "運賃",
+    "地域チイキ": "地域",
+}
+TRADE_PARTNER_REQUIRED_SHEETS = (
+    TRADE_PARTNER_MASTER_SHEET,
+    TRADE_PARTNER_CONTACT_SHEET,
+    TRADE_PARTNER_PRODUCT_SHEET,
+    TRADE_PARTNER_TRANSPORT_SHEET,
+)
+TRADE_PARTNER_ID_FIELDS = {
+    TRADE_PARTNER_MASTER_SHEET: "取引先ID",
+    TRADE_PARTNER_CONTACT_SHEET: "担当者ID",
+    TRADE_PARTNER_PRODUCT_SHEET: "仕入商品ID",
+    TRADE_PARTNER_TRANSPORT_SHEET: "運送条件ID",
+}
+TRADE_PARTNER_PRIMARY_FIELDS = {
+    TRADE_PARTNER_MASTER_SHEET: "会社名",
+    TRADE_PARTNER_CONTACT_SHEET: "担当者名",
+    TRADE_PARTNER_PRODUCT_SHEET: "商品名",
+    TRADE_PARTNER_TRANSPORT_SHEET: "納品先",
+}
+TRADE_PARTNER_NOTE_PREFIXES = {
+    "supplier": "【仕入先】",
+    "carrier": "【運送会社】",
+}
+
+
+def normalize_trade_partner_header(value):
+    text = clean_value(value, blank_text="").strip()
+    return TRADE_PARTNER_HEADER_ALIASES.get(text, text)
+
+
+def trade_partner_text(value):
+    if value is None:
+        return ""
+    if isinstance(value, float) and math.isnan(value):
+        return ""
+    if isinstance(value, (datetime, date)):
+        return value.strftime("%Y/%m/%d")
+    text = str(value).strip()
+    if text.startswith("="):
+        return ""
+    return text
+
+
+def is_trade_partner_marked(value):
+    text = trade_partner_text(value).strip().lower()
+    return text in {"○", "〇", "1", "true", "yes", "有", "あり"}
+
+
+def trade_partner_type_label(partner_type):
+    return "仕入先" if partner_type == "supplier" else "運送会社"
+
+
+def trade_partner_home_page(partner_type):
+    return "supplier_home" if partner_type == "supplier" else "carrier_home"
+
+
+def trade_partner_list_page(partner_type):
+    return "supplier_list" if partner_type == "supplier" else "carrier_list"
+
+
+def trade_partner_search_page(partner_type):
+    return "supplier_search" if partner_type == "supplier" else "carrier_search"
+
+
+def trade_partner_category_field(partner_type):
+    return "仕入先区分" if partner_type == "supplier" else "運送会社区分"
+
+
+def get_trade_partner_file_path():
+    path = str(TRADE_PARTNER_DROPBOX_FILE_PATH or "").strip()
+    return path or TRADE_PARTNER_DROPBOX_DEFAULT_FILE_PATH
+
+
+XLSX_MAIN_NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+XLSX_REL_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+XLSX_PACKAGE_REL_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
+XLSX_XML_NS = "http://www.w3.org/XML/1998/namespace"
+
+# Excelの拡張データ検証やリビジョン情報を壊さないよう、元と同じ名前空間接頭辞を保つ。
+for _prefix, _namespace in {
+    "": XLSX_MAIN_NS,
+    "r": XLSX_REL_NS,
+    "mc": "http://schemas.openxmlformats.org/markup-compatibility/2006",
+    "x14ac": "http://schemas.microsoft.com/office/spreadsheetml/2009/9/ac",
+    "xr": "http://schemas.microsoft.com/office/spreadsheetml/2014/revision",
+    "xr2": "http://schemas.microsoft.com/office/spreadsheetml/2015/revision2",
+    "xr3": "http://schemas.microsoft.com/office/spreadsheetml/2016/revision3",
+    "x14": "http://schemas.microsoft.com/office/spreadsheetml/2009/9/main",
+    "xm": "http://schemas.microsoft.com/office/excel/2006/main",
+}.items():
+    try:
+        ET.register_namespace(_prefix, _namespace)
+    except Exception:
+        pass
+
+
+def xlsx_tag(local_name):
+    return f"{{{XLSX_MAIN_NS}}}{local_name}"
+
+
+def xlsx_column_name(column_number):
+    result = ""
+    number = int(column_number)
+    while number:
+        number, remainder = divmod(number - 1, 26)
+        result = chr(65 + remainder) + result
+    return result
+
+
+def xlsx_column_number(cell_reference):
+    match = re.match(r"^([A-Z]+)", str(cell_reference or "").upper())
+    if not match:
+        return 0
+    result = 0
+    for char in match.group(1):
+        result = result * 26 + (ord(char) - 64)
+    return result
+
+
+class TradePartnerXlsxEditor:
+    """セル値だけをXMLで差し替え、入力規則・書式・数式をそのまま保持する。"""
+
+    def __init__(self, content):
+        self.original_infos = []
+        self.parts = {}
+        with zipfile.ZipFile(BytesIO(content), "r") as archive:
+            self.original_infos = archive.infolist()
+            for info in self.original_infos:
+                self.parts[info.filename] = archive.read(info.filename)
+
+        self.shared_strings = self._read_shared_strings()
+        self.sheet_paths = self._read_sheet_paths()
+        self.sheet_roots = {}
+        self.changed_sheet_names = set()
+
+    def _read_shared_strings(self):
+        path = "xl/sharedStrings.xml"
+        if path not in self.parts:
+            return []
+        root = ET.fromstring(self.parts[path])
+        result = []
+        for item in root.findall(xlsx_tag("si")):
+            texts = []
+            direct_text = item.find(xlsx_tag("t"))
+            if direct_text is not None:
+                texts.append(direct_text.text or "")
+            for run in item.findall(xlsx_tag("r")):
+                run_text = run.find(xlsx_tag("t"))
+                if run_text is not None:
+                    texts.append(run_text.text or "")
+            result.append("".join(texts))
+        return result
+
+    def _read_sheet_paths(self):
+        workbook_root = ET.fromstring(self.parts["xl/workbook.xml"])
+        relation_root = ET.fromstring(self.parts["xl/_rels/workbook.xml.rels"])
+        relation_map = {
+            relation.attrib.get("Id"): relation.attrib.get("Target", "")
+            for relation in relation_root.findall(f"{{{XLSX_PACKAGE_REL_NS}}}Relationship")
+        }
+        result = {}
+        sheets = workbook_root.find(xlsx_tag("sheets"))
+        if sheets is None:
+            return result
+        relation_attribute = f"{{{XLSX_REL_NS}}}id"
+        for sheet in sheets.findall(xlsx_tag("sheet")):
+            name = sheet.attrib.get("name", "")
+            target = relation_map.get(sheet.attrib.get(relation_attribute), "")
+            if not target:
+                continue
+            if target.startswith("/"):
+                path = target.lstrip("/")
+            else:
+                path = posixpath.normpath(posixpath.join("xl", target))
+            result[name] = path
+        return result
+
+    def has_sheet(self, sheet_name):
+        return sheet_name in self.sheet_paths
+
+    def get_sheet_root(self, sheet_name):
+        if sheet_name not in self.sheet_paths:
+            raise ValueError(f"{sheet_name}シートがありません。")
+        if sheet_name not in self.sheet_roots:
+            self.sheet_roots[sheet_name] = ET.fromstring(self.parts[self.sheet_paths[sheet_name]])
+        return self.sheet_roots[sheet_name]
+
+    def get_sheet_data(self, sheet_name):
+        root = self.get_sheet_root(sheet_name)
+        sheet_data = root.find(xlsx_tag("sheetData"))
+        if sheet_data is None:
+            sheet_data = ET.SubElement(root, xlsx_tag("sheetData"))
+        return sheet_data
+
+    def _display_inline_string(self, container):
+        if container is None:
+            return ""
+        texts = []
+        direct_text = container.find(xlsx_tag("t"))
+        if direct_text is not None:
+            texts.append(direct_text.text or "")
+        for run in container.findall(xlsx_tag("r")):
+            run_text = run.find(xlsx_tag("t"))
+            if run_text is not None:
+                texts.append(run_text.text or "")
+        return "".join(texts)
+
+    def cell_value_from_element(self, cell):
+        if cell is None:
+            return None
+        formula = cell.find(xlsx_tag("f"))
+        if formula is not None:
+            return "=" + (formula.text or "")
+        cell_type = cell.attrib.get("t", "")
+        if cell_type == "inlineStr":
+            return self._display_inline_string(cell.find(xlsx_tag("is")))
+        value_element = cell.find(xlsx_tag("v"))
+        raw_value = value_element.text if value_element is not None else None
+        if raw_value is None:
+            return None
+        if cell_type == "s":
+            try:
+                return self.shared_strings[int(raw_value)]
+            except Exception:
+                return ""
+        if cell_type == "b":
+            return raw_value == "1"
+        if cell_type in {"str", "e"}:
+            return raw_value
+        try:
+            number = float(raw_value)
+            return int(number) if number.is_integer() else number
+        except Exception:
+            return raw_value
+
+    def get_row_element(self, sheet_name, row_number, create=False):
+        sheet_data = self.get_sheet_data(sheet_name)
+        target = int(row_number)
+        rows = list(sheet_data.findall(xlsx_tag("row")))
+        for row in rows:
+            if int(row.attrib.get("r", "0") or 0) == target:
+                return row
+        if not create:
+            return None
+        new_row = ET.Element(xlsx_tag("row"), {"r": str(target)})
+        inserted = False
+        for index, row in enumerate(rows):
+            current = int(row.attrib.get("r", "0") or 0)
+            if current > target:
+                sheet_data.insert(index, new_row)
+                inserted = True
+                break
+        if not inserted:
+            sheet_data.append(new_row)
+        self.changed_sheet_names.add(sheet_name)
+        return new_row
+
+    def get_cell_element(self, sheet_name, row_number, column_number, create=False):
+        row = self.get_row_element(sheet_name, row_number, create=create)
+        if row is None:
+            return None
+        reference = f"{xlsx_column_name(column_number)}{int(row_number)}"
+        cells = list(row.findall(xlsx_tag("c")))
+        for cell in cells:
+            if cell.attrib.get("r") == reference:
+                return cell
+        if not create:
+            return None
+        new_cell = ET.Element(xlsx_tag("c"), {"r": reference})
+        inserted = False
+        target_column = int(column_number)
+        for index, cell in enumerate(cells):
+            if xlsx_column_number(cell.attrib.get("r")) > target_column:
+                row.insert(index, new_cell)
+                inserted = True
+                break
+        if not inserted:
+            row.append(new_cell)
+        self.changed_sheet_names.add(sheet_name)
+        return new_cell
+
+    def get_cell_value(self, sheet_name, row_number, column_number):
+        return self.cell_value_from_element(
+            self.get_cell_element(sheet_name, row_number, column_number, create=False)
+        )
+
+    def set_cell_value(self, sheet_name, row_number, column_number, value):
+        cell = self.get_cell_element(sheet_name, row_number, column_number, create=True)
+        for child_name in ("f", "v", "is"):
+            child = cell.find(xlsx_tag(child_name))
+            if child is not None:
+                cell.remove(child)
+        if value is None or value == "":
+            cell.attrib.pop("t", None)
+        elif isinstance(value, bool):
+            cell.attrib["t"] = "b"
+            ET.SubElement(cell, xlsx_tag("v")).text = "1" if value else "0"
+        elif isinstance(value, (int, float)) and not isinstance(value, bool):
+            cell.attrib.pop("t", None)
+            ET.SubElement(cell, xlsx_tag("v")).text = str(value)
+        else:
+            text = value.strftime("%Y/%m/%d") if isinstance(value, (datetime, date)) else str(value)
+            cell.attrib["t"] = "inlineStr"
+            inline = ET.SubElement(cell, xlsx_tag("is"))
+            text_element = ET.SubElement(inline, xlsx_tag("t"))
+            if text != text.strip() or "\n" in text:
+                text_element.attrib[f"{{{XLSX_XML_NS}}}space"] = "preserve"
+            text_element.text = text
+        self.changed_sheet_names.add(sheet_name)
+
+    def get_max_row(self, sheet_name):
+        maximum = 1
+        for row in self.get_sheet_data(sheet_name).findall(xlsx_tag("row")):
+            try:
+                maximum = max(maximum, int(row.attrib.get("r", "0") or 0))
+            except Exception:
+                pass
+        return maximum
+
+    def get_header_map(self, sheet_name):
+        result = {}
+        row = self.get_row_element(sheet_name, 1, create=False)
+        if row is None:
+            return result
+        for cell in row.findall(xlsx_tag("c")):
+            column = xlsx_column_number(cell.attrib.get("r"))
+            header = normalize_trade_partner_header(self.cell_value_from_element(cell))
+            if header and header not in result:
+                result[header] = column
+        return result
+
+    def read_sheet(self, sheet_name):
+        header_map = self.get_header_map(sheet_name)
+        headers = list(header_map.keys())
+        rows = []
+        for row_number in range(2, self.get_max_row(sheet_name) + 1):
+            row = {
+                header: self.get_cell_value(sheet_name, row_number, column)
+                for header, column in header_map.items()
+            }
+            row["_row_number"] = row_number
+            rows.append(row)
+        return {"headers": headers, "rows": rows}
+
+    def to_bytes(self):
+        for sheet_name in self.changed_sheet_names:
+            path = self.sheet_paths[sheet_name]
+            self.parts[path] = ET.tostring(
+                self.get_sheet_root(sheet_name),
+                encoding="utf-8",
+                xml_declaration=True,
+            )
+        output = BytesIO()
+        with zipfile.ZipFile(output, "w") as archive:
+            for info in self.original_infos:
+                archive.writestr(info, self.parts[info.filename])
+        return output.getvalue()
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def load_trade_partner_data():
+    access_token = get_dropbox_access_token()
+    path = get_trade_partner_file_path()
+    content, response = download_dropbox_file(path, access_token)
+    if content is None:
+        raise RuntimeError(
+            "取引先カルテ.xlsxをDropboxから取得できませんでした。\n"
+            + dropbox_error_text(response)
+        )
+
+    editor = TradePartnerXlsxEditor(content)
+    missing = [name for name in TRADE_PARTNER_REQUIRED_SHEETS if not editor.has_sheet(name)]
+    if missing:
+        raise RuntimeError("取引先カルテ.xlsxに必要なシートがありません：" + "、".join(missing))
+    return {name: editor.read_sheet(name) for name in TRADE_PARTNER_REQUIRED_SHEETS}
+
+def get_trade_partner_master_rows(data, partner_type=None):
+    rows = []
+    for row in data[TRADE_PARTNER_MASTER_SHEET]["rows"]:
+        if not trade_partner_text(row.get("会社名")):
+            continue
+        if partner_type and not is_trade_partner_marked(row.get(trade_partner_category_field(partner_type))):
+            continue
+        rows.append(row)
+    return rows
+
+
+def get_trade_partner_by_id(data, partner_id):
+    target = str(partner_id or "").strip()
+    for row in get_trade_partner_master_rows(data):
+        if trade_partner_text(row.get("取引先ID")) == target:
+            return row
+    return None
+
+
+def get_trade_partner_related_rows(data, sheet_name, partner_id):
+    target = str(partner_id or "").strip()
+    primary_field = TRADE_PARTNER_PRIMARY_FIELDS[sheet_name]
+    result = []
+    for row in data[sheet_name]["rows"]:
+        if trade_partner_text(row.get("取引先ID")) != target:
+            continue
+        if not trade_partner_text(row.get(primary_field)):
+            continue
+        result.append(row)
+    return result
+
+
+def trade_partner_sort_key(row):
+    kana = trade_partner_text(row.get("会社名かな"))
+    company = trade_partner_text(row.get("会社名"))
+    return (kana or company, company)
+
+
+def make_trade_partner_note_key(partner_type, partner_id, company_name=None):
+    """会社名が変わってもメモが外れないよう、区分と取引先IDだけで紐づける。"""
+    prefix = TRADE_PARTNER_NOTE_PREFIXES.get(partner_type, "【取引先】")
+    return f"{prefix}{partner_id}"
+
+
+def parse_trade_partner_note_key(value):
+    text = trade_partner_text(value)
+    for partner_type, prefix in TRADE_PARTNER_NOTE_PREFIXES.items():
+        if text.startswith(prefix):
+            body = text[len(prefix):]
+            partner_id, separator, company = body.partition("|")
+            return {
+                "partner_type": partner_type,
+                "partner_id": partner_id.strip(),
+                "company_name": company.strip() if separator else "",
+            }
+    return None
+
+
+def ensure_trade_partner_backup_folder(access_token):
+    response = call_dropbox_rpc(
+        "files/create_folder_v2",
+        {"path": TRADE_PARTNER_BACKUP_FOLDER, "autorename": False},
+        access_token,
+    )
+    if response.status_code == 200:
+        return
+    try:
+        summary = str(response.json().get("error_summary", "")).lower()
+    except Exception:
+        summary = str(getattr(response, "text", "")).lower()
+    if "conflict" in summary and "folder" in summary:
+        return
+    raise RuntimeError(
+        "取引先カルテのバックアップフォルダを作成できませんでした。\n"
+        + dropbox_error_text(response)
+    )
+
+
+def create_trade_partner_backup(target_path, backup_path, original_content, access_token):
+    ensure_trade_partner_backup_folder(access_token)
+    copy_response = copy_dropbox_file(target_path, backup_path, access_token)
+    if copy_response.status_code == 200:
+        metadata = get_dropbox_response_metadata(copy_response)
+        if not metadata.get("content_hash") or metadata.get("size") is None:
+            metadata = get_dropbox_file_metadata(backup_path, access_token)
+        try:
+            verify_dropbox_file_metadata(metadata, original_content)
+            return
+        except Exception:
+            call_dropbox_rpc("files/delete_v2", {"path": backup_path}, access_token)
+            raise RuntimeError(
+                "取引先カルテ.xlsxが別の端末で更新された可能性があります。再読み込みしてやり直してください。"
+            )
+
+    backup_response = upload_dropbox_file(
+        backup_path,
+        original_content,
+        access_token,
+        mode="add",
+    )
+    if backup_response.status_code != 200:
+        raise RuntimeError(
+            "取引先カルテのバックアップを作成できないため、本番ファイルは更新しません。\n"
+            + dropbox_error_text(backup_response)
+        )
+    metadata = get_dropbox_response_metadata(backup_response)
+    if not metadata.get("content_hash") or metadata.get("size") is None:
+        metadata = get_dropbox_file_metadata(backup_path, access_token)
+    verify_dropbox_file_metadata(metadata, original_content)
+
+
+def trim_trade_partner_backups(access_token, keep=30):
+    response = call_dropbox_rpc(
+        "files/list_folder",
+        {"path": TRADE_PARTNER_BACKUP_FOLDER, "recursive": False, "include_deleted": False},
+        access_token,
+    )
+    if response.status_code != 200:
+        return
+    try:
+        entries = list(response.json().get("entries", []))
+    except Exception:
+        return
+    pattern = re.compile(r"^取引先カルテ_\d{8}_\d{6}_\d+\.xlsx$")
+    files = [item for item in entries if pattern.match(str(item.get("name", "")))]
+    files.sort(key=lambda item: str(item.get("server_modified", "")), reverse=True)
+    for item in files[keep:]:
+        path = item.get("path_lower") or item.get("path_display")
+        if path:
+            call_dropbox_rpc("files/delete_v2", {"path": path}, access_token)
+
+
+def save_trade_partner_workbook(mutator):
+    access_token = get_dropbox_access_token()
+    target_path = get_trade_partner_file_path()
+    original_content, download_response = download_dropbox_file(target_path, access_token)
+    if original_content is None:
+        raise RuntimeError(
+            "最新の取引先カルテ.xlsxを取得できませんでした。\n"
+            + dropbox_error_text(download_response)
+        )
+    revision = get_download_revision(download_response)
+    if not revision:
+        raise RuntimeError("Dropboxの更新番号を確認できないため、安全のため保存を中止しました。")
+
+    timestamp = get_jst_now().strftime("%Y%m%d_%H%M%S_%f")
+    backup_path = f"{TRADE_PARTNER_BACKUP_FOLDER}/取引先カルテ_{timestamp}.xlsx"
+    create_trade_partner_backup(
+        target_path,
+        backup_path,
+        original_content,
+        access_token,
+    )
+
+    editor = TradePartnerXlsxEditor(original_content)
+    missing = [name for name in TRADE_PARTNER_REQUIRED_SHEETS if not editor.has_sheet(name)]
+    if missing:
+        raise ValueError("必要なシートがありません：" + "、".join(missing))
+    result = mutator(editor)
+    saved_content = editor.to_bytes()
+
+    # XML更新後もブック構造と入力規則の拡張部分が残っていることを確認する。
+    verified = TradePartnerXlsxEditor(saved_content)
+    missing = [name for name in TRADE_PARTNER_REQUIRED_SHEETS if not verified.has_sheet(name)]
+    if missing:
+        raise ValueError("保存後の検証で必要なシートがありません：" + "、".join(missing))
+    for sheet_name in TRADE_PARTNER_REQUIRED_SHEETS:
+        if not verified.get_header_map(sheet_name):
+            raise ValueError(f"保存後の検証で{sheet_name}の見出しを確認できません。")
+
+    upload_response = upload_dropbox_file(
+        target_path,
+        saved_content,
+        access_token,
+        mode="update",
+        revision=revision,
+    )
+    if upload_response.status_code != 200:
+        raise RuntimeError(
+            "取引先カルテ.xlsxを更新できませんでした。\n"
+            + dropbox_error_text(upload_response)
+        )
+    metadata = get_dropbox_response_metadata(upload_response)
+    if not metadata.get("content_hash") or metadata.get("size") is None:
+        metadata = get_dropbox_file_metadata(target_path, access_token)
+    verify_dropbox_file_metadata(metadata, saved_content, previous_revision=revision)
+    trim_trade_partner_backups(access_token, keep=30)
+    st.cache_data.clear()
+    return result
+
+def trade_partner_input_value(header, value):
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if header in {"単価", "運賃"}:
+        normalized = text.replace(",", "").translate(
+            str.maketrans("０１２３４５６７８９．－", "0123456789.-")
+        )
+        try:
+            number = float(normalized)
+            return int(number) if number.is_integer() else number
+        except Exception:
+            return text
+    return text
+
+
+def update_trade_partner_row(sheet_name, record_id, values):
+    id_field = TRADE_PARTNER_ID_FIELDS[sheet_name]
+    target_id = str(record_id or "").strip()
+
+    def mutator(editor):
+        header_map = editor.get_header_map(sheet_name)
+        if id_field not in header_map:
+            raise ValueError(f"{sheet_name}に{id_field}列がありません。")
+        target_row = None
+        for row_number in range(2, editor.get_max_row(sheet_name) + 1):
+            current_id = trade_partner_text(
+                editor.get_cell_value(sheet_name, row_number, header_map[id_field])
+            )
+            if current_id == target_id:
+                target_row = row_number
+                break
+        if target_row is None:
+            raise ValueError(f"{sheet_name}で対象IDが見つかりません。")
+        changed = 0
+        for header, value in values.items():
+            if header not in header_map or header == id_field or header == "会社名（確認用）":
+                continue
+            old_value = editor.get_cell_value(sheet_name, target_row, header_map[header])
+            new_value = trade_partner_input_value(header, value)
+            if not same_excel_value(old_value, new_value):
+                editor.set_cell_value(sheet_name, target_row, header_map[header], new_value)
+                changed += 1
+        if changed == 0:
+            raise ValueError("変更された項目がありません。")
+        return {"record_id": target_id, "changed": changed}
+
+    return save_trade_partner_workbook(mutator)
+
+
+def find_trade_partner_empty_row(editor, sheet_name, header_map, primary_field):
+    if primary_field not in header_map:
+        raise ValueError(f"{sheet_name}に{primary_field}列がありません。")
+    id_field = TRADE_PARTNER_ID_FIELDS[sheet_name]
+    if id_field not in header_map:
+        raise ValueError(f"{sheet_name}に{id_field}列がありません。")
+    for row_number in range(2, editor.get_max_row(sheet_name) + 1):
+        primary = trade_partner_text(
+            editor.get_cell_value(sheet_name, row_number, header_map[primary_field])
+        )
+        record_id = trade_partner_text(
+            editor.get_cell_value(sheet_name, row_number, header_map[id_field])
+        )
+        if not primary and record_id:
+            return row_number, record_id
+    raise ValueError(
+        f"{sheet_name}に登録用の空き行がありません。ExcelでID付きの空き行を追加してください。"
+    )
+
+
+def create_trade_partner_record(sheet_name, values):
+    primary_field = TRADE_PARTNER_PRIMARY_FIELDS[sheet_name]
+    id_field = TRADE_PARTNER_ID_FIELDS[sheet_name]
+
+    def mutator(editor):
+        header_map = editor.get_header_map(sheet_name)
+        row_number, record_id = find_trade_partner_empty_row(
+            editor,
+            sheet_name,
+            header_map,
+            primary_field,
+        )
+        if sheet_name == TRADE_PARTNER_MASTER_SHEET:
+            company = trade_partner_text(values.get("会社名"))
+            if not company:
+                raise ValueError("会社名を入力してください。")
+            if "会社名" not in header_map:
+                raise ValueError("取引先マスターに会社名列がありません。")
+            for check_row in range(2, editor.get_max_row(sheet_name) + 1):
+                existing = trade_partner_text(
+                    editor.get_cell_value(sheet_name, check_row, header_map["会社名"])
+                )
+                if existing and normalize_match_value(existing) == normalize_match_value(company):
+                    raise ValueError("同じ会社名がすでに登録されています。")
+        for header, value in values.items():
+            if header not in header_map or header in {id_field, "会社名（確認用）"}:
+                continue
+            editor.set_cell_value(
+                sheet_name,
+                row_number,
+                header_map[header],
+                trade_partner_input_value(header, value),
+            )
+        return {"record_id": record_id, "row_number": row_number}
+
+    return save_trade_partner_workbook(mutator)
+
+def show_top_home_link():
+    st.markdown(render_page_link("← トップへ戻る", page="home"), unsafe_allow_html=True)
+
+
+def show_trade_partner_home_link(partner_type):
+    st.markdown(
+        render_page_link(
+            f"← {trade_partner_type_label(partner_type)}メニューへ戻る",
+            page=trade_partner_home_page(partner_type),
+        ),
+        unsafe_allow_html=True,
+    )
+
+
+def trade_partner_detail_link(row, partner_type, label=None, class_name="dispatch-month-link"):
+    partner_id = trade_partner_text(row.get("取引先ID"))
+    company = trade_partner_text(row.get("会社名"))
+    return render_page_link(
+        label or company,
+        page="partner_detail",
+        partner_id=partner_id,
+        partner_type=partner_type,
+        class_name=class_name,
+    )
+
+
+def show_trade_partner_home(partner_type):
+    show_top_home_link()
+    label = trade_partner_type_label(partner_type)
+    icon = "🏢" if partner_type == "supplier" else "🚚"
+    st.header(f"{icon} {label}")
+
+    register_page = "supplier_register" if partner_type == "supplier" else "carrier_register"
+    st.markdown(
+        render_page_link(f"＋ 新しい{label}を登録", page=register_page),
+        unsafe_allow_html=True,
+    )
+    st.markdown("---")
+
+    col1, col2 = st.columns(2)
+    with col1:
+        st.markdown(
+            render_page_link(f"📋 {label}一覧", page=trade_partner_list_page(partner_type)),
+            unsafe_allow_html=True,
+        )
+    with col2:
+        st.markdown(
+            render_page_link(f"🔍 {label}検索", page=trade_partner_search_page(partner_type)),
+            unsafe_allow_html=True,
+        )
+
+    if partner_type == "supplier":
+        st.markdown(
+            render_page_link("📦 商品検索", page="supplier_product"),
+            unsafe_allow_html=True,
+        )
+    else:
+        st.markdown(
+            render_page_link("🗺 運送条件検索", page="carrier_condition"),
+            unsafe_allow_html=True,
+        )
+
+
+def show_trade_partner_directory(partner_type):
+    show_trade_partner_home_link(partner_type)
+    label = trade_partner_type_label(partner_type)
+    st.header(f"📋 {label}一覧")
+    data = load_trade_partner_data()
+    rows = sorted(get_trade_partner_master_rows(data, partner_type), key=trade_partner_sort_key)
+    if not rows:
+        st.info(f"登録されている{label}はありません。")
+        return
+    st.caption(f"{len(rows)}件")
+    for row in rows:
+        company = trade_partner_text(row.get("会社名"))
+        region = trade_partner_text(row.get("地域"))
+        with st.container(border=True):
+            st.markdown(trade_partner_detail_link(row, partner_type), unsafe_allow_html=True)
+            if region:
+                st.write(f"地域：{region}")
+
+
+def show_trade_partner_search(partner_type):
+    show_trade_partner_home_link(partner_type)
+    label = trade_partner_type_label(partner_type)
+    st.header(f"🔍 {label}検索")
+    default_keyword = str(get_query_value("partner_search", "")).strip()
+    keyword = st.text_input(
+        "会社名・会社名かな・地域で検索",
+        value=default_keyword,
+        placeholder="入力すると候補を表示します",
+        key=f"{partner_type}_partner_search_input",
+    ).strip()
+    update_query_params(
+        page=trade_partner_search_page(partner_type),
+        partner_search=keyword or None,
+    )
+    if not keyword:
+        st.info("検索文字を入力してください。")
+        return
+    data = load_trade_partner_data()
+    target = normalize_match_value(keyword).lower()
+    matches = []
+    for row in get_trade_partner_master_rows(data, partner_type):
+        haystack = " ".join(
+            trade_partner_text(row.get(field))
+            for field in ("会社名", "会社名かな", "地域")
+        ).lower()
+        if target in normalize_match_value(haystack).lower():
+            matches.append(row)
+    matches.sort(key=trade_partner_sort_key)
+    if not matches:
+        st.warning("一致する会社が見つかりません。")
+        return
+    st.caption(f"{len(matches)}件")
+    for row in matches:
+        with st.container(border=True):
+            st.markdown(trade_partner_detail_link(row, partner_type), unsafe_allow_html=True)
+            region = trade_partner_text(row.get("地域"))
+            if region:
+                st.write(f"地域：{region}")
+
+
+def show_supplier_product_search():
+    show_trade_partner_home_link("supplier")
+    st.header("📦 仕入商品の検索")
+    data = load_trade_partner_data()
+    supplier_ids = {
+        trade_partner_text(row.get("取引先ID"))
+        for row in get_trade_partner_master_rows(data, "supplier")
+    }
+    products = [
+        row for row in data[TRADE_PARTNER_PRODUCT_SHEET]["rows"]
+        if trade_partner_text(row.get("取引先ID")) in supplier_ids
+        and trade_partner_text(row.get("商品名"))
+    ]
+    keyword = st.text_input(
+        "商品名で検索",
+        placeholder="例：酒、醤油粕",
+        key="supplier_product_search_input",
+    ).strip()
+    if not keyword:
+        st.info("商品名を入力してください。")
+        return
+    candidates = sorted({
+        trade_partner_text(row.get("商品名"))
+        for row in products
+        if normalize_match_value(keyword).lower()
+        in normalize_match_value(trade_partner_text(row.get("商品名"))).lower()
+    })
+    if not candidates:
+        st.warning("一致する商品名が見つかりません。")
+        return
+    st.caption("候補の商品名を選んでください。")
+    selected = st.session_state.get("selected_supplier_product", "")
+    columns = st.columns(min(3, max(1, len(candidates))))
+    for index, product_name in enumerate(candidates):
+        with columns[index % len(columns)]:
+            if st.button(product_name, key=f"supplier_product_candidate_{index}", use_container_width=True):
+                st.session_state["selected_supplier_product"] = product_name
+                selected = product_name
+                st.rerun()
+    if selected not in candidates:
+        return
+    st.markdown(f"### {selected}")
+    master_by_id = {
+        trade_partner_text(row.get("取引先ID")): row
+        for row in get_trade_partner_master_rows(data, "supplier")
+    }
+    exact_rows = [row for row in products if trade_partner_text(row.get("商品名")) == selected]
+    exact_rows.sort(key=lambda row: trade_partner_sort_key(master_by_id.get(trade_partner_text(row.get("取引先ID")), {})))
+    for product in exact_rows:
+        master = master_by_id.get(trade_partner_text(product.get("取引先ID")))
+        if not master:
+            continue
+        with st.container(border=True):
+            st.markdown(trade_partner_detail_link(master, "supplier"), unsafe_allow_html=True)
+            for field in data[TRADE_PARTNER_PRODUCT_SHEET]["headers"]:
+                if field in {"仕入商品ID", "取引先ID", "会社名（確認用）", "商品名"}:
+                    continue
+                value = trade_partner_text(product.get(field))
+                if value:
+                    st.write(f"**{field}：** {value}")
+
+
+def show_carrier_condition_search():
+    show_trade_partner_home_link("carrier")
+    st.header("🗺 運送条件検索")
+    keyword = st.text_input(
+        "納品先・地域・運賃などで検索",
+        placeholder="例：帯広、釧路",
+        key="carrier_condition_search_input",
+    ).strip()
+    if not keyword:
+        st.info("検索文字を入力してください。")
+        return
+    data = load_trade_partner_data()
+    carrier_ids = {
+        trade_partner_text(row.get("取引先ID"))
+        for row in get_trade_partner_master_rows(data, "carrier")
+    }
+    target = normalize_match_value(keyword).lower()
+    matches = []
+    for row in data[TRADE_PARTNER_TRANSPORT_SHEET]["rows"]:
+        partner_id = trade_partner_text(row.get("取引先ID"))
+        if partner_id not in carrier_ids:
+            continue
+        values = [
+            trade_partner_text(row.get(header))
+            for header in data[TRADE_PARTNER_TRANSPORT_SHEET]["headers"]
+            if header not in {"運送条件ID", "取引先ID", "会社名（確認用）"}
+        ]
+        if target in normalize_match_value(" ".join(values)).lower():
+            matches.append(row)
+    if not matches:
+        st.warning("一致する運送条件が見つかりません。")
+        return
+    master_by_id = {
+        trade_partner_text(row.get("取引先ID")): row
+        for row in get_trade_partner_master_rows(data, "carrier")
+    }
+    for condition in matches:
+        master = master_by_id.get(trade_partner_text(condition.get("取引先ID")))
+        if not master:
+            continue
+        with st.container(border=True):
+            st.markdown(trade_partner_detail_link(master, "carrier"), unsafe_allow_html=True)
+            for field in data[TRADE_PARTNER_TRANSPORT_SHEET]["headers"]:
+                if field in {"運送条件ID", "取引先ID", "会社名（確認用）"}:
+                    continue
+                value = trade_partner_text(condition.get(field))
+                if value:
+                    st.write(f"**{field}：** {value}")
+
+
+def render_trade_partner_fields(row, headers, excluded=None):
+    excluded = set(excluded or [])
+    visible = []
+    for header in headers:
+        if header in excluded or header.startswith("_"):
+            continue
+        value = trade_partner_text(row.get(header))
+        if value:
+            visible.append((header, value))
+    if not visible:
+        st.caption("入力済みの情報はありません。")
+        return
+    for start in range(0, len(visible), 2):
+        cols = st.columns(2)
+        for offset, item in enumerate(visible[start:start + 2]):
+            header, value = item
+            with cols[offset]:
+                st.caption(header)
+                st.markdown(f"**{html.escape(value)}**")
+
+
+def render_trade_partner_row_editor(sheet_name, row, headers, key_prefix):
+    id_field = TRADE_PARTNER_ID_FIELDS[sheet_name]
+    record_id = trade_partner_text(row.get(id_field))
+    excluded_headers = {id_field, "取引先ID", "会社名（確認用）"}
+    if sheet_name == TRADE_PARTNER_MASTER_SHEET:
+        excluded_headers.update({"仕入先区分", "運送会社区分"})
+    editable_headers = [header for header in headers if header not in excluded_headers]
+    with st.expander("編集"):
+        with st.form(f"edit_{key_prefix}_{record_id}"):
+            inputs = {}
+            for header in editable_headers:
+                inputs[header] = st.text_input(
+                    header,
+                    value=trade_partner_text(row.get(header)),
+                    key=f"edit_{key_prefix}_{record_id}_{header}",
+                )
+            submitted = st.form_submit_button("バックアップして保存", use_container_width=True)
+        if submitted:
+            try:
+                with st.spinner("バックアップを作成して保存しています…"):
+                    update_trade_partner_row(sheet_name, record_id, inputs)
+                st.success("保存しました。")
+                st.rerun()
+            except Exception as error:
+                st.error(str(error))
+
+
+def render_trade_partner_related_section(data, sheet_name, partner_id, title, add_label):
+    headers = data[sheet_name]["headers"]
+    rows = get_trade_partner_related_rows(data, sheet_name, partner_id)
+    id_field = TRADE_PARTNER_ID_FIELDS[sheet_name]
+    primary_field = TRADE_PARTNER_PRIMARY_FIELDS[sheet_name]
+    st.markdown("---")
+    st.subheader(title)
+    if not rows:
+        st.info(f"{title}はまだ登録されていません。")
+    for row in rows:
+        with st.container(border=True):
+            heading = trade_partner_text(row.get(primary_field))
+            st.markdown(f"**{html.escape(heading)}**")
+            render_trade_partner_fields(
+                row,
+                headers,
+                excluded={id_field, "取引先ID", "会社名（確認用）", primary_field},
+            )
+            render_trade_partner_row_editor(
+                sheet_name,
+                row,
+                headers,
+                key_prefix=f"{sheet_name}_{partner_id}",
+            )
+
+    with st.expander(f"＋ {add_label}"):
+        editable_headers = [
+            header for header in headers
+            if header not in {id_field, "取引先ID", "会社名（確認用）"}
+        ]
+        with st.form(f"add_{sheet_name}_{partner_id}"):
+            values = {"取引先ID": partner_id}
+            for header in editable_headers:
+                values[header] = st.text_input(
+                    header,
+                    key=f"add_{sheet_name}_{partner_id}_{header}",
+                )
+            submitted = st.form_submit_button("バックアップして追加", use_container_width=True)
+        if submitted:
+            try:
+                if not trade_partner_text(values.get(primary_field)):
+                    raise ValueError(f"{primary_field}を入力してください。")
+                with st.spinner("バックアップを作成して保存しています…"):
+                    create_trade_partner_record(sheet_name, values)
+                st.success("追加しました。")
+                st.rerun()
+            except Exception as error:
+                st.error(str(error))
+
+
+def show_trade_partner_notes(partner_type, partner_id, company_name):
+    st.markdown("---")
+    st.subheader(f"📝 この{trade_partner_type_label(partner_type)}のメモ")
+    note_key = make_trade_partner_note_key(partner_type, partner_id, company_name)
+    input_key = f"trade_partner_note_{partner_type}_{partner_id}"
+    clear_key = f"clear_{input_key}"
+    if st.session_state.pop(clear_key, False):
+        st.session_state[input_key] = ""
+    note_text = st.text_area(
+        "メモ本文",
+        key=input_key,
+        height=120,
+        help=VOICE_INPUT_HELP,
+    )
+    if st.button("メモを保存", key=f"save_{input_key}"):
+        if add_note(note_key, note_text):
+            st.session_state[clear_key] = True
+            st.rerun()
+    notes = get_notes_for_customer(note_key)
+    if not notes:
+        st.info("メモはまだありません。")
+        return
+    st.markdown("#### メモ履歴")
+    for note in notes:
+        render_note_card(note, show_customer=False)
+        render_note_delete_controls(note)
+
+
+def show_trade_partner_detail(partner_type, partner_id):
+    show_trade_partner_home_link(partner_type)
+    data = load_trade_partner_data()
+    master = get_trade_partner_by_id(data, partner_id)
+    if not master or not is_trade_partner_marked(master.get(trade_partner_category_field(partner_type))):
+        st.warning("選択した会社の情報が見つかりません。")
+        return
+    label = trade_partner_type_label(partner_type)
+    company = trade_partner_text(master.get("会社名"))
+    st.header(f"{'🏢' if partner_type == 'supplier' else '🚚'} {company}")
+    st.caption(f"{label}ID：{trade_partner_text(master.get('取引先ID'))}")
+
+    map_value = trade_partner_text(master.get("マップ位置")) or trade_partner_text(master.get("住所"))
+    if map_value:
+        map_url = build_google_maps_url(map_value)
+        if map_url:
+            show_google_maps_button(map_url)
+
+    st.subheader("基本情報")
+    master_headers = data[TRADE_PARTNER_MASTER_SHEET]["headers"]
+    render_trade_partner_fields(
+        master,
+        master_headers,
+        excluded={"取引先ID", "仕入先区分", "運送会社区分", "会社名"},
+    )
+    render_trade_partner_row_editor(
+        TRADE_PARTNER_MASTER_SHEET,
+        master,
+        master_headers,
+        key_prefix=f"master_{partner_type}",
+    )
+
+    render_trade_partner_related_section(
+        data,
+        TRADE_PARTNER_CONTACT_SHEET,
+        partner_id,
+        "担当者",
+        "担当者を追加",
+    )
+    if partner_type == "supplier":
+        render_trade_partner_related_section(
+            data,
+            TRADE_PARTNER_PRODUCT_SHEET,
+            partner_id,
+            "取扱商品",
+            "商品を追加",
+        )
+    else:
+        render_trade_partner_related_section(
+            data,
+            TRADE_PARTNER_TRANSPORT_SHEET,
+            partner_id,
+            "運送条件",
+            "運送条件を追加",
+        )
+    show_trade_partner_notes(partner_type, partner_id, company)
+
+
+def show_trade_partner_register(partner_type):
+    show_trade_partner_home_link(partner_type)
+    label = trade_partner_type_label(partner_type)
+    st.header(f"＋ 新しい{label}を登録")
+    data = load_trade_partner_data()
+    headers = data[TRADE_PARTNER_MASTER_SHEET]["headers"]
+    editable_headers = [
+        header for header in headers
+        if header not in {"取引先ID", "仕入先区分", "運送会社区分"}
+    ]
+    other_label = "運送会社でもある" if partner_type == "supplier" else "仕入先でもある"
+    with st.form(f"register_{partner_type}"):
+        values = {}
+        for header in editable_headers:
+            values[header] = st.text_input(
+                header,
+                key=f"register_{partner_type}_{header}",
+            )
+        also_other = st.checkbox(other_label, key=f"register_{partner_type}_also_other")
+        submitted = st.form_submit_button("バックアップして登録", use_container_width=True)
+    if submitted:
+        try:
+            if not trade_partner_text(values.get("会社名")):
+                raise ValueError("会社名を入力してください。")
+            values[trade_partner_category_field(partner_type)] = "○"
+            if also_other:
+                values[trade_partner_category_field("carrier" if partner_type == "supplier" else "supplier")] = "○"
+            with st.spinner("バックアップを作成して登録しています…"):
+                result = create_trade_partner_record(TRADE_PARTNER_MASTER_SHEET, values)
+            partner_id = result["record_id"]
+            st.session_state["selected_partner_id"] = partner_id
+            st.session_state["selected_partner_type"] = partner_type
+            st.session_state["page"] = "partner_detail"
+            update_query_params(
+                page="partner_detail",
+                partner_id=partner_id,
+                partner_type=partner_type,
+            )
+            st.rerun()
+        except Exception as error:
+            st.error(str(error))
+
+
+def render_trade_note_card(note, category, partner_names=None):
+    parsed = parse_trade_partner_note_key(note.get("customer_name"))
+    created_at = format_note_datetime(note.get("created_at", ""))
+    body = html.escape(clean_value(note.get("body"), blank_text="")).replace("\n", "<br>")
+    if parsed:
+        partner_names = partner_names or {}
+        company_name = (
+            partner_names.get((parsed["partner_type"], parsed["partner_id"]))
+            or parsed.get("company_name")
+            or parsed["partner_id"]
+        )
+        company_link = render_page_link(
+            company_name,
+            page="partner_detail",
+            partner_id=parsed["partner_id"],
+            partner_type=parsed["partner_type"],
+            class_name="dispatch-month-link",
+        )
+        meta = f"{html.escape(created_at)}　{company_link}"
+    else:
+        customer_name = clean_value(note.get("customer_name"), blank_text="未設定")
+        customer_link = build_customer_detail_link(customer_name, class_name="dispatch-month-link")
+        meta = f"{html.escape(created_at)}　{customer_link}"
+    st.markdown(
+        f'<div class="note-card"><div class="note-meta">{meta}</div><div class="note-body">{body}</div></div>',
+        unsafe_allow_html=True,
+    )
+
+
+def show_trade_notes_page():
+    show_top_home_link()
+    st.header("📝 取引先メモ")
+    notes = load_notes_from_supabase()
+    try:
+        partner_data = load_trade_partner_data()
+        partner_names = {}
+        for partner_type in ("supplier", "carrier"):
+            for row in get_trade_partner_master_rows(partner_data, partner_type):
+                partner_names[(partner_type, trade_partner_text(row.get("取引先ID")))] = trade_partner_text(row.get("会社名"))
+    except Exception:
+        partner_names = {}
+    tabs = st.tabs(["顧客", "仕入先", "運送会社"])
+    categories = ["customer", "supplier", "carrier"]
+    for tab, category in zip(tabs, categories):
+        with tab:
+            filtered = []
+            for note in notes:
+                parsed = parse_trade_partner_note_key(note.get("customer_name"))
+                if category == "customer" and parsed is None:
+                    filtered.append(note)
+                elif parsed and parsed["partner_type"] == category:
+                    filtered.append(note)
+            if not filtered:
+                st.info("メモはまだありません。")
+                continue
+            for note in filtered:
+                render_trade_note_card(note, category, partner_names=partner_names)
+                render_note_delete_controls(note)
+
+
+def show_top_home():
+    st.subheader("取引先を選択")
+    col1, col2 = st.columns(2)
+    with col1:
+        st.markdown(render_page_link("👥 顧客", page="customer_home"), unsafe_allow_html=True)
+    with col2:
+        st.markdown(render_page_link("🏢 仕入先", page="supplier_home"), unsafe_allow_html=True)
+    col3, col4 = st.columns(2)
+    with col3:
+        st.markdown(render_page_link("🚚 運送会社", page="carrier_home"), unsafe_allow_html=True)
+    with col4:
+        st.markdown(render_page_link("📝 取引先メモ", page="trade_notes"), unsafe_allow_html=True)
+
+
 # =========================
 # ホームメニュー
 # =========================
 def show_home_menu():
-    st.subheader("メニュー")
+    show_top_home_link()
+    st.subheader("顧客メニュー")
 
     col1, col2 = st.columns(2)
     with col1:
@@ -6710,35 +7996,64 @@ if "page" not in st.session_state:
 
 if "selected_customer" not in st.session_state:
     st.session_state["selected_customer"] = None
+if "selected_partner_id" not in st.session_state:
+    st.session_state["selected_partner_id"] = None
+if "selected_partner_type" not in st.session_state:
+    st.session_state["selected_partner_type"] = None
 
-# URLにpage/customerがある場合は、ブラウザの戻る・進むに合わせて画面を復元する。
+# URLに画面情報がある場合は、ブラウザの戻る・進むに合わせて復元する。
 handle_customer_query_param()
 
-
-MENU_OPTIONS = {
-    "👥 顧客名一覧": "customer_list",
-    "🔍 顧客検索": "customer",
-    "📍 地域検索": "region",
-    "🔎 商品検索": "product",
-    "🗓 配車カレンダー": "calendar",
-    "🚚 配車表": "dispatch_table",
-    "🧪 ソリュブル在庫": "soluble_inventory",
-    "📝 メモ帳": "notes",
-}
-
 current_page = st.session_state.get("page", "home")
+customer_pages = {
+    "customer_home", "customer_list", "customer", "region", "product", "calendar",
+    "dispatch_table", "soluble_inventory", "notes", "detail",
+}
+supplier_pages = {
+    "supplier_home", "supplier_list", "supplier_search", "supplier_product",
+    "supplier_register",
+}
+carrier_pages = {
+    "carrier_home", "carrier_list", "carrier_search", "carrier_condition",
+    "carrier_register",
+}
 
 with st.sidebar:
     st.title(f"🚚 {APP_TITLE}")
     st.markdown("### メニュー")
-    st.markdown(render_page_link("👥 顧客名一覧", page="customer_list"), unsafe_allow_html=True)
-    st.markdown(render_page_link("🔍 顧客検索", page="customer"), unsafe_allow_html=True)
-    st.markdown(render_page_link("📍 地域検索", page="region"), unsafe_allow_html=True)
-    st.markdown(render_page_link("🔎 商品検索", page="product"), unsafe_allow_html=True)
-    st.markdown(render_page_link("🗓 配車カレンダー", page="calendar"), unsafe_allow_html=True)
-    st.markdown(render_page_link("🚚 配車表", page="dispatch_table"), unsafe_allow_html=True)
-    st.markdown(render_page_link("🧪 ソリュブル在庫", page="soluble_inventory"), unsafe_allow_html=True)
-    st.markdown(render_page_link("📝 メモ帳", page="notes"), unsafe_allow_html=True)
+    st.markdown(render_page_link("🏠 トップ", page="home"), unsafe_allow_html=True)
+    st.markdown(render_page_link("👥 顧客", page="customer_home"), unsafe_allow_html=True)
+    st.markdown(render_page_link("🏢 仕入先", page="supplier_home"), unsafe_allow_html=True)
+    st.markdown(render_page_link("🚚 運送会社", page="carrier_home"), unsafe_allow_html=True)
+    st.markdown(render_page_link("📝 取引先メモ", page="trade_notes"), unsafe_allow_html=True)
+
+    if current_page in customer_pages:
+        st.markdown("---")
+        st.markdown("#### 顧客メニュー")
+        st.markdown(render_page_link("👥 顧客名一覧", page="customer_list"), unsafe_allow_html=True)
+        st.markdown(render_page_link("🔍 顧客検索", page="customer"), unsafe_allow_html=True)
+        st.markdown(render_page_link("📍 地域検索", page="region"), unsafe_allow_html=True)
+        st.markdown(render_page_link("🔎 商品検索", page="product"), unsafe_allow_html=True)
+        st.markdown(render_page_link("🗓 配車カレンダー", page="calendar"), unsafe_allow_html=True)
+        st.markdown(render_page_link("🚚 配車表", page="dispatch_table"), unsafe_allow_html=True)
+        st.markdown(render_page_link("🧪 ソリュブル在庫", page="soluble_inventory"), unsafe_allow_html=True)
+        st.markdown(render_page_link("📝 顧客メモ", page="notes"), unsafe_allow_html=True)
+    elif current_page in supplier_pages or (
+        current_page == "partner_detail" and st.session_state.get("selected_partner_type") == "supplier"
+    ):
+        st.markdown("---")
+        st.markdown("#### 仕入先メニュー")
+        st.markdown(render_page_link("📋 仕入先一覧", page="supplier_list"), unsafe_allow_html=True)
+        st.markdown(render_page_link("🔍 仕入先検索", page="supplier_search"), unsafe_allow_html=True)
+        st.markdown(render_page_link("📦 商品検索", page="supplier_product"), unsafe_allow_html=True)
+    elif current_page in carrier_pages or (
+        current_page == "partner_detail" and st.session_state.get("selected_partner_type") == "carrier"
+    ):
+        st.markdown("---")
+        st.markdown("#### 運送会社メニュー")
+        st.markdown(render_page_link("📋 運送会社一覧", page="carrier_list"), unsafe_allow_html=True)
+        st.markdown(render_page_link("🔍 運送会社検索", page="carrier_search"), unsafe_allow_html=True)
+        st.markdown(render_page_link("🗺 運送条件検索", page="carrier_condition"), unsafe_allow_html=True)
 
     st.markdown("---")
     if st.button("🔄 更新", use_container_width=True):
@@ -6750,7 +8065,7 @@ col_title, col_logout = st.columns([3, 1])
 
 with col_title:
     st.title(f"🚚 {APP_TITLE}")
-    st.caption("顧客名一覧・顧客検索・地域検索・商品検索・配車カレンダー・配車表・ソリュブル在庫・メモ帳")
+    st.caption("顧客・仕入先・運送会社の情報を確認・編集します。")
 
 with col_logout:
     st.write("")
@@ -6758,6 +8073,8 @@ with col_logout:
         st.session_state.authenticated = False
         st.session_state.page = "home"
         st.session_state.selected_customer = None
+        st.session_state.selected_partner_id = None
+        st.session_state.selected_partner_type = None
         try:
             st.query_params.clear()
         except Exception:
@@ -6766,6 +8083,9 @@ with col_logout:
 
 try:
     if st.session_state["page"] == "home":
+        show_top_home()
+
+    elif st.session_state["page"] == "customer_home":
         show_home_menu()
         show_customer_search()
 
@@ -6795,17 +8115,49 @@ try:
     elif st.session_state["page"] == "notes":
         show_notes_page(None)
 
+    elif st.session_state["page"] == "trade_notes":
+        show_trade_notes_page()
+
     elif st.session_state["page"] == "detail":
         selected = st.session_state.get("selected_customer")
         if selected:
-            # 商品カード保存直後だけ、保存済みExcelから作った最新データを直接使う。
-            # Dropboxのメタデータ反映が一瞬遅れても、保存ボタン1回で日付を更新する。
             immediate_df = st.session_state.pop("customer_excel_immediate_df", None)
             if isinstance(immediate_df, pd.DataFrame) and not immediate_df.empty:
                 df = immediate_df
             else:
                 df = load_data()
             show_customer_detail(df, selected)
+        else:
+            set_page("customer_home")
+            st.rerun()
+
+    elif st.session_state["page"] == "supplier_home":
+        show_trade_partner_home("supplier")
+    elif st.session_state["page"] == "supplier_list":
+        show_trade_partner_directory("supplier")
+    elif st.session_state["page"] == "supplier_search":
+        show_trade_partner_search("supplier")
+    elif st.session_state["page"] == "supplier_product":
+        show_supplier_product_search()
+    elif st.session_state["page"] == "supplier_register":
+        show_trade_partner_register("supplier")
+
+    elif st.session_state["page"] == "carrier_home":
+        show_trade_partner_home("carrier")
+    elif st.session_state["page"] == "carrier_list":
+        show_trade_partner_directory("carrier")
+    elif st.session_state["page"] == "carrier_search":
+        show_trade_partner_search("carrier")
+    elif st.session_state["page"] == "carrier_condition":
+        show_carrier_condition_search()
+    elif st.session_state["page"] == "carrier_register":
+        show_trade_partner_register("carrier")
+
+    elif st.session_state["page"] == "partner_detail":
+        partner_id = st.session_state.get("selected_partner_id")
+        partner_type = st.session_state.get("selected_partner_type")
+        if partner_id and partner_type in {"supplier", "carrier"}:
+            show_trade_partner_detail(partner_type, partner_id)
         else:
             set_page("home")
             st.rerun()
@@ -6815,4 +8167,7 @@ except Exception as e:
     st.exception(e)
     st.stop()
 
-st.caption("※ 顧客情報はSheet1、配車表は配車表1.xlsm、ソリュブル在庫はaoベンチャーグレイン配車表.xlsxを読み込んで表示しています。")
+st.caption(
+    "※ 顧客情報は配車予定 次郎.xlsm、仕入先・運送会社は取引先カルテ.xlsxを読み込んで表示しています。"
+)
+
