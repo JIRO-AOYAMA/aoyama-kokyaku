@@ -7297,7 +7297,7 @@ def save_trade_partner_workbook(mutator):
         saved_content,
         access_token,
         mode="update",
-        revision=revision,
+        rev=revision,
     )
     if upload_response.status_code != 200:
         raise RuntimeError(
