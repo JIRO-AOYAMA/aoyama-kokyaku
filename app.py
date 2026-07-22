@@ -5267,8 +5267,9 @@ def show_dispatch_filtered_list(df):
         render_dispatch_board_card(row)
 
 
-def render_dispatch_responsive_list(display_df):
+def render_dispatch_responsive_list(display_df, customer_names=None):
     """PCはExcel風一覧、スマホは横スクロール不要の縦型カードで表示する。"""
+    customer_names = set(customer_names or [])
     st.markdown(
         """
         <style>
@@ -5419,6 +5420,15 @@ def render_dispatch_responsive_list(display_df):
         text = normalize_dispatch_text(value) or "未入力"
         return html.escape(text)
 
+    def destination_value(value):
+        destination = normalize_dispatch_text(value) or "未入力"
+        if destination in customer_names:
+            return build_customer_detail_link(
+                destination,
+                class_name="dispatch-month-link",
+            )
+        return html.escape(destination)
+
     columns = ["引取日", "引取先", "商品名", "数量", "運送会社", "納品先", "着日"]
     desktop_parts = [
         '<div class="dispatch-desktop-view">',
@@ -5430,7 +5440,12 @@ def render_dispatch_responsive_list(display_df):
         desktop_parts.append("<tr>")
         for column in columns:
             css_class = "date-cell" if column in ["引取日", "着日"] else "quantity-cell" if column == "数量" else ""
-            desktop_parts.append(f'<td class="{css_class}">{safe_value(row.get(column))}</td>')
+            cell_value = (
+                destination_value(row.get(column))
+                if column == "納品先"
+                else safe_value(row.get(column))
+            )
+            desktop_parts.append(f'<td class="{css_class}">{cell_value}</td>')
         desktop_parts.append("</tr>")
     desktop_parts.append("</tbody></table></div>")
 
@@ -5453,7 +5468,7 @@ def render_dispatch_responsive_list(display_df):
                     '<div class="dispatch-route">',
                     f'<div class="dispatch-route-box"><span class="dispatch-route-label">引取先</span><span class="dispatch-route-value">{safe_value(row.get("引取先"))}</span></div>',
                     '<div class="dispatch-route-arrow">→</div>',
-                    f'<div class="dispatch-route-box"><span class="dispatch-route-label">納品先</span><span class="dispatch-route-value">{safe_value(row.get("納品先"))}</span></div>',
+                    f'<div class="dispatch-route-box"><span class="dispatch-route-label">納品先</span><span class="dispatch-route-value">{destination_value(row.get("納品先"))}</span></div>',
                     '</div>',
                     '<div class="dispatch-details">',
                     f'<div class="dispatch-detail-box"><span class="dispatch-detail-label">商品名</span><span class="dispatch-detail-value">{safe_value(row.get("商品名"))}</span></div>',
@@ -5525,7 +5540,20 @@ def show_dispatch_board():
     for column in ["引取先", "商品名", "数量", "運送会社", "納品先"]:
         display_df[column] = display_df[column].map(normalize_dispatch_text)
 
-    render_dispatch_responsive_list(display_df)
+    customer_names = set()
+    try:
+        customer_df = load_data()
+        if "顧客名" in customer_df.columns:
+            customer_names = {
+                clean_value(value, blank_text="").strip()
+                for value in customer_df["顧客名"].tolist()
+                if clean_value(value, blank_text="").strip()
+            }
+    except Exception:
+        # 顧客データを確認できない場合も、配車表は従来どおり文字表示で続行する。
+        customer_names = set()
+
+    render_dispatch_responsive_list(display_df, customer_names)
 
 
 # =========================
