@@ -6974,44 +6974,157 @@ def render_soluble_water_it_summary(location, context):
         st.caption(
             f"最終受信：{measured_at.strftime('%Y/%m/%d %H:%M')}　｜　参照：{context['source']}"
         )
-        col_actual, col_excel, col_difference = st.columns(3)
-        with col_actual:
-            st.metric("現在の実測在庫", f"{soluble_number_label(actual_value)} kg")
-        with col_excel:
-            st.metric(
-                "同日のExcel計算在庫",
-                f"{soluble_number_label(excel_value)} kg" if excel_value is not None else "—",
+        def summary_card(label, value, tone=""):
+            tone_class = f" {tone}" if tone else ""
+            return (
+                f'<div class="soluble-waterit-stat{tone_class}">'
+                f'<span class="soluble-waterit-stat-label">{html.escape(str(label))}</span>'
+                f'<span class="soluble-waterit-stat-value">{html.escape(str(value))}</span>'
+                '</div>'
             )
-        with col_difference:
-            if difference is None:
-                st.metric("実測 − Excel", "—")
-            else:
-                st.metric(
-                    "実測 − Excel",
-                    f"{difference:+,.0f} kg",
-                )
+
+        st.markdown(
+            """
+            <style>
+            .soluble-waterit-summary-grid {
+                display: grid;
+                grid-template-columns: repeat(3, minmax(0, 1fr));
+                gap: 0.75rem;
+                margin: 0.4rem 0 1.1rem;
+            }
+            .soluble-waterit-usage-grid {
+                display: grid;
+                grid-template-columns: repeat(2, minmax(0, 1fr));
+                gap: 0.75rem;
+                margin: 0.45rem 0 0.8rem;
+            }
+            .soluble-waterit-stat {
+                min-width: 0;
+                box-sizing: border-box;
+                padding: 0.9rem 1rem;
+                border: 1px solid rgba(15, 23, 42, 0.12);
+                border-radius: 14px;
+                background: rgba(255, 255, 255, 0.9);
+            }
+            .soluble-waterit-stat.actual {
+                background: #dcfce7;
+                border-color: #4ade80;
+            }
+            .soluble-waterit-stat.excel {
+                background: #f8fafc;
+                border-color: #cbd5e1;
+            }
+            .soluble-waterit-stat.difference {
+                background: #eff6ff;
+                border-color: #93c5fd;
+            }
+            .soluble-waterit-stat.average {
+                background: #f0fdfa;
+                border-color: #5eead4;
+            }
+            .soluble-waterit-stat-label {
+                display: block;
+                color: #667085;
+                font-size: 0.88rem;
+                font-weight: 700;
+                line-height: 1.35;
+                margin-bottom: 0.35rem;
+                overflow-wrap: anywhere;
+            }
+            .soluble-waterit-stat-value {
+                display: block;
+                color: #172033;
+                font-size: clamp(1.55rem, 3.2vw, 2.2rem);
+                font-weight: 800;
+                line-height: 1.15;
+                letter-spacing: -0.02em;
+                white-space: normal;
+                overflow: visible;
+                text-overflow: clip;
+                overflow-wrap: anywhere;
+            }
+            @media (max-width: 640px) {
+                .soluble-waterit-summary-grid,
+                .soluble-waterit-usage-grid {
+                    grid-template-columns: 1fr;
+                    gap: 0.55rem;
+                }
+                .soluble-waterit-stat {
+                    padding: 0.78rem 0.85rem;
+                }
+                .soluble-waterit-stat-label {
+                    font-size: 0.82rem;
+                }
+                .soluble-waterit-stat-value {
+                    font-size: 1.45rem;
+                    white-space: nowrap;
+                    overflow-wrap: normal;
+                }
+            }
+            </style>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        actual_label = f"{soluble_number_label(actual_value)} kg"
+        excel_label = (
+            f"{soluble_number_label(excel_value)} kg"
+            if excel_value is not None
+            else "—"
+        )
+        difference_label = "—" if difference is None else f"{difference:+,.0f} kg"
+        st.markdown(
+            '<div class="soluble-waterit-summary-grid">'
+            + summary_card("現在の実測在庫", actual_label, "actual")
+            + summary_card("同日のExcel計算在庫", excel_label, "excel")
+            + summary_card("実測 − Excel", difference_label, "difference")
+            + '</div>',
+            unsafe_allow_html=True,
+        )
 
         st.markdown("#### 実績から見た1日平均使用量（参考）")
-        if isinstance(excel_usage, (int, float)):
-            st.metric("Excel設定使用量", f"{soluble_number_label(excel_usage)} kg/日")
-        else:
-            st.metric("Excel設定使用量", "—")
+        excel_usage_label = (
+            f"{soluble_number_label(excel_usage)} kg/日"
+            if isinstance(excel_usage, (int, float))
+            else "—"
+        )
+        st.markdown(
+            '<div class="soluble-waterit-usage-grid">'
+            + summary_card("Excel設定使用量", excel_usage_label, "excel")
+            + '</div>',
+            unsafe_allow_html=True,
+        )
         st.caption(
             "WATER it履歴を1時間単位でならし、大きな在庫増加は納品として区切った推定値です。"
             "Excelの使用量/日や予測計算へは自動反映しません。"
         )
-        average_columns = st.columns(len(SOLUBLE_WATER_IT_USAGE_WINDOWS))
-        for display_column, days in zip(average_columns, SOLUBLE_WATER_IT_USAGE_WINDOWS):
+
+        # st.tabsは先頭タブが初期表示になるため、7日を先頭にして標準表示にする。
+        usage_tab_specs = (
+            (7, "7日（標準）"),
+            (3, "3日"),
+            (20, "20日"),
+            (30, "30日"),
+        )
+        usage_tabs = st.tabs([label for _, label in usage_tab_specs])
+        for tab, (days, _) in zip(usage_tabs, usage_tab_specs):
             estimate = context["usage_averages"][days]
-            with display_column:
+            with tab:
                 if estimate.get("enough_data") and estimate.get("average") is not None:
-                    st.metric(
-                        f"直近{days}日",
-                        f"{estimate['average']:,.0f} kg/日",
-                    )
+                    average_label = f"{estimate['average']:,.0f} kg/日"
+                    detail_label = f"直近{days}日の実績平均"
                 else:
-                    st.metric(f"直近{days}日", "データ不足")
-                    st.caption(f"現在 約{estimate.get('available_days', 0):.1f}日分")
+                    average_label = "データ不足"
+                    detail_label = (
+                        f"直近{days}日分には不足しています（現在 約"
+                        f"{estimate.get('available_days', 0):.1f}日分）"
+                    )
+                st.markdown(
+                    '<div class="soluble-waterit-usage-grid">'
+                    + summary_card(detail_label, average_label, "average")
+                    + '</div>',
+                    unsafe_allow_html=True,
+                )
 
         st.markdown("#### Excelへ反映（任意）")
         st.caption(
