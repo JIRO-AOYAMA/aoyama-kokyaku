@@ -8122,6 +8122,10 @@ def show_water_it_test_page():
     st.markdown("---")
     st.header("💧 WATER it CSV取込・保存")
     show_back_home_button("water_it_back_home")
+    st.markdown(
+        render_page_link("🧪 ソリュブル在庫", page="soluble_inventory"),
+        unsafe_allow_html=True,
+    )
     st.caption(
         "スマホでWATER itからCSVを手動ダウンロードし、そのCSVを選ぶだけで画面へ反映し、既存のSupabaseへ自動保存します。Excel・WATER it・Dropboxへの書き込みは行いません。"
     )
