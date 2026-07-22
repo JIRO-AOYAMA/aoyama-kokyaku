@@ -8141,6 +8141,22 @@ def show_water_it_test_page():
 
     uploader_version = int(st.session_state.get("water_it_uploader_version", 0))
     uploader_key = f"water_it_mobile_csv_uploader_{uploader_version}"
+
+    temporary_store_before_upload = get_water_it_temporary_store()
+    has_selected_water_it_csv = bool(
+        st.session_state.get(WATER_IT_UPLOAD_BYTES_KEY)
+        or temporary_store_before_upload.get("content")
+    )
+    if not has_selected_water_it_csv:
+        if st.button(
+            "CSV選択をリセット",
+            key=f"water_it_reset_uploader_{uploader_version}",
+            use_container_width=True,
+        ):
+            clear_uploaded_water_it_csv()
+            st.session_state["water_it_uploader_version"] = uploader_version + 1
+            st.rerun()
+
     uploaded_file = st.file_uploader(
         "ダウンロードしたファイルを選ぶ",
         type=None,
