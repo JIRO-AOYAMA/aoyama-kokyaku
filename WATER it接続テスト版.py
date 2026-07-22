@@ -194,7 +194,7 @@ MAP_LOCATION_COLUMN_CANDIDATES = [
 
 
 # =========================
-# WATER it接続テスト（読み取り専用）
+# WATER it接続（読み取り専用）
 # =========================
 # スマホでWATER itから手動ダウンロードしたCSVを選び、読み取り専用で表示する。
 # 選択したCSVはStreamlitのセッション内だけに保持し、Excel・WATER it・Dropboxへは書き込まない。
@@ -7533,7 +7533,7 @@ def show_soluble_inventory_page():
 
 
 # =========================
-# WATER it接続テスト（読み取り専用）
+# WATER it接続（読み取り専用）
 # =========================
 def resolve_water_it_csv_path():
     """data.csvの場所を、このPythonファイル基準で解決する。"""
@@ -8120,7 +8120,7 @@ def show_water_it_history(dataframe):
 
 def show_water_it_test_page():
     st.markdown("---")
-    st.header("💧 WATER it CSV取込・保存テスト")
+    st.header("💧 WATER it CSV取込・保存")
     show_back_home_button("water_it_back_home")
     st.caption(
         "スマホでWATER itからCSVを手動ダウンロードし、そのCSVを選ぶだけで画面へ反映し、既存のSupabaseへ自動保存します。Excel・WATER it・Dropboxへの書き込みは行いません。"
@@ -9837,7 +9837,7 @@ def show_home_menu():
 
     col9, _ = st.columns(2)
     with col9:
-        st.markdown(render_page_link("💧 WATER it接続テスト", page="water_it_test"), unsafe_allow_html=True)
+        st.markdown(render_page_link("💧 WATER it接続", page="water_it_test"), unsafe_allow_html=True)
 
     st.markdown("---")
 
@@ -9890,7 +9890,7 @@ with st.sidebar:
         st.markdown(render_page_link("🗓 配車カレンダー", page="calendar"), unsafe_allow_html=True)
         st.markdown(render_page_link("🚚 配車表", page="dispatch_table"), unsafe_allow_html=True)
         st.markdown(render_page_link("🧪 ソリュブル在庫", page="soluble_inventory"), unsafe_allow_html=True)
-        st.markdown(render_page_link("💧 WATER it接続テスト", page="water_it_test"), unsafe_allow_html=True)
+        st.markdown(render_page_link("💧 WATER it接続", page="water_it_test"), unsafe_allow_html=True)
         st.markdown(render_page_link("📝 顧客メモ", page="notes"), unsafe_allow_html=True)
     elif current_page in supplier_pages or (
         current_page == "partner_detail" and st.session_state.get("selected_partner_type") == "supplier"
