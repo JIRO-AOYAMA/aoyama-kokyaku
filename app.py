@@ -9883,6 +9883,11 @@ carrier_pages = {
 with st.sidebar:
     st.title(f"🚚 {APP_TITLE}")
     st.markdown("### メニュー")
+    if st.button("🔄 更新", use_container_width=True):
+        st.cache_data.clear()
+        st.rerun()
+    st.markdown("---")
+
     st.markdown(render_page_link("🏠 トップ", page="home"), unsafe_allow_html=True)
     st.markdown(render_page_link("👥 顧客", page="customer_home"), unsafe_allow_html=True)
     st.markdown(render_page_link("🏢 仕入先", page="supplier_home"), unsafe_allow_html=True)
@@ -9917,11 +9922,6 @@ with st.sidebar:
         st.markdown(render_page_link("📋 運送会社一覧", page="carrier_list"), unsafe_allow_html=True)
         st.markdown(render_page_link("🔍 運送会社検索", page="carrier_search"), unsafe_allow_html=True)
         st.markdown(render_page_link("🗺 運送条件検索", page="carrier_condition"), unsafe_allow_html=True)
-
-    st.markdown("---")
-    if st.button("🔄 更新", use_container_width=True):
-        st.cache_data.clear()
-        st.rerun()
 
 
 col_title, col_logout = st.columns([3, 1])
