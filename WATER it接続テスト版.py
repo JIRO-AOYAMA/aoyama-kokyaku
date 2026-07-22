@@ -239,6 +239,14 @@ WATER_IT_POINT_DISPLAY_NAMES = {
     "ノベルズデイリーファーム": "ノベルズデイリー",
 }
 
+# ソリュブル在庫とWATER itの対応。Excel内の識別名や既存列構成は変更しない。
+SOLUBLE_WATER_IT_POINT_NAMES = {
+    "ノベルズ": "ノベルズデイリー",
+    "コスモアグリ": "コスモアグリ",
+}
+# 実績平均はアプリ上の参考表示だけに使い、Excelの使用量/日へは反映しない。
+SOLUBLE_WATER_IT_USAGE_WINDOWS = (3, 7, 20, 30)
+
 
 # =========================
 # ログイン認証
@@ -6545,6 +6553,514 @@ def render_soluble_customer_product_card(customer_name, current, key_scope):
         render_soluble_customer_editor(customer_name, current, key_scope)
 
 
+
+def get_soluble_water_it_history(dataframe, location):
+    """選択会社に対応するWATER itのタンク履歴を、kgの数値行だけ返す。"""
+    point_name = SOLUBLE_WATER_IT_POINT_NAMES.get(location)
+    if not point_name or dataframe is None or dataframe.empty:
+        return pd.DataFrame()
+
+    history = get_water_it_customer_rows(dataframe, point_name)
+    if history.empty:
+        return history
+
+    # ノベルズ・コスモは保管タンク1基。別の測定項目を誤って混ぜない。
+    tank_rows = history[
+        history["測定項目"].astype(str).str.contains("保管タンク", regex=False, na=False)
+    ].copy()
+    tank_rows = tank_rows[
+        tank_rows["測定値_数値"].notna()
+        & tank_rows["単位_表示"].map(normalize_water_it_unit).eq("kg")
+    ].copy()
+    if tank_rows.empty:
+        return tank_rows
+
+    # 測定項目が複数ある場合は、最新時刻を持つ1項目だけに限定する。
+    latest_by_item = tank_rows.groupby("測定項目")["測定日時_解析"].max()
+    selected_item = latest_by_item.idxmax()
+    tank_rows = tank_rows[tank_rows["測定項目"] == selected_item].copy()
+    tank_rows.sort_values("測定日時_解析", inplace=True)
+    tank_rows.reset_index(drop=True, inplace=True)
+    return tank_rows
+
+
+def estimate_soluble_water_it_daily_usage(history, days):
+    """WATER it履歴から1日平均使用量を参考値として推定する。
+
+    1時間ごとの中央値で短時間の揺れをならし、大きな上昇は納品として区切る。
+    各区間の開始値と終了値の減少分だけを合計するため、Excelの使用量/日や
+    将来予測へは一切反映しない。
+    """
+    result = {
+        "days": int(days),
+        "average": None,
+        "available_days": 0.0,
+        "enough_data": False,
+    }
+    if history is None or history.empty:
+        return result
+
+    series = (
+        history.dropna(subset=["測定日時_解析", "測定値_数値"])
+        .sort_values("測定日時_解析")
+        .set_index("測定日時_解析")["測定値_数値"]
+        .astype(float)
+    )
+    series = series[~series.index.duplicated(keep="last")]
+    if len(series) < 2:
+        return result
+
+    latest_time = series.index.max()
+    oldest_time = series.index.min()
+    available_days = max(
+        0.0,
+        (latest_time - oldest_time).total_seconds() / 86400.0,
+    )
+    result["available_days"] = available_days
+
+    # 10分程度の端数は許容するが、期間が足りない時は無理に期間平均を出さない。
+    if available_days < float(days) - 0.1:
+        return result
+
+    cutoff = latest_time - pd.Timedelta(days=int(days))
+    hourly = series.resample("1h").median().interpolate(limit=2)
+    hourly = hourly[(hourly.index >= cutoff) & (hourly.index <= latest_time)].dropna()
+    if len(hourly) < 2:
+        return result
+
+    median_level = float(hourly.median())
+    # 小さな測定揺れは納品扱いにしない。実タンクでは納品上昇が数千kg単位になる。
+    delivery_jump = max(1000.0, abs(median_level) * 0.04)
+    differences = hourly.diff()
+    split_positions = [
+        hourly.index.get_loc(timestamp)
+        for timestamp in hourly.index[differences > delivery_jump]
+    ]
+
+    starts = [0] + split_positions
+    ends = [position - 1 for position in split_positions] + [len(hourly) - 1]
+    total_decrease = 0.0
+    for start_position, end_position in zip(starts, ends):
+        if end_position <= start_position:
+            continue
+        decrease = float(hourly.iloc[start_position] - hourly.iloc[end_position])
+        if math.isfinite(decrease) and decrease > 0:
+            total_decrease += decrease
+
+    elapsed_days = (
+        hourly.index[-1] - hourly.index[0]
+    ).total_seconds() / 86400.0
+    if elapsed_days <= 0:
+        return result
+
+    average = total_decrease / elapsed_days
+    if not math.isfinite(average) or average < 0:
+        return result
+
+    result["average"] = average
+    result["enough_data"] = True
+    return result
+
+
+def get_soluble_water_it_context(location, rows):
+    """ソリュブル画面用の実測値・差額・参考平均をまとめる。失敗時はNone。"""
+    if location not in SOLUBLE_WATER_IT_POINT_NAMES:
+        return None
+    try:
+        dataframe, source = get_active_water_it_data()
+        history = get_soluble_water_it_history(dataframe, location)
+    except Exception:
+        return None
+    if history.empty:
+        return None
+
+    latest = history.iloc[-1]
+    measured_at = latest["測定日時_解析"]
+    if pd.isna(measured_at):
+        return None
+    actual_value = float(latest["測定値_数値"])
+    if not math.isfinite(actual_value):
+        return None
+    if actual_value.is_integer():
+        actual_value = int(actual_value)
+
+    measured_date = measured_at.date()
+    excel_row = next((row for row in rows if row.get("date") == measured_date), None)
+    excel_value = (
+        excel_row.get(f"{location}_inventory")
+        if excel_row is not None
+        else None
+    )
+    excel_usage = (
+        excel_row.get(f"{location}_usage")
+        if excel_row is not None
+        else None
+    )
+    difference = None
+    if isinstance(excel_value, (int, float)):
+        difference = float(actual_value) - float(excel_value)
+        if difference.is_integer():
+            difference = int(difference)
+
+    usage_averages = {
+        days: estimate_soluble_water_it_daily_usage(history, days)
+        for days in SOLUBLE_WATER_IT_USAGE_WINDOWS
+    }
+    return {
+        "source": source,
+        "history": history,
+        "actual_value": actual_value,
+        "measured_at": measured_at,
+        "measured_date": measured_date,
+        "unit": "kg",
+        "excel_row": excel_row,
+        "excel_value": excel_value,
+        "excel_usage": excel_usage,
+        "difference": difference,
+        "usage_averages": usage_averages,
+    }
+
+
+def apply_soluble_water_it_forecast(rows, location, context):
+    """実測日以降のアプリ表示だけを、実測値起点で再計算する。
+
+    Excel本体・元のrows・使用量/日・納品は変更しない。将来日に黄色の在庫が
+    ある場合は、既存ルールどおり人が決めた新しい基準値として尊重する。
+    """
+    display_rows = [dict(row) for row in rows]
+    if not context or context.get("excel_row") is None:
+        return display_rows
+
+    measured_date = context["measured_date"]
+    previous_inventory = None
+    started = False
+    for row in sorted(display_rows, key=lambda item: item["date"]):
+        row_date = row["date"]
+        display_key = f"{location}_inventory_display"
+        source_key = f"{location}_inventory_display_source"
+
+        if row_date < measured_date:
+            row[display_key] = row.get(f"{location}_inventory")
+            row[source_key] = "excel"
+            continue
+
+        if row_date == measured_date:
+            previous_inventory = context["actual_value"]
+            row[display_key] = previous_inventory
+            row[source_key] = "water_it_actual"
+            started = True
+            continue
+
+        if not started:
+            row[display_key] = row.get(f"{location}_inventory")
+            row[source_key] = "excel"
+            continue
+
+        # 将来の黄色い在庫は、人が指定した次の基準値としてそのまま使う。
+        if row.get(f"{location}_inventory_manual"):
+            manual_value = row.get(f"{location}_inventory")
+            if isinstance(manual_value, (int, float)):
+                previous_inventory = manual_value
+                row[display_key] = manual_value
+                row[source_key] = "excel_manual_baseline"
+                continue
+
+        usage = row.get(f"{location}_usage")
+        delivery = row.get(f"{location}_delivery")
+        usage = usage if isinstance(usage, (int, float)) else 0
+        delivery = delivery if isinstance(delivery, (int, float)) else 0
+        if isinstance(previous_inventory, (int, float)):
+            previous_inventory = previous_inventory - usage + delivery
+            row[display_key] = previous_inventory
+            row[source_key] = "water_it_forecast"
+        else:
+            row[display_key] = row.get(f"{location}_inventory")
+            row[source_key] = "excel"
+
+    return display_rows
+
+
+def find_soluble_row_by_date(content, target_date):
+    matches = [row for row in read_soluble_rows(content) if row.get("date") == target_date]
+    if len(matches) != 1:
+        if not matches:
+            raise RuntimeError(
+                f"Excelのソリュブルシートに{target_date.strftime('%Y/%m/%d')}の行がありません。"
+            )
+        raise RuntimeError("同じ日付の行が複数あるため、安全のため更新を中止しました。")
+    return matches[0]
+
+
+def verify_soluble_water_it_baseline(content, location, target_date, expected_value, next_formula):
+    """Dropbox保存後に実測値・黄色・翌日の式が保たれていることを確認する。"""
+    row = find_soluble_row_by_date(content, target_date)
+    workbook = load_workbook(BytesIO(content), data_only=False, read_only=False)
+    try:
+        if SOLUBLE_SHEET_NAME not in workbook.sheetnames:
+            raise RuntimeError("保存後のExcelにソリュブルシートがありません。")
+        ws = workbook[SOLUBLE_SHEET_NAME]
+        inventory_column = SOLUBLE_LOCATIONS[location]["inventory"]
+        cell = ws.cell(row["row"], inventory_column)
+        if not same_soluble_value(cell.value, expected_value):
+            raise RuntimeError("保存後のExcelで実測値が一致しません。")
+        if not soluble_cell_is_manual(cell):
+            raise RuntimeError("保存後のExcelで実測値のセルが黄色になっていません。")
+        if next_formula is not None and row["row"] < ws.max_row:
+            actual_next_formula = ws.cell(row["row"] + 1, inventory_column).value
+            if actual_next_formula != next_formula:
+                raise RuntimeError("保存後のExcelで翌日の在庫計算式が変わっています。")
+    finally:
+        workbook.close()
+
+
+def save_soluble_water_it_baseline(location, context):
+    """選択会社の今日の実測値だけを、バックアップ付きでExcelの黄色い基準値にする。"""
+    if location not in SOLUBLE_WATER_IT_POINT_NAMES:
+        raise RuntimeError("WATER it実測値を反映できる会社ではありません。")
+    if not context:
+        raise RuntimeError("WATER itの実測値を確認できません。")
+
+    measured_at = context.get("measured_at")
+    target_date = context.get("measured_date")
+    actual_value = context.get("actual_value")
+    if measured_at is None or target_date is None or not isinstance(actual_value, (int, float)):
+        raise RuntimeError("反映する実測値が正しくありません。")
+    if target_date != get_jst_now().date():
+        raise RuntimeError("最新測定日が今日ではないため、Excelへの反映を中止しました。")
+    if normalize_water_it_unit(context.get("unit")) != "kg":
+        raise RuntimeError("kg以外の実測値はExcelへ反映しません。")
+    if actual_value < 0:
+        raise RuntimeError("実測値がマイナスのため、Excelへの反映を中止しました。")
+
+    target_path = str(SOLUBLE_DROPBOX_FILE_PATH or SOLUBLE_DROPBOX_DEFAULT_FILE_PATH).strip()
+    timestamp = get_jst_now().strftime("%Y%m%d_%H%M%S_%f")
+
+    if has_dropbox_auth_config():
+        access_token = get_dropbox_access_token()
+        original_content, response = download_dropbox_file(target_path, access_token)
+        if original_content is None:
+            raise RuntimeError(
+                "最新の対象Excelを取得できませんでした。\n" + dropbox_error_text(response)
+            )
+        revision = get_download_revision(response)
+        if not revision:
+            raise RuntimeError("Dropboxの更新番号を取得できないため、保存を中止しました。")
+
+        latest_row = find_soluble_row_by_date(original_content, target_date)
+        inventory_column = SOLUBLE_LOCATIONS[location]["inventory"]
+        formula_book = load_workbook(BytesIO(original_content), data_only=False, read_only=False)
+        try:
+            ws = formula_book[SOLUBLE_SHEET_NAME]
+            next_formula = (
+                ws.cell(latest_row["row"] + 1, inventory_column).value
+                if latest_row["row"] < ws.max_row
+                else None
+            )
+        finally:
+            formula_book.close()
+
+        saved_content, changed = build_soluble_updated_workbook(
+            original_content,
+            latest_row["row"],
+            location,
+            {"inventory": actual_value},
+        )
+        ensure_soluble_backup_folder(access_token)
+        backup_path = (
+            f"{SOLUBLE_BACKUP_FOLDER}/"
+            f"aoベンチャーグレイン配車表_{timestamp}.xlsx"
+        )
+        backup_response = upload_dropbox_file(
+            backup_path,
+            original_content,
+            access_token,
+            mode="add",
+        )
+        if backup_response.status_code != 200:
+            raise RuntimeError(
+                "バックアップを作成できないため、本番ファイルは更新しません。\n"
+                + dropbox_error_text(backup_response)
+            )
+        upload_response = upload_dropbox_file(
+            target_path,
+            saved_content,
+            access_token,
+            mode="update",
+            rev=revision,
+        )
+        if upload_response.status_code == 409:
+            raise RuntimeError(
+                "保存中にPCなどでExcelが更新されました。再読み込みしてからやり直してください。"
+            )
+        if upload_response.status_code != 200:
+            raise RuntimeError(
+                "対象Excelを更新できませんでした。\n" + dropbox_error_text(upload_response)
+            )
+
+        confirmed_content, confirmed_response = download_dropbox_file(target_path, access_token)
+        if confirmed_content is None:
+            raise RuntimeError(
+                "保存後のExcelを再取得できませんでした。\n"
+                + dropbox_error_text(confirmed_response)
+            )
+        verify_soluble_water_it_baseline(
+            confirmed_content,
+            location,
+            target_date,
+            actual_value,
+            next_formula,
+        )
+    else:
+        local_path = Path(str(SOLUBLE_LOCAL_FILE))
+        if not local_path.exists():
+            raise FileNotFoundError(f"対象ファイルが見つかりません：{local_path}")
+        original_content = local_path.read_bytes()
+        latest_row = find_soluble_row_by_date(original_content, target_date)
+        inventory_column = SOLUBLE_LOCATIONS[location]["inventory"]
+        formula_book = load_workbook(BytesIO(original_content), data_only=False, read_only=False)
+        try:
+            ws = formula_book[SOLUBLE_SHEET_NAME]
+            next_formula = (
+                ws.cell(latest_row["row"] + 1, inventory_column).value
+                if latest_row["row"] < ws.max_row
+                else None
+            )
+        finally:
+            formula_book.close()
+        saved_content, changed = build_soluble_updated_workbook(
+            original_content,
+            latest_row["row"],
+            location,
+            {"inventory": actual_value},
+        )
+        backup_dir = local_path.parent / "Backups"
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        backup_path = backup_dir / f"aoベンチャーグレイン配車表_{timestamp}.xlsx"
+        backup_path.write_bytes(original_content)
+        local_path.write_bytes(saved_content)
+        verify_soluble_water_it_baseline(
+            local_path.read_bytes(),
+            location,
+            target_date,
+            actual_value,
+            next_formula,
+        )
+
+    st.cache_data.clear()
+    return changed
+
+
+def render_soluble_water_it_summary(location, context):
+    """ソリュブル画面に実測値、Excelとの差、参考平均、任意反映ボタンを表示する。"""
+    if not context:
+        return
+
+    success = st.session_state.pop("soluble_water_it_excel_success", None)
+    if success and success.get("location") == location:
+        st.success(
+            f"{success['date']}の実測値 {soluble_number_label(success['value'])} kg を"
+            "Excelの基準値として保存しました。対象セルは黄色です。"
+        )
+
+    display_name = SOLUBLE_LOCATION_DISPLAY_NAMES.get(location, location)
+    actual_value = context["actual_value"]
+    measured_at = context["measured_at"]
+    excel_value = context.get("excel_value")
+    excel_usage = context.get("excel_usage")
+    difference = context.get("difference")
+
+    with st.container(border=True):
+        st.subheader(f"💧 {display_name}のWATER it実測")
+        st.caption(
+            f"最終受信：{measured_at.strftime('%Y/%m/%d %H:%M')}　｜　参照：{context['source']}"
+        )
+        col_actual, col_excel, col_difference = st.columns(3)
+        with col_actual:
+            st.metric("現在の実測在庫", f"{soluble_number_label(actual_value)} kg")
+        with col_excel:
+            st.metric(
+                "同日のExcel計算在庫",
+                f"{soluble_number_label(excel_value)} kg" if excel_value is not None else "—",
+            )
+        with col_difference:
+            if difference is None:
+                st.metric("実測 − Excel", "—")
+            else:
+                st.metric(
+                    "実測 − Excel",
+                    f"{difference:+,.0f} kg",
+                )
+
+        st.markdown("#### 実績から見た1日平均使用量（参考）")
+        if isinstance(excel_usage, (int, float)):
+            st.metric("Excel設定使用量", f"{soluble_number_label(excel_usage)} kg/日")
+        else:
+            st.metric("Excel設定使用量", "—")
+        st.caption(
+            "WATER it履歴を1時間単位でならし、大きな在庫増加は納品として区切った推定値です。"
+            "Excelの使用量/日や予測計算へは自動反映しません。"
+        )
+        average_columns = st.columns(len(SOLUBLE_WATER_IT_USAGE_WINDOWS))
+        for display_column, days in zip(average_columns, SOLUBLE_WATER_IT_USAGE_WINDOWS):
+            estimate = context["usage_averages"][days]
+            with display_column:
+                if estimate.get("enough_data") and estimate.get("average") is not None:
+                    st.metric(
+                        f"直近{days}日",
+                        f"{estimate['average']:,.0f} kg/日",
+                    )
+                else:
+                    st.metric(f"直近{days}日", "データ不足")
+                    st.caption(f"現在 約{estimate.get('available_days', 0):.1f}日分")
+
+        st.markdown("#### Excelへ反映（任意）")
+        st.caption(
+            "アプリは実測値を使います。Excelは自動変更せず、ここで確認して押した場合だけ、"
+            "今日の在庫セルを実測値へ変更して黄色にします。保存前バックアップと保存後確認を行います。"
+        )
+
+        excel_row = context.get("excel_row")
+        is_today = context.get("measured_date") == get_jst_now().date()
+        same_value = (
+            excel_value is not None
+            and same_soluble_value(excel_value, actual_value)
+        )
+        if excel_row is None:
+            st.warning("実測日の行がExcelにないため、反映できません。")
+            return
+        if not is_today:
+            st.warning("最新測定日が今日ではないため、Excelへの反映ボタンは使えません。")
+            return
+        if same_value:
+            st.info("Excelの同日在庫は、すでに実測値と同じです。")
+            return
+
+        confirm_key = f"soluble_water_it_confirm_{location}_{context['measured_date'].isoformat()}"
+        confirmed = st.checkbox(
+            f"{context['measured_date'].strftime('%Y/%m/%d')}のExcel在庫を "
+            f"{soluble_number_label(actual_value)} kg に変更する",
+            key=confirm_key,
+        )
+        if st.button(
+            "今日の実測値をExcelの基準値にする",
+            key=f"soluble_water_it_save_{location}_{context['measured_date'].isoformat()}",
+            type="primary",
+            use_container_width=True,
+            disabled=not confirmed,
+        ):
+            try:
+                with st.spinner("元ファイルをバックアップし、実測値を保存・確認しています…"):
+                    changed = save_soluble_water_it_baseline(location, context)
+                st.session_state["soluble_water_it_excel_success"] = {
+                    "location": location,
+                    "date": context["measured_date"].strftime("%Y/%m/%d"),
+                    "value": actual_value,
+                    "changed_count": len(changed),
+                }
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Excelへ反映できませんでした：{exc}")
+
 def show_soluble_inventory_page():
     st.markdown("---")
     st.header("🧪 ソリュブル在庫")
@@ -6585,7 +7101,15 @@ def show_soluble_inventory_page():
         return
 
     # 数値がまだ空の日も、ここから新しく入力できるように日付行はすべて表示対象にする。
-    active_rows = list(rows)
+    water_it_context = get_soluble_water_it_context(location, rows)
+    if water_it_context is not None:
+        render_soluble_water_it_summary(location, water_it_context)
+        active_rows = apply_soluble_water_it_forecast(rows, location, water_it_context)
+    else:
+        # WATER itを読めない時も、既存のExcel表示・編集ルールは従来どおり動かす。
+        active_rows = list(rows)
+        if location in SOLUBLE_WATER_IT_POINT_NAMES:
+            st.info("WATER itの保存済みデータを確認できないため、Excelの値だけを表示しています。")
     if not active_rows:
         st.info(f"{location}の表示データはありません。")
         return
@@ -6689,6 +7213,8 @@ def show_soluble_inventory_page():
         .soluble-values {display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:8px;}
         .soluble-value {background:#f8fafc; border-radius:12px; padding:9px 10px; min-width:0;}
         .soluble-value.manual {background:#fff59d; border:1px solid #e3cb42;}
+        .soluble-value.waterit-actual {background:#dcfce7; border:1px solid #4ade80;}
+        .soluble-value.waterit-forecast {background:#e0f2fe; border:1px solid #7dd3fc;}
         .soluble-value.negative {background:#fee2e2; border:1px solid #f87171;}
         .soluble-label {display:block; color:#697386; font-size:.78rem; margin-bottom:3px;}
         .soluble-number {display:block; color:#182033; font-size:1.04rem; font-weight:800; overflow-wrap:anywhere;}
@@ -6704,7 +7230,7 @@ def show_soluble_inventory_page():
         unsafe_allow_html=True,
     )
     st.markdown(
-        f'<div class="soluble-legend"><span class="soluble-yellow-chip"></span><span>黄色は手入力　｜　参照：{html.escape(source)}</span></div>',
+        f'<div class="soluble-legend"><span class="soluble-yellow-chip"></span><span>黄色はExcelの手入力　｜　緑はWATER it実測　｜　水色は実測起点のアプリ予測　｜　参照：{html.escape(source)}</span></div>',
         unsafe_allow_html=True,
     )
 
@@ -6717,14 +7243,25 @@ def show_soluble_inventory_page():
         usage = row.get(f"{location}_usage")
         delivery = row.get(f"{location}_delivery")
         inventory = row.get(f"{location}_inventory")
+        inventory_display = row.get(f"{location}_inventory_display", inventory)
+        inventory_display_source = row.get(f"{location}_inventory_display_source", "excel")
+        inventory_label = {
+            "water_it_actual": "在庫（実測）",
+            "water_it_forecast": "在庫（実測起点予測）",
+            "excel_manual_baseline": "在庫（Excel手入力基準）",
+        }.get(inventory_display_source, "在庫")
         cells = []
         for label, field, value in (
             ("使用量/日", "usage", usage),
             ("納品", "delivery", delivery),
-            ("在庫", "inventory", inventory),
+            (inventory_label, "inventory", inventory_display),
         ):
             classes = ["soluble-value"]
-            if row.get(f"{location}_{field}_manual"):
+            if field == "inventory" and inventory_display_source == "water_it_actual":
+                classes.append("waterit-actual")
+            elif field == "inventory" and inventory_display_source == "water_it_forecast":
+                classes.append("waterit-forecast")
+            elif row.get(f"{location}_{field}_manual"):
                 classes.append("manual")
             if field == "inventory" and isinstance(value, (int, float)) and value < 0:
                 classes.append("negative")
