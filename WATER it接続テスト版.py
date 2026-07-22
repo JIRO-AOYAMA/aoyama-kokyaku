@@ -6753,14 +6753,18 @@ def get_soluble_water_it_context(location, rows):
         for days in SOLUBLE_WATER_IT_USAGE_WINDOWS
     }
 
-    # 過去日は各日9:00の実測値を使う。最新測定日は、従来どおり最新値を優先し、
-    # 今日のCSVが9:00より後に取得された場合も現在値を失わないようにする。
+    # 日付ごとの在庫欄は、最新値ではなく各日の9:00実測だけを使う。
+    # 上部の「現在の実測在庫」は従来どおりCSV内の最新値を表示する。
     daily_actuals = get_soluble_water_it_daily_actuals(history)
-    daily_actuals[measured_date] = {
-        "value": actual_value,
-        "measured_at": measured_at,
-        "source": "latest",
-    }
+
+    today = get_jst_now().date()
+    today_actual = daily_actuals.get(today)
+    today_excel_row = next((row for row in rows if row.get("date") == today), None)
+    today_excel_value = (
+        today_excel_row.get(f"{location}_inventory")
+        if today_excel_row is not None
+        else None
+    )
 
     return {
         "source": source,
@@ -6775,6 +6779,9 @@ def get_soluble_water_it_context(location, rows):
         "difference": difference,
         "usage_averages": usage_averages,
         "daily_actuals": daily_actuals,
+        "today_9am_actual": today_actual,
+        "today_9am_excel_row": today_excel_row,
+        "today_9am_excel_value": today_excel_value,
     }
 
 
@@ -6801,8 +6808,8 @@ def apply_soluble_water_it_forecast(rows, location, context):
         display_key = f"{location}_inventory_display"
         source_key = f"{location}_inventory_display_source"
 
-        # CSV内にその日の9:00実測（最新日は最新測定値）があれば、
-        # Excelの計算値より優先して緑の実測値として表示する。
+        # CSV内にその日の9:00実測があれば、最新日の直近値ではなく、
+        # 必ず9:00の値をExcel計算値より優先して緑の実測値として表示する。
         actual = daily_actuals.get(row_date)
         if actual is not None:
             actual_value = actual.get("value")
@@ -6884,13 +6891,14 @@ def save_soluble_water_it_baseline(location, context):
     if not context:
         raise RuntimeError("WATER itの実測値を確認できません。")
 
-    measured_at = context.get("measured_at")
-    target_date = context.get("measured_date")
-    actual_value = context.get("actual_value")
-    if measured_at is None or target_date is None or not isinstance(actual_value, (int, float)):
-        raise RuntimeError("反映する実測値が正しくありません。")
-    if target_date != get_jst_now().date():
-        raise RuntimeError("最新測定日が今日ではないため、Excelへの反映を中止しました。")
+    today_actual = context.get("today_9am_actual") or {}
+    measured_at = today_actual.get("measured_at")
+    target_date = get_jst_now().date()
+    actual_value = today_actual.get("value")
+    if measured_at is None or not isinstance(actual_value, (int, float)):
+        raise RuntimeError("今日9:00の実測値がないため、Excelへの反映を中止しました。")
+    if measured_at.date() != target_date or measured_at.hour != 9 or measured_at.minute != 0:
+        raise RuntimeError("今日9:00の実測値を確認できないため、Excelへの反映を中止しました。")
     if normalize_water_it_unit(context.get("unit")) != "kg":
         raise RuntimeError("kg以外の実測値はExcelへ反映しません。")
     if actual_value < 0:
@@ -7192,46 +7200,58 @@ def render_soluble_water_it_summary(location, context):
 
         st.markdown("#### Excelへ反映（任意）")
         st.caption(
-            "アプリは実測値を使います。Excelは自動変更せず、ここで確認して押した場合だけ、"
-            "今日の在庫セルを実測値へ変更して黄色にします。保存前バックアップと保存後確認を行います。"
+            "アプリは各日の9:00実測値を在庫に使います。Excelは自動変更せず、ここで確認して押した場合だけ、"
+            "今日9:00の在庫を基準値として黄色セルへ保存します。保存前バックアップと保存後確認を行います。"
         )
 
-        excel_row = context.get("excel_row")
-        is_today = context.get("measured_date") == get_jst_now().date()
-        same_value = (
-            excel_value is not None
-            and same_soluble_value(excel_value, actual_value)
+        today = get_jst_now().date()
+        today_actual = context.get("today_9am_actual") or {}
+        baseline_value = today_actual.get("value")
+        baseline_measured_at = today_actual.get("measured_at")
+        excel_row = context.get("today_9am_excel_row")
+        baseline_excel_value = context.get("today_9am_excel_value")
+        has_today_9am = (
+            isinstance(baseline_value, (int, float))
+            and baseline_measured_at is not None
+            and baseline_measured_at.date() == today
+            and baseline_measured_at.hour == 9
+            and baseline_measured_at.minute == 0
         )
-        if excel_row is None:
-            st.warning("実測日の行がExcelにないため、反映できません。")
+        same_value = (
+            has_today_9am
+            and baseline_excel_value is not None
+            and same_soluble_value(baseline_excel_value, baseline_value)
+        )
+        if not has_today_9am:
+            st.warning("今日9:00の実測値がCSVにないため、Excelへの反映ボタンは使えません。")
             return
-        if not is_today:
-            st.warning("最新測定日が今日ではないため、Excelへの反映ボタンは使えません。")
+        if excel_row is None:
+            st.warning("今日の行がExcelにないため、反映できません。")
             return
         if same_value:
-            st.info("Excelの同日在庫は、すでに実測値と同じです。")
+            st.info("今日のExcel在庫は、すでに9:00実測値と同じです。")
             return
 
-        confirm_key = f"soluble_water_it_confirm_{location}_{context['measured_date'].isoformat()}"
+        confirm_key = f"soluble_water_it_confirm_{location}_{today.isoformat()}"
         confirmed = st.checkbox(
-            f"{context['measured_date'].strftime('%Y/%m/%d')}のExcel在庫を "
-            f"{soluble_number_label(actual_value)} kg に変更する",
+            f"{today.strftime('%Y/%m/%d')}のExcel在庫を "
+            f"9:00実測の {soluble_number_label(baseline_value)} kg に変更する",
             key=confirm_key,
         )
         if st.button(
             "今日の実測値をExcelの基準値にする",
-            key=f"soluble_water_it_save_{location}_{context['measured_date'].isoformat()}",
+            key=f"soluble_water_it_save_{location}_{today.isoformat()}",
             type="primary",
             use_container_width=True,
             disabled=not confirmed,
         ):
             try:
-                with st.spinner("元ファイルをバックアップし、実測値を保存・確認しています…"):
+                with st.spinner("元ファイルをバックアップし、9:00実測値を保存・確認しています…"):
                     changed = save_soluble_water_it_baseline(location, context)
                 st.session_state["soluble_water_it_excel_success"] = {
                     "location": location,
-                    "date": context["measured_date"].strftime("%Y/%m/%d"),
-                    "value": actual_value,
+                    "date": today.strftime("%Y/%m/%d"),
+                    "value": baseline_value,
                     "changed_count": len(changed),
                 }
                 st.rerun()
