@@ -1,5 +1,7 @@
+import base64
 import calendar
 import copy
+import gzip
 import hashlib
 import html
 import json
@@ -204,6 +206,15 @@ WATER_IT_LOGIN_URL = "https://www.dms2.waterit.optex.net/WIA0101/Index01"
 WATER_IT_UPLOAD_BYTES_KEY = "water_it_uploaded_csv_bytes"
 WATER_IT_UPLOAD_NAME_KEY = "water_it_uploaded_csv_name"
 WATER_IT_UPLOAD_HASH_KEY = "water_it_uploaded_csv_hash"
+WATER_IT_UPLOAD_PERSISTED_KEY = "water_it_uploaded_csv_persisted"
+# 既存のcustomer_informationテーブル内に、通常の顧客情報と衝突しない内部レコードとして保存する。
+# 新しいSupabaseテーブルやSecretsは不要。Excel・WATER it・Dropboxには書き込まない。
+WATER_IT_STORAGE_CUSTOMER = "__WATER_IT_STORAGE__"
+WATER_IT_STORAGE_FIELD = "__water_it_csv_snapshot__"
+WATER_IT_STORAGE_ID = str(
+    uuid.uuid5(uuid.NAMESPACE_URL, "aoyama-water-it-csv-snapshot-v1")
+)
+WATER_IT_STORAGE_VERSION = 1
 WATER_IT_REQUIRED_COLUMNS = [
     "測定日時",
     "測定項目",
@@ -6928,6 +6939,126 @@ def load_water_it_data():
     return parse_water_it_csv(content), source
 
 
+def make_water_it_snapshot_payload(content, filename, dataframe):
+    """検証済みCSVを圧縮し、Supabaseへ保存できるJSON文字列にする。"""
+    latest_time = dataframe["測定日時_解析"].max()
+    oldest_time = dataframe["測定日時_解析"].min()
+    return json.dumps(
+        {
+            "version": WATER_IT_STORAGE_VERSION,
+            "filename": str(filename or "data.csv"),
+            "sha256": hashlib.sha256(content).hexdigest(),
+            "csv_gzip_base64": base64.b64encode(gzip.compress(content)).decode("ascii"),
+            "row_count": int(len(dataframe)),
+            "point_count": int(dataframe["ポイント"].nunique()),
+            "oldest_time": oldest_time.isoformat() if pd.notna(oldest_time) else None,
+            "latest_time": latest_time.isoformat() if pd.notna(latest_time) else None,
+            "imported_at": get_jst_now().isoformat(),
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+
+def decode_water_it_snapshot_payload(payload_text):
+    """Supabaseに保存したスナップショットから元のCSVバイト列を復元する。"""
+    try:
+        payload = json.loads(str(payload_text or ""))
+    except Exception as exc:
+        raise RuntimeError("保存済みWATER itデータの形式が正しくありません。") from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError("保存済みWATER itデータの形式が正しくありません。")
+    if int(payload.get("version", 0)) != WATER_IT_STORAGE_VERSION:
+        raise RuntimeError("保存済みWATER itデータのバージョンが対応外です。")
+    encoded = str(payload.get("csv_gzip_base64") or "")
+    if not encoded:
+        raise RuntimeError("保存済みWATER itデータにCSV本体がありません。")
+    try:
+        content = gzip.decompress(base64.b64decode(encoded.encode("ascii")))
+    except Exception as exc:
+        raise RuntimeError("保存済みWATER itデータを復元できませんでした。") from exc
+    expected_hash = str(payload.get("sha256") or "")
+    if expected_hash and hashlib.sha256(content).hexdigest() != expected_hash:
+        raise RuntimeError("保存済みWATER itデータの検証に失敗しました。")
+    return content, str(payload.get("filename") or "data.csv"), payload
+
+
+def save_water_it_snapshot_to_supabase(content, filename, dataframe):
+    """選択したCSVを既存Supabaseへ保存する。WATER itやExcelには書き込まない。"""
+    if not has_supabase_config():
+        raise RuntimeError("Supabase設定がないため、CSVを永続保存できません。")
+    now = get_jst_now().isoformat()
+    payload = {
+        "id": WATER_IT_STORAGE_ID,
+        "customer_key": None,
+        "customer_name": WATER_IT_STORAGE_CUSTOMER,
+        "field_name": WATER_IT_STORAGE_FIELD,
+        "content": make_water_it_snapshot_payload(content, filename, dataframe),
+        "sort_order": 0,
+        "created_at": now,
+        "updated_at": now,
+    }
+    try:
+        response = requests.post(
+            get_supabase_customer_information_url(),
+            headers=get_supabase_headers(
+                prefer="resolution=merge-duplicates,return=minimal"
+            ),
+            params={"on_conflict": "id"},
+            json=payload,
+            timeout=30,
+        )
+    except Exception as exc:
+        raise RuntimeError("WATER itデータをSupabaseへ保存できませんでした。") from exc
+    if response.status_code not in (200, 201):
+        detail = str(response.text or "").strip()[:500]
+        raise RuntimeError(
+            f"WATER itデータをSupabaseへ保存できませんでした（{response.status_code}）。"
+            + (f" {detail}" if detail else "")
+        )
+    load_saved_water_it_snapshot.clear()
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def load_saved_water_it_snapshot():
+    """Supabaseから最後に取り込んだCSVを取得する。未保存ならNoneを返す。"""
+    if not has_supabase_config():
+        return None
+    try:
+        response = requests.get(
+            get_supabase_customer_information_url(),
+            headers=get_supabase_headers(),
+            params={
+                "select": "content,updated_at",
+                "id": f"eq.{WATER_IT_STORAGE_ID}",
+                "limit": "1",
+            },
+            timeout=20,
+        )
+    except Exception:
+        return None
+    if response.status_code != 200:
+        return None
+    try:
+        rows = response.json()
+    except Exception:
+        return None
+    if not isinstance(rows, list) or not rows:
+        return None
+    try:
+        content, filename, metadata = decode_water_it_snapshot_payload(rows[0].get("content"))
+        dataframe = parse_water_it_csv(content)
+    except Exception:
+        return None
+    return {
+        "content": content,
+        "filename": filename,
+        "metadata": metadata,
+        "dataframe": dataframe,
+        "updated_at": rows[0].get("updated_at"),
+    }
+
+
 @st.cache_resource(show_spinner=False)
 def get_water_it_temporary_store():
     """アプリ再起動まで、選択CSVをサーバーの一時メモリに保持する。"""
@@ -6935,33 +7066,59 @@ def get_water_it_temporary_store():
 
 
 def get_active_water_it_data():
-    """スマホで選択したCSVを優先し、なければ従来のdata.csvを読む。"""
+    """選択中CSV、Supabase保存済みCSV、同梱data.csvの順で読み込む。"""
     uploaded_content = st.session_state.get(WATER_IT_UPLOAD_BYTES_KEY)
     uploaded_name = st.session_state.get(WATER_IT_UPLOAD_NAME_KEY)
+    persisted = bool(st.session_state.get(WATER_IT_UPLOAD_PERSISTED_KEY))
     if not uploaded_content:
         temporary_store = get_water_it_temporary_store()
         uploaded_content = temporary_store.get("content")
         uploaded_name = temporary_store.get("name")
+        persisted = bool(temporary_store.get("persisted"))
     if uploaded_content:
         uploaded_name = str(uploaded_name or "選択したCSV")
-        return parse_water_it_csv(uploaded_content), f"スマホから選択：{uploaded_name}"
+        label = "スマホから選択・Supabase保存済み" if persisted else "スマホから選択（一時）"
+        return parse_water_it_csv(uploaded_content), f"{label}：{uploaded_name}"
+
+    saved = load_saved_water_it_snapshot()
+    if saved:
+        return saved["dataframe"].copy(), f"Supabase保存：{saved['filename']}"
+
     return load_water_it_data()
 
 
 def remember_uploaded_water_it_csv(uploaded_file):
-    """選択されたCSVを検証し、現在のStreamlitセッション内だけに保持する。"""
+    """選択されたCSVを検証し、Supabaseへ自動保存する。"""
     content = uploaded_file.getvalue()
     if not content:
         raise RuntimeError("選択したCSVが空です。")
     dataframe = parse_water_it_csv(content)
     digest = hashlib.sha256(content).hexdigest()
     uploaded_name = uploaded_file.name or "data.csv"
+
+    persisted = False
+    st.session_state.pop("water_it_persist_warning_message", None)
+    try:
+        save_water_it_snapshot_to_supabase(content, uploaded_name, dataframe)
+        persisted = True
+    except Exception as exc:
+        st.session_state["water_it_persist_warning_message"] = str(exc)
+
     st.session_state[WATER_IT_UPLOAD_BYTES_KEY] = content
     st.session_state[WATER_IT_UPLOAD_NAME_KEY] = uploaded_name
     st.session_state[WATER_IT_UPLOAD_HASH_KEY] = digest
+    st.session_state[WATER_IT_UPLOAD_PERSISTED_KEY] = persisted
     temporary_store = get_water_it_temporary_store()
-    temporary_store.update({"content": content, "name": uploaded_name, "hash": digest})
-    return dataframe, f"スマホから選択：{uploaded_name}"
+    temporary_store.update(
+        {
+            "content": content,
+            "name": uploaded_name,
+            "hash": digest,
+            "persisted": persisted,
+        }
+    )
+    label = "スマホから選択・Supabase保存済み" if persisted else "スマホから選択（一時）"
+    return dataframe, f"{label}：{uploaded_name}"
 
 
 def clear_uploaded_water_it_csv():
@@ -6969,12 +7126,14 @@ def clear_uploaded_water_it_csv():
         WATER_IT_UPLOAD_BYTES_KEY,
         WATER_IT_UPLOAD_NAME_KEY,
         WATER_IT_UPLOAD_HASH_KEY,
+        WATER_IT_UPLOAD_PERSISTED_KEY,
         "water_it_upload_success_message",
+        "water_it_persist_warning_message",
         "water_it_upload_error_message",
     ):
         st.session_state.pop(key, None)
     temporary_store = get_water_it_temporary_store()
-    temporary_store.update({"content": None, "name": None, "hash": None})
+    temporary_store.update({"content": None, "name": None, "hash": None, "persisted": False})
 
 
 def handle_water_it_mobile_upload(widget_key):
@@ -6987,9 +7146,15 @@ def handle_water_it_mobile_upload(widget_key):
     try:
         dataframe, source = remember_uploaded_water_it_csv(uploaded_file)
         latest_time = dataframe["測定日時_解析"].max()
+        saved_text = (
+            " Supabaseへ保存しました。"
+            if st.session_state.get(WATER_IT_UPLOAD_PERSISTED_KEY)
+            else " 一時表示には反映しました。"
+        )
         st.session_state["water_it_upload_success_message"] = (
             f"{uploaded_file.name or '選択したファイル'} を受け取りました。"
-            f" 最新測定日時：{latest_time.strftime('%Y/%m/%d %H:%M')}"
+            f" 最新測定日時：{latest_time.strftime('%Y/%m/%d %H:%M')}。"
+            + saved_text
         )
     except Exception as exc:
         st.session_state["water_it_upload_error_message"] = str(exc)
@@ -7221,10 +7386,10 @@ def show_water_it_history(dataframe):
 
 def show_water_it_test_page():
     st.markdown("---")
-    st.header("💧 WATER it CSV取込テスト（スマホ修正版）")
+    st.header("💧 WATER it CSV取込・保存テスト")
     show_back_home_button("water_it_back_home")
     st.caption(
-        "スマホでWATER itからCSVを手動ダウンロードし、そのCSVを選ぶだけで読み取り専用表示へ反映します。Excel・WATER it・Dropboxへの書き込みは行いません。"
+        "スマホでWATER itからCSVを手動ダウンロードし、そのCSVを選ぶだけで画面へ反映し、既存のSupabaseへ自動保存します。Excel・WATER it・Dropboxへの書き込みは行いません。"
     )
 
     st.link_button(
@@ -7261,8 +7426,12 @@ def show_water_it_test_page():
 
     success_message = st.session_state.pop("water_it_upload_success_message", None)
     error_message = st.session_state.pop("water_it_upload_error_message", None)
+    persist_warning = st.session_state.pop("water_it_persist_warning_message", None)
     if success_message:
         st.success(success_message)
+    if persist_warning:
+        st.warning("CSVは画面へ反映しましたが、Supabaseへの保存は完了していません。")
+        st.write(persist_warning)
     if error_message:
         st.error("選択したファイルを読み込めませんでした。")
         st.write(error_message)
@@ -7300,12 +7469,12 @@ def show_water_it_test_page():
     if st.session_state.get(WATER_IT_UPLOAD_BYTES_KEY) or temporary_store.get("content"):
         button_col, note_col = st.columns([1, 2])
         with button_col:
-            if st.button("選択したCSVを解除", key="water_it_clear_upload"):
+            if st.button("選択中のCSVを解除", key="water_it_clear_upload"):
                 clear_uploaded_water_it_csv()
                 st.session_state["water_it_uploader_version"] = uploader_version + 1
                 st.rerun()
         with note_col:
-            st.caption("現在はアプリの一時メモリに保持しています。顧客詳細にも表示されますが、アプリ再起動後も残す保存機能は次の段階で追加します。")
+            st.caption("選択したCSVはSupabaseへ保存されます。ここで選択状態を解除しても、最後に保存したデータは残り、顧客詳細から引き続き確認できます。")
 
     if dataframe is None or dataframe.empty:
         st.warning("CSVに表示できる測定データがありません。")
