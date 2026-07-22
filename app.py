@@ -1,5 +1,7 @@
+import base64
 import calendar
 import copy
+import gzip
 import hashlib
 import html
 import json
@@ -7,6 +9,7 @@ import math
 import posixpath
 import re
 import urllib.parse
+import unicodedata
 import uuid
 import zipfile
 from datetime import date, datetime, timedelta, timezone
@@ -100,6 +103,10 @@ SOLUBLE_LOCATIONS = {
     "ノベルズ": {"usage": 3, "delivery": 4, "inventory": 5},
     "コスモアグリ": {"usage": 6, "delivery": 7, "inventory": 8},
 }
+# Excel内の識別名・既存ロジックは変えず、画面表示だけを分かりやすい名称にする。
+SOLUBLE_LOCATION_DISPLAY_NAMES = {
+    "ノベルズ": "ノベルズデイリー",
+}
 SOLUBLE_CUSTOMER_NAMES = ("三谷牧場", "熊林牧場")
 SOLUBLE_CUSTOMER_COLUMNS = {
     "customer_name": 2,       # B列
@@ -184,6 +191,61 @@ MAP_LOCATION_COLUMN_CANDIDATES = [
     "緯度・経度",
     "座標",
 ]
+
+
+# =========================
+# WATER it接続（読み取り専用）
+# =========================
+# スマホでWATER itから手動ダウンロードしたCSVを選び、読み取り専用で表示する。
+# 選択したCSVはStreamlitのセッション内だけに保持し、Excel・WATER it・Dropboxへは書き込まない。
+# 未選択時は、従来どおり同じフォルダのdata.csvを参考表示できる。
+WATER_IT_CSV_PATH = st.secrets.get("WATER_IT_CSV_PATH", "data.csv")
+WATER_IT_CSV_URL = st.secrets.get("WATER_IT_CSV_URL", "")
+WATER_IT_REQUEST_TIMEOUT = 20
+WATER_IT_LOGIN_URL = "https://www.dms2.waterit.optex.net/WIA0101/Index01"
+WATER_IT_UPLOAD_BYTES_KEY = "water_it_uploaded_csv_bytes"
+WATER_IT_UPLOAD_NAME_KEY = "water_it_uploaded_csv_name"
+WATER_IT_UPLOAD_HASH_KEY = "water_it_uploaded_csv_hash"
+WATER_IT_UPLOAD_PERSISTED_KEY = "water_it_uploaded_csv_persisted"
+# 既存のcustomer_informationテーブル内に、通常の顧客情報と衝突しない内部レコードとして保存する。
+# 新しいSupabaseテーブルやSecretsは不要。Excel・WATER it・Dropboxには書き込まない。
+WATER_IT_STORAGE_CUSTOMER = "__WATER_IT_STORAGE__"
+WATER_IT_STORAGE_FIELD = "__water_it_csv_snapshot__"
+WATER_IT_STORAGE_ID = str(
+    uuid.uuid5(uuid.NAMESPACE_URL, "aoyama-water-it-csv-snapshot-v1")
+)
+WATER_IT_STORAGE_VERSION = 1
+WATER_IT_REQUIRED_COLUMNS = [
+    "測定日時",
+    "測定項目",
+    "測定値",
+    "単位",
+    "エリア",
+    "ポイント",
+]
+WATER_IT_ALERT_COLUMNS = [
+    "HOLD中",
+    "メンテナンス時期",
+    "校正時期",
+    "消耗品交換時期",
+    "オーバーホール時期",
+    "ローバッテリ",
+    "センサまたは変換器異常",
+    "通信不良または断線",
+    "状態",
+]
+# WATER it側の元名称は変更せず、画面表示と顧客照合だけを統一する。
+WATER_IT_POINT_DISPLAY_NAMES = {
+    "ノベルズデイリーファーム": "ノベルズデイリー",
+}
+
+# ソリュブル在庫とWATER itの対応。Excel内の識別名や既存列構成は変更しない。
+SOLUBLE_WATER_IT_POINT_NAMES = {
+    "ノベルズ": "ノベルズデイリー",
+    "コスモアグリ": "コスモアグリ",
+}
+# 実績平均はアプリ上の参考表示だけに使い、Excelの使用量/日へは反映しない。
+SOLUBLE_WATER_IT_USAGE_WINDOWS = (3, 7, 20, 30)
 
 
 # =========================
@@ -3323,6 +3385,7 @@ def sync_page_from_query_params():
         "calendar",
         "dispatch_table",
         "soluble_inventory",
+        "water_it_test",
         "notes",
         "trade_notes",
         "detail",
@@ -3797,6 +3860,9 @@ def show_customer_detail(df, customer_name):
 
     customer_key = get_stable_customer_key(detail)
     render_customer_information_card(customer_name, customer_key)
+
+    # WATER itのポイント名と顧客名が一致する場合だけ、最新値を読み取り専用で表示する。
+    render_customer_water_it_card(customer_name)
 
     if visible_detail.empty:
         st.info("表示対象の商品はありません。使用数量/日が0または空白の商品は非表示にしています。")
@@ -6487,6 +6553,711 @@ def render_soluble_customer_product_card(customer_name, current, key_scope):
         render_soluble_customer_editor(customer_name, current, key_scope)
 
 
+
+def get_soluble_water_it_history(dataframe, location):
+    """選択会社に対応するWATER itのタンク履歴を、kgの数値行だけ返す。"""
+    point_name = SOLUBLE_WATER_IT_POINT_NAMES.get(location)
+    if not point_name or dataframe is None or dataframe.empty:
+        return pd.DataFrame()
+
+    history = get_water_it_customer_rows(dataframe, point_name)
+    if history.empty:
+        return history
+
+    # ノベルズ・コスモは保管タンク1基。別の測定項目を誤って混ぜない。
+    tank_rows = history[
+        history["測定項目"].astype(str).str.contains("保管タンク", regex=False, na=False)
+    ].copy()
+    tank_rows = tank_rows[
+        tank_rows["測定値_数値"].notna()
+        & tank_rows["単位_表示"].map(normalize_water_it_unit).eq("kg")
+    ].copy()
+    if tank_rows.empty:
+        return tank_rows
+
+    # 測定項目が複数ある場合は、最新時刻を持つ1項目だけに限定する。
+    latest_by_item = tank_rows.groupby("測定項目")["測定日時_解析"].max()
+    selected_item = latest_by_item.idxmax()
+    tank_rows = tank_rows[tank_rows["測定項目"] == selected_item].copy()
+    tank_rows.sort_values("測定日時_解析", inplace=True)
+    tank_rows.reset_index(drop=True, inplace=True)
+    return tank_rows
+
+
+def get_soluble_water_it_daily_actuals(history):
+    """WATER it履歴から、各日の9:00実測値を日付ごとに返す。
+
+    CSVを数日取り込まなかった場合でも、次回CSVに含まれる過去日の9:00値を
+    アプリ表示へまとめて反映する。Excel本体は変更しない。
+    """
+    if history is None or history.empty:
+        return {}
+
+    daily = history.dropna(subset=["測定日時_解析", "測定値_数値"]).copy()
+    if daily.empty:
+        return {}
+
+    measured_at = pd.to_datetime(daily["測定日時_解析"], errors="coerce")
+    daily = daily[
+        measured_at.notna()
+        & measured_at.dt.hour.eq(9)
+        & measured_at.dt.minute.eq(0)
+    ].copy()
+    if daily.empty:
+        return {}
+
+    daily["_water_it_measured_at"] = pd.to_datetime(
+        daily["測定日時_解析"],
+        errors="coerce",
+    )
+    daily["_water_it_date"] = daily["_water_it_measured_at"].dt.date
+    daily.sort_values("_water_it_measured_at", inplace=True)
+
+    # 同じ日の9:00行が重複していても、CSV内で最後の1件だけを採用する。
+    daily = daily.groupby("_water_it_date", sort=True, as_index=False).tail(1)
+    result = {}
+    for _, row in daily.iterrows():
+        value = float(row["測定値_数値"])
+        if not math.isfinite(value):
+            continue
+        if value.is_integer():
+            value = int(value)
+        result[row["_water_it_date"]] = {
+            "value": value,
+            "measured_at": row["_water_it_measured_at"],
+            "source": "09:00",
+        }
+    return result
+
+
+def estimate_soluble_water_it_daily_usage(history, days):
+    """WATER it履歴から1日平均使用量を参考値として推定する。
+
+    1時間ごとの中央値で短時間の揺れをならし、大きな上昇は納品として区切る。
+    各区間の開始値と終了値の減少分だけを合計するため、Excelの使用量/日や
+    将来予測へは一切反映しない。
+    """
+    result = {
+        "days": int(days),
+        "average": None,
+        "available_days": 0.0,
+        "enough_data": False,
+    }
+    if history is None or history.empty:
+        return result
+
+    series = (
+        history.dropna(subset=["測定日時_解析", "測定値_数値"])
+        .sort_values("測定日時_解析")
+        .set_index("測定日時_解析")["測定値_数値"]
+        .astype(float)
+    )
+    series = series[~series.index.duplicated(keep="last")]
+    if len(series) < 2:
+        return result
+
+    latest_time = series.index.max()
+    oldest_time = series.index.min()
+    available_days = max(
+        0.0,
+        (latest_time - oldest_time).total_seconds() / 86400.0,
+    )
+    result["available_days"] = available_days
+
+    # 10分程度の端数は許容するが、期間が足りない時は無理に期間平均を出さない。
+    if available_days < float(days) - 0.1:
+        return result
+
+    cutoff = latest_time - pd.Timedelta(days=int(days))
+    hourly = series.resample("1h").median().interpolate(limit=2)
+    hourly = hourly[(hourly.index >= cutoff) & (hourly.index <= latest_time)].dropna()
+    if len(hourly) < 2:
+        return result
+
+    median_level = float(hourly.median())
+    # 小さな測定揺れは納品扱いにしない。実タンクでは納品上昇が数千kg単位になる。
+    delivery_jump = max(1000.0, abs(median_level) * 0.04)
+    differences = hourly.diff()
+    split_positions = [
+        hourly.index.get_loc(timestamp)
+        for timestamp in hourly.index[differences > delivery_jump]
+    ]
+
+    starts = [0] + split_positions
+    ends = [position - 1 for position in split_positions] + [len(hourly) - 1]
+    total_decrease = 0.0
+    for start_position, end_position in zip(starts, ends):
+        if end_position <= start_position:
+            continue
+        decrease = float(hourly.iloc[start_position] - hourly.iloc[end_position])
+        if math.isfinite(decrease) and decrease > 0:
+            total_decrease += decrease
+
+    elapsed_days = (
+        hourly.index[-1] - hourly.index[0]
+    ).total_seconds() / 86400.0
+    if elapsed_days <= 0:
+        return result
+
+    average = total_decrease / elapsed_days
+    if not math.isfinite(average) or average < 0:
+        return result
+
+    result["average"] = average
+    result["enough_data"] = True
+    return result
+
+
+def get_soluble_water_it_context(location, rows):
+    """ソリュブル画面用の実測値・差額・参考平均をまとめる。失敗時はNone。"""
+    if location not in SOLUBLE_WATER_IT_POINT_NAMES:
+        return None
+    try:
+        dataframe, source = get_active_water_it_data()
+        history = get_soluble_water_it_history(dataframe, location)
+    except Exception:
+        return None
+    if history.empty:
+        return None
+
+    latest = history.iloc[-1]
+    measured_at = latest["測定日時_解析"]
+    if pd.isna(measured_at):
+        return None
+    actual_value = float(latest["測定値_数値"])
+    if not math.isfinite(actual_value):
+        return None
+    if actual_value.is_integer():
+        actual_value = int(actual_value)
+
+    measured_date = measured_at.date()
+    excel_row = next((row for row in rows if row.get("date") == measured_date), None)
+    excel_value = (
+        excel_row.get(f"{location}_inventory")
+        if excel_row is not None
+        else None
+    )
+    excel_usage = (
+        excel_row.get(f"{location}_usage")
+        if excel_row is not None
+        else None
+    )
+    difference = None
+    if isinstance(excel_value, (int, float)):
+        difference = float(actual_value) - float(excel_value)
+        if difference.is_integer():
+            difference = int(difference)
+
+    usage_averages = {
+        days: estimate_soluble_water_it_daily_usage(history, days)
+        for days in SOLUBLE_WATER_IT_USAGE_WINDOWS
+    }
+
+    # 日付ごとの在庫欄は、最新値ではなく各日の9:00実測だけを使う。
+    # 上部の「現在の実測在庫」は従来どおりCSV内の最新値を表示する。
+    daily_actuals = get_soluble_water_it_daily_actuals(history)
+
+    today = get_jst_now().date()
+    today_actual = daily_actuals.get(today)
+    today_excel_row = next((row for row in rows if row.get("date") == today), None)
+    today_excel_value = (
+        today_excel_row.get(f"{location}_inventory")
+        if today_excel_row is not None
+        else None
+    )
+
+    return {
+        "source": source,
+        "history": history,
+        "actual_value": actual_value,
+        "measured_at": measured_at,
+        "measured_date": measured_date,
+        "unit": "kg",
+        "excel_row": excel_row,
+        "excel_value": excel_value,
+        "excel_usage": excel_usage,
+        "difference": difference,
+        "usage_averages": usage_averages,
+        "daily_actuals": daily_actuals,
+        "today_9am_actual": today_actual,
+        "today_9am_excel_row": today_excel_row,
+        "today_9am_excel_value": today_excel_value,
+    }
+
+
+def apply_soluble_water_it_forecast(rows, location, context):
+    """WATER it実測を日付ごとに反映し、その間だけアプリ予測を行う。
+
+    CSVに各日の9:00実測値が含まれる場合は、過去日も含めてその日の在庫表示を
+    実測値へ置き換える。実測値がない日は、直前の実測または黄色い手入力基準から
+    Excelの使用量・納品を使って計算する。Excel本体・元のrows・使用量/日・納品は
+    変更しない。
+    """
+    display_rows = [dict(row) for row in rows]
+    if not context:
+        return display_rows
+
+    daily_actuals = context.get("daily_actuals") or {}
+    if not daily_actuals:
+        return display_rows
+
+    previous_inventory = None
+    started = False
+    for row in sorted(display_rows, key=lambda item: item["date"]):
+        row_date = row["date"]
+        display_key = f"{location}_inventory_display"
+        source_key = f"{location}_inventory_display_source"
+
+        # CSV内にその日の9:00実測があれば、最新日の直近値ではなく、
+        # 必ず9:00の値をExcel計算値より優先して緑の実測値として表示する。
+        actual = daily_actuals.get(row_date)
+        if actual is not None:
+            actual_value = actual.get("value")
+            if isinstance(actual_value, (int, float)) and math.isfinite(float(actual_value)):
+                previous_inventory = actual_value
+                row[display_key] = actual_value
+                row[source_key] = "water_it_actual"
+                row[f"{location}_inventory_measured_at"] = actual.get("measured_at")
+                started = True
+                continue
+
+        if not started:
+            row[display_key] = row.get(f"{location}_inventory")
+            row[source_key] = "excel"
+            continue
+
+        # 実測値がない日の黄色い在庫は、人が指定した次の基準値として尊重する。
+        # 後日の9:00実測が現れた時点で、その実測値へ再び補正される。
+        if row.get(f"{location}_inventory_manual"):
+            manual_value = row.get(f"{location}_inventory")
+            if isinstance(manual_value, (int, float)):
+                previous_inventory = manual_value
+                row[display_key] = manual_value
+                row[source_key] = "excel_manual_baseline"
+                continue
+
+        usage = row.get(f"{location}_usage")
+        delivery = row.get(f"{location}_delivery")
+        usage = usage if isinstance(usage, (int, float)) else 0
+        delivery = delivery if isinstance(delivery, (int, float)) else 0
+        if isinstance(previous_inventory, (int, float)):
+            previous_inventory = previous_inventory - usage + delivery
+            row[display_key] = previous_inventory
+            row[source_key] = "water_it_forecast"
+        else:
+            row[display_key] = row.get(f"{location}_inventory")
+            row[source_key] = "excel"
+
+    return display_rows
+
+
+def find_soluble_row_by_date(content, target_date):
+    matches = [row for row in read_soluble_rows(content) if row.get("date") == target_date]
+    if len(matches) != 1:
+        if not matches:
+            raise RuntimeError(
+                f"Excelのソリュブルシートに{target_date.strftime('%Y/%m/%d')}の行がありません。"
+            )
+        raise RuntimeError("同じ日付の行が複数あるため、安全のため更新を中止しました。")
+    return matches[0]
+
+
+def verify_soluble_water_it_baseline(content, location, target_date, expected_value, next_formula):
+    """Dropbox保存後に実測値・黄色・翌日の式が保たれていることを確認する。"""
+    row = find_soluble_row_by_date(content, target_date)
+    workbook = load_workbook(BytesIO(content), data_only=False, read_only=False)
+    try:
+        if SOLUBLE_SHEET_NAME not in workbook.sheetnames:
+            raise RuntimeError("保存後のExcelにソリュブルシートがありません。")
+        ws = workbook[SOLUBLE_SHEET_NAME]
+        inventory_column = SOLUBLE_LOCATIONS[location]["inventory"]
+        cell = ws.cell(row["row"], inventory_column)
+        if not same_soluble_value(cell.value, expected_value):
+            raise RuntimeError("保存後のExcelで実測値が一致しません。")
+        if not soluble_cell_is_manual(cell):
+            raise RuntimeError("保存後のExcelで実測値のセルが黄色になっていません。")
+        if next_formula is not None and row["row"] < ws.max_row:
+            actual_next_formula = ws.cell(row["row"] + 1, inventory_column).value
+            if actual_next_formula != next_formula:
+                raise RuntimeError("保存後のExcelで翌日の在庫計算式が変わっています。")
+    finally:
+        workbook.close()
+
+
+def save_soluble_water_it_baseline(location, context):
+    """選択会社の今日の実測値だけを、バックアップ付きでExcelの黄色い基準値にする。"""
+    if location not in SOLUBLE_WATER_IT_POINT_NAMES:
+        raise RuntimeError("WATER it実測値を反映できる会社ではありません。")
+    if not context:
+        raise RuntimeError("WATER itの実測値を確認できません。")
+
+    today_actual = context.get("today_9am_actual") or {}
+    measured_at = today_actual.get("measured_at")
+    target_date = get_jst_now().date()
+    actual_value = today_actual.get("value")
+    if measured_at is None or not isinstance(actual_value, (int, float)):
+        raise RuntimeError("今日9:00の実測値がないため、Excelへの反映を中止しました。")
+    if measured_at.date() != target_date or measured_at.hour != 9 or measured_at.minute != 0:
+        raise RuntimeError("今日9:00の実測値を確認できないため、Excelへの反映を中止しました。")
+    if normalize_water_it_unit(context.get("unit")) != "kg":
+        raise RuntimeError("kg以外の実測値はExcelへ反映しません。")
+    if actual_value < 0:
+        raise RuntimeError("実測値がマイナスのため、Excelへの反映を中止しました。")
+
+    target_path = str(SOLUBLE_DROPBOX_FILE_PATH or SOLUBLE_DROPBOX_DEFAULT_FILE_PATH).strip()
+    timestamp = get_jst_now().strftime("%Y%m%d_%H%M%S_%f")
+
+    if has_dropbox_auth_config():
+        access_token = get_dropbox_access_token()
+        original_content, response = download_dropbox_file(target_path, access_token)
+        if original_content is None:
+            raise RuntimeError(
+                "最新の対象Excelを取得できませんでした。\n" + dropbox_error_text(response)
+            )
+        revision = get_download_revision(response)
+        if not revision:
+            raise RuntimeError("Dropboxの更新番号を取得できないため、保存を中止しました。")
+
+        latest_row = find_soluble_row_by_date(original_content, target_date)
+        inventory_column = SOLUBLE_LOCATIONS[location]["inventory"]
+        formula_book = load_workbook(BytesIO(original_content), data_only=False, read_only=False)
+        try:
+            ws = formula_book[SOLUBLE_SHEET_NAME]
+            next_formula = (
+                ws.cell(latest_row["row"] + 1, inventory_column).value
+                if latest_row["row"] < ws.max_row
+                else None
+            )
+        finally:
+            formula_book.close()
+
+        saved_content, changed = build_soluble_updated_workbook(
+            original_content,
+            latest_row["row"],
+            location,
+            {"inventory": actual_value},
+        )
+        ensure_soluble_backup_folder(access_token)
+        backup_path = (
+            f"{SOLUBLE_BACKUP_FOLDER}/"
+            f"aoベンチャーグレイン配車表_{timestamp}.xlsx"
+        )
+        backup_response = upload_dropbox_file(
+            backup_path,
+            original_content,
+            access_token,
+            mode="add",
+        )
+        if backup_response.status_code != 200:
+            raise RuntimeError(
+                "バックアップを作成できないため、本番ファイルは更新しません。\n"
+                + dropbox_error_text(backup_response)
+            )
+        upload_response = upload_dropbox_file(
+            target_path,
+            saved_content,
+            access_token,
+            mode="update",
+            rev=revision,
+        )
+        if upload_response.status_code == 409:
+            raise RuntimeError(
+                "保存中にPCなどでExcelが更新されました。再読み込みしてからやり直してください。"
+            )
+        if upload_response.status_code != 200:
+            raise RuntimeError(
+                "対象Excelを更新できませんでした。\n" + dropbox_error_text(upload_response)
+            )
+
+        confirmed_content, confirmed_response = download_dropbox_file(target_path, access_token)
+        if confirmed_content is None:
+            raise RuntimeError(
+                "保存後のExcelを再取得できませんでした。\n"
+                + dropbox_error_text(confirmed_response)
+            )
+        verify_soluble_water_it_baseline(
+            confirmed_content,
+            location,
+            target_date,
+            actual_value,
+            next_formula,
+        )
+    else:
+        local_path = Path(str(SOLUBLE_LOCAL_FILE))
+        if not local_path.exists():
+            raise FileNotFoundError(f"対象ファイルが見つかりません：{local_path}")
+        original_content = local_path.read_bytes()
+        latest_row = find_soluble_row_by_date(original_content, target_date)
+        inventory_column = SOLUBLE_LOCATIONS[location]["inventory"]
+        formula_book = load_workbook(BytesIO(original_content), data_only=False, read_only=False)
+        try:
+            ws = formula_book[SOLUBLE_SHEET_NAME]
+            next_formula = (
+                ws.cell(latest_row["row"] + 1, inventory_column).value
+                if latest_row["row"] < ws.max_row
+                else None
+            )
+        finally:
+            formula_book.close()
+        saved_content, changed = build_soluble_updated_workbook(
+            original_content,
+            latest_row["row"],
+            location,
+            {"inventory": actual_value},
+        )
+        backup_dir = local_path.parent / "Backups"
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        backup_path = backup_dir / f"aoベンチャーグレイン配車表_{timestamp}.xlsx"
+        backup_path.write_bytes(original_content)
+        local_path.write_bytes(saved_content)
+        verify_soluble_water_it_baseline(
+            local_path.read_bytes(),
+            location,
+            target_date,
+            actual_value,
+            next_formula,
+        )
+
+    st.cache_data.clear()
+    return changed
+
+
+def render_soluble_water_it_summary(location, context):
+    """ソリュブル画面に実測値、Excelとの差、参考平均、任意反映ボタンを表示する。"""
+    if not context:
+        return
+
+    success = st.session_state.pop("soluble_water_it_excel_success", None)
+    if success and success.get("location") == location:
+        st.success(
+            f"{success['date']}の実測値 {soluble_number_label(success['value'])} kg を"
+            "Excelの基準値として保存しました。対象セルは黄色です。"
+        )
+
+    display_name = SOLUBLE_LOCATION_DISPLAY_NAMES.get(location, location)
+    actual_value = context["actual_value"]
+    measured_at = context["measured_at"]
+    excel_value = context.get("excel_value")
+    excel_usage = context.get("excel_usage")
+    difference = context.get("difference")
+
+    with st.container(border=True):
+        st.subheader(f"💧 {display_name}のWATER it実測")
+        st.caption(
+            f"最終受信：{measured_at.strftime('%Y/%m/%d %H:%M')}　｜　参照：{context['source']}"
+        )
+        def summary_card(label, value, tone=""):
+            tone_class = f" {tone}" if tone else ""
+            return (
+                f'<div class="soluble-waterit-stat{tone_class}">'
+                f'<span class="soluble-waterit-stat-label">{html.escape(str(label))}</span>'
+                f'<span class="soluble-waterit-stat-value">{html.escape(str(value))}</span>'
+                '</div>'
+            )
+
+        st.markdown(
+            """
+            <style>
+            .soluble-waterit-summary-grid {
+                display: grid;
+                grid-template-columns: repeat(3, minmax(0, 1fr));
+                gap: 0.75rem;
+                margin: 0.4rem 0 1.1rem;
+            }
+            .soluble-waterit-usage-grid {
+                display: grid;
+                grid-template-columns: repeat(2, minmax(0, 1fr));
+                gap: 0.75rem;
+                margin: 0.45rem 0 0.8rem;
+            }
+            .soluble-waterit-stat {
+                min-width: 0;
+                box-sizing: border-box;
+                padding: 0.9rem 1rem;
+                border: 1px solid rgba(15, 23, 42, 0.12);
+                border-radius: 14px;
+                background: rgba(255, 255, 255, 0.9);
+            }
+            .soluble-waterit-stat.actual {
+                background: #dcfce7;
+                border-color: #4ade80;
+            }
+            .soluble-waterit-stat.excel {
+                background: #f8fafc;
+                border-color: #cbd5e1;
+            }
+            .soluble-waterit-stat.difference {
+                background: #eff6ff;
+                border-color: #93c5fd;
+            }
+            .soluble-waterit-stat.average {
+                background: #f0fdfa;
+                border-color: #5eead4;
+            }
+            .soluble-waterit-stat-label {
+                display: block;
+                color: #667085;
+                font-size: 0.88rem;
+                font-weight: 700;
+                line-height: 1.35;
+                margin-bottom: 0.35rem;
+                overflow-wrap: anywhere;
+            }
+            .soluble-waterit-stat-value {
+                display: block;
+                color: #172033;
+                font-size: clamp(1.55rem, 3.2vw, 2.2rem);
+                font-weight: 800;
+                line-height: 1.15;
+                letter-spacing: -0.02em;
+                white-space: normal;
+                overflow: visible;
+                text-overflow: clip;
+                overflow-wrap: anywhere;
+            }
+            @media (max-width: 640px) {
+                .soluble-waterit-summary-grid,
+                .soluble-waterit-usage-grid {
+                    grid-template-columns: 1fr;
+                    gap: 0.55rem;
+                }
+                .soluble-waterit-stat {
+                    padding: 0.78rem 0.85rem;
+                }
+                .soluble-waterit-stat-label {
+                    font-size: 0.82rem;
+                }
+                .soluble-waterit-stat-value {
+                    font-size: 1.45rem;
+                    white-space: nowrap;
+                    overflow-wrap: normal;
+                }
+            }
+            </style>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        actual_label = f"{soluble_number_label(actual_value)} kg"
+        excel_label = (
+            f"{soluble_number_label(excel_value)} kg"
+            if excel_value is not None
+            else "—"
+        )
+        difference_label = "—" if difference is None else f"{difference:+,.0f} kg"
+        st.markdown(
+            '<div class="soluble-waterit-summary-grid">'
+            + summary_card(f"現在の実測在庫/{measured_at.strftime('%H:%M')}", actual_label, "actual")
+            + summary_card("同日のExcel計算在庫", excel_label, "excel")
+            + summary_card("実測 − Excel", difference_label, "difference")
+            + '</div>',
+            unsafe_allow_html=True,
+        )
+
+        st.markdown("#### 実績から見た1日平均使用量（参考）")
+        excel_usage_label = (
+            f"{soluble_number_label(excel_usage)} kg/日"
+            if isinstance(excel_usage, (int, float))
+            else "—"
+        )
+        st.markdown(
+            '<div class="soluble-waterit-usage-grid">'
+            + summary_card("Excel設定使用量", excel_usage_label, "excel")
+            + '</div>',
+            unsafe_allow_html=True,
+        )
+        st.caption(
+            "WATER it履歴を1時間単位でならし、大きな在庫増加は納品として区切った推定値です。"
+            "Excelの使用量/日や予測計算へは自動反映しません。"
+        )
+
+        # st.tabsは先頭タブが初期表示になるため、7日を先頭にして標準表示にする。
+        usage_tab_specs = (
+            (7, "7日（標準）"),
+            (3, "3日"),
+            (20, "20日"),
+            (30, "30日"),
+        )
+        usage_tabs = st.tabs([label for _, label in usage_tab_specs])
+        for tab, (days, _) in zip(usage_tabs, usage_tab_specs):
+            estimate = context["usage_averages"][days]
+            with tab:
+                if estimate.get("enough_data") and estimate.get("average") is not None:
+                    average_label = f"{estimate['average']:,.0f} kg/日"
+                    detail_label = f"直近{days}日の実績平均"
+                else:
+                    average_label = "データ不足"
+                    detail_label = (
+                        f"直近{days}日分には不足しています（現在 約"
+                        f"{estimate.get('available_days', 0):.1f}日分）"
+                    )
+                st.markdown(
+                    '<div class="soluble-waterit-usage-grid">'
+                    + summary_card(detail_label, average_label, "average")
+                    + '</div>',
+                    unsafe_allow_html=True,
+                )
+
+        st.markdown("#### Excelへ反映（任意）")
+        st.caption(
+            "アプリは各日の9:00実測値を在庫に使います。Excelは自動変更せず、ここで確認して押した場合だけ、"
+            "今日9:00の在庫を基準値として黄色セルへ保存します。保存前バックアップと保存後確認を行います。"
+        )
+
+        today = get_jst_now().date()
+        today_actual = context.get("today_9am_actual") or {}
+        baseline_value = today_actual.get("value")
+        baseline_measured_at = today_actual.get("measured_at")
+        excel_row = context.get("today_9am_excel_row")
+        baseline_excel_value = context.get("today_9am_excel_value")
+        has_today_9am = (
+            isinstance(baseline_value, (int, float))
+            and baseline_measured_at is not None
+            and baseline_measured_at.date() == today
+            and baseline_measured_at.hour == 9
+            and baseline_measured_at.minute == 0
+        )
+        same_value = (
+            has_today_9am
+            and baseline_excel_value is not None
+            and same_soluble_value(baseline_excel_value, baseline_value)
+        )
+        if not has_today_9am:
+            st.warning("今日9:00の実測値がCSVにないため、Excelへの反映ボタンは使えません。")
+            return
+        if excel_row is None:
+            st.warning("今日の行がExcelにないため、反映できません。")
+            return
+        if same_value:
+            st.info("今日のExcel在庫は、すでに9:00実測値と同じです。")
+            return
+
+        confirm_key = f"soluble_water_it_confirm_{location}_{today.isoformat()}"
+        confirmed = st.checkbox(
+            f"{today.strftime('%Y/%m/%d')}のExcel在庫を "
+            f"9:00実測の {soluble_number_label(baseline_value)} kg に変更する",
+            key=confirm_key,
+        )
+        if st.button(
+            "今日の実測値をExcelの基準値にする",
+            key=f"soluble_water_it_save_{location}_{today.isoformat()}",
+            type="primary",
+            use_container_width=True,
+            disabled=not confirmed,
+        ):
+            try:
+                with st.spinner("元ファイルをバックアップし、9:00実測値を保存・確認しています…"):
+                    changed = save_soluble_water_it_baseline(location, context)
+                st.session_state["soluble_water_it_excel_success"] = {
+                    "location": location,
+                    "date": today.strftime("%Y/%m/%d"),
+                    "value": baseline_value,
+                    "changed_count": len(changed),
+                }
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Excelへ反映できませんでした：{exc}")
+
 def show_soluble_inventory_page():
     st.markdown("---")
     st.header("🧪 ソリュブル在庫")
@@ -6506,6 +7277,7 @@ def show_soluble_inventory_page():
         list(SOLUBLE_LOCATIONS.keys()) + list(SOLUBLE_CUSTOMER_NAMES),
         horizontal=True,
         key="soluble_location",
+        format_func=lambda name: SOLUBLE_LOCATION_DISPLAY_NAMES.get(name, name),
     )
 
     if location in SOLUBLE_CUSTOMER_NAMES:
@@ -6526,7 +7298,15 @@ def show_soluble_inventory_page():
         return
 
     # 数値がまだ空の日も、ここから新しく入力できるように日付行はすべて表示対象にする。
-    active_rows = list(rows)
+    water_it_context = get_soluble_water_it_context(location, rows)
+    if water_it_context is not None:
+        render_soluble_water_it_summary(location, water_it_context)
+        active_rows = apply_soluble_water_it_forecast(rows, location, water_it_context)
+    else:
+        # WATER itを読めない時も、既存のExcel表示・編集ルールは従来どおり動かす。
+        active_rows = list(rows)
+        if location in SOLUBLE_WATER_IT_POINT_NAMES:
+            st.info("WATER itの保存済みデータを確認できないため、Excelの値だけを表示しています。")
     if not active_rows:
         st.info(f"{location}の表示データはありません。")
         return
@@ -6630,6 +7410,8 @@ def show_soluble_inventory_page():
         .soluble-values {display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:8px;}
         .soluble-value {background:#f8fafc; border-radius:12px; padding:9px 10px; min-width:0;}
         .soluble-value.manual {background:#fff59d; border:1px solid #e3cb42;}
+        .soluble-value.waterit-actual {background:#dcfce7; border:1px solid #4ade80;}
+        .soluble-value.waterit-forecast {background:#e0f2fe; border:1px solid #7dd3fc;}
         .soluble-value.negative {background:#fee2e2; border:1px solid #f87171;}
         .soluble-label {display:block; color:#697386; font-size:.78rem; margin-bottom:3px;}
         .soluble-number {display:block; color:#182033; font-size:1.04rem; font-weight:800; overflow-wrap:anywhere;}
@@ -6645,7 +7427,7 @@ def show_soluble_inventory_page():
         unsafe_allow_html=True,
     )
     st.markdown(
-        f'<div class="soluble-legend"><span class="soluble-yellow-chip"></span><span>黄色は手入力　｜　参照：{html.escape(source)}</span></div>',
+        f'<div class="soluble-legend"><span class="soluble-yellow-chip"></span><span>黄色はExcelの手入力　｜　緑はWATER it実測　｜　水色は実測起点のアプリ予測　｜　参照：{html.escape(source)}</span></div>',
         unsafe_allow_html=True,
     )
 
@@ -6658,14 +7440,25 @@ def show_soluble_inventory_page():
         usage = row.get(f"{location}_usage")
         delivery = row.get(f"{location}_delivery")
         inventory = row.get(f"{location}_inventory")
+        inventory_display = row.get(f"{location}_inventory_display", inventory)
+        inventory_display_source = row.get(f"{location}_inventory_display_source", "excel")
+        inventory_label = {
+            "water_it_actual": "在庫（実測）",
+            "water_it_forecast": "在庫（実測起点予測）",
+            "excel_manual_baseline": "在庫（Excel手入力基準）",
+        }.get(inventory_display_source, "在庫")
         cells = []
         for label, field, value in (
             ("使用量/日", "usage", usage),
             ("納品", "delivery", delivery),
-            ("在庫", "inventory", inventory),
+            (inventory_label, "inventory", inventory_display),
         ):
             classes = ["soluble-value"]
-            if row.get(f"{location}_{field}_manual"):
+            if field == "inventory" and inventory_display_source == "water_it_actual":
+                classes.append("waterit-actual")
+            elif field == "inventory" and inventory_display_source == "water_it_forecast":
+                classes.append("waterit-forecast")
+            elif row.get(f"{location}_{field}_manual"):
                 classes.append("manual")
             if field == "inventory" and isinstance(value, (int, float)) and value < 0:
                 classes.append("negative")
@@ -6736,6 +7529,729 @@ def show_soluble_inventory_page():
 
 
 
+
+
+
+# =========================
+# WATER it接続（読み取り専用）
+# =========================
+def resolve_water_it_csv_path():
+    """data.csvの場所を、このPythonファイル基準で解決する。"""
+    configured = str(WATER_IT_CSV_PATH).strip() or "data.csv"
+    path = Path(configured).expanduser()
+    if not path.is_absolute():
+        path = Path(__file__).resolve().parent / path
+    return path
+
+
+def read_water_it_source_bytes():
+    """WATER itのCSVを読み取る。書き込み処理は行わない。"""
+    csv_url = str(WATER_IT_CSV_URL).strip()
+    if csv_url:
+        try:
+            response = requests.get(
+                csv_url,
+                timeout=WATER_IT_REQUEST_TIMEOUT,
+                headers={"User-Agent": "Aoyama-WATER-it-readonly-test/1.0"},
+            )
+            response.raise_for_status()
+        except requests.RequestException as exc:
+            raise RuntimeError(f"WATER it CSV URLから取得できませんでした：{exc}") from exc
+
+        content_type = str(response.headers.get("Content-Type", "")).lower()
+        if "text/html" in content_type:
+            raise RuntimeError(
+                "WATER_IT_CSV_URLからCSVではなくHTMLが返されました。CSVを直接取得できるURLを設定してください。"
+            )
+        hostname = urllib.parse.urlparse(csv_url).hostname or "設定URL"
+        return response.content, f"WATER_IT_CSV_URL（{hostname}）"
+
+    path = resolve_water_it_csv_path()
+    if not path.exists():
+        raise RuntimeError(
+            f"{path.name} が見つかりません。このPythonファイルと同じフォルダに data.csv を置いてください。"
+        )
+    if not path.is_file():
+        raise RuntimeError(f"WATER_IT_CSV_PATH がファイルではありません：{path.name}")
+    return path.read_bytes(), path.name
+
+
+def normalize_water_it_unit(value):
+    text = clean_value(value, blank_text="").strip()
+    replacements = {
+        "㎏": "kg",
+        "ＫＧ": "kg",
+        "ｋｇ": "kg",
+        "Ｋｇ": "kg",
+        "Ｌ": "L",
+        "ℓ": "L",
+        "㍑": "L",
+    }
+    return replacements.get(text, text)
+
+
+def water_it_nonblank(value):
+    if value is None or pd.isna(value):
+        return False
+    text = str(value).strip()
+    if not text:
+        return False
+    return text.lower() not in {
+        "nan",
+        "none",
+        "false",
+        "0",
+        "0.0",
+        "-",
+        "なし",
+        "正常",
+        "異常なし",
+    }
+
+
+def parse_water_it_csv(content):
+    """WATER itのCSVを画面表示用に整形する。"""
+    dataframe = None
+    errors = []
+    for encoding in ("utf-8-sig", "utf-8", "cp932", "shift_jis"):
+        try:
+            candidate = pd.read_csv(BytesIO(content), encoding=encoding)
+            if len(candidate.columns) <= 1:
+                raise ValueError("CSVの列を分割できませんでした。")
+            dataframe = candidate
+            break
+        except Exception as exc:
+            errors.append(f"{encoding}: {exc}")
+
+    if dataframe is None:
+        detail = " / ".join(errors[:2])
+        raise RuntimeError(f"data.csvを読み込めませんでした。{detail}")
+
+    dataframe.columns = [str(column).replace("\ufeff", "").strip() for column in dataframe.columns]
+    missing = [column for column in WATER_IT_REQUIRED_COLUMNS if column not in dataframe.columns]
+    if missing:
+        raise RuntimeError(
+            "data.csvに必要な列がありません：" + "、".join(missing)
+        )
+
+    dataframe = dataframe.copy()
+    dataframe["測定日時_解析"] = pd.to_datetime(
+        dataframe["測定日時"],
+        errors="coerce",
+    )
+
+    number_translation = str.maketrans(
+        "０１２３４５６７８９．，－＋",
+        "0123456789.,-+",
+    )
+    number_text = (
+        dataframe["測定値"]
+        .astype(str)
+        .str.translate(number_translation)
+        .str.replace(",", "", regex=False)
+        .str.strip()
+    )
+    dataframe["測定値_数値"] = pd.to_numeric(number_text, errors="coerce")
+    dataframe["単位_表示"] = dataframe["単位"].apply(normalize_water_it_unit)
+    dataframe["エリア"] = dataframe["エリア"].fillna("").astype(str).str.strip()
+    dataframe["ポイント"] = dataframe["ポイント"].fillna("").astype(str).str.strip()
+    dataframe["測定項目"] = dataframe["測定項目"].fillna("").astype(str).str.strip()
+
+    dataframe = dataframe[
+        dataframe["測定日時_解析"].notna()
+        & dataframe["ポイント"].ne("")
+        & dataframe["測定項目"].ne("")
+    ].copy()
+    dataframe.sort_values("測定日時_解析", ascending=False, inplace=True)
+    dataframe.reset_index(drop=True, inplace=True)
+    return dataframe
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def load_water_it_data():
+    content, source = read_water_it_source_bytes()
+    return parse_water_it_csv(content), source
+
+
+def make_water_it_snapshot_payload(content, filename, dataframe):
+    """検証済みCSVを圧縮し、Supabaseへ保存できるJSON文字列にする。"""
+    latest_time = dataframe["測定日時_解析"].max()
+    oldest_time = dataframe["測定日時_解析"].min()
+    return json.dumps(
+        {
+            "version": WATER_IT_STORAGE_VERSION,
+            "filename": str(filename or "data.csv"),
+            "sha256": hashlib.sha256(content).hexdigest(),
+            "csv_gzip_base64": base64.b64encode(gzip.compress(content)).decode("ascii"),
+            "row_count": int(len(dataframe)),
+            "point_count": int(dataframe["ポイント"].nunique()),
+            "oldest_time": oldest_time.isoformat() if pd.notna(oldest_time) else None,
+            "latest_time": latest_time.isoformat() if pd.notna(latest_time) else None,
+            "imported_at": get_jst_now().isoformat(),
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+
+def decode_water_it_snapshot_payload(payload_text):
+    """Supabaseに保存したスナップショットから元のCSVバイト列を復元する。"""
+    try:
+        payload = json.loads(str(payload_text or ""))
+    except Exception as exc:
+        raise RuntimeError("保存済みWATER itデータの形式が正しくありません。") from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError("保存済みWATER itデータの形式が正しくありません。")
+    if int(payload.get("version", 0)) != WATER_IT_STORAGE_VERSION:
+        raise RuntimeError("保存済みWATER itデータのバージョンが対応外です。")
+    encoded = str(payload.get("csv_gzip_base64") or "")
+    if not encoded:
+        raise RuntimeError("保存済みWATER itデータにCSV本体がありません。")
+    try:
+        content = gzip.decompress(base64.b64decode(encoded.encode("ascii")))
+    except Exception as exc:
+        raise RuntimeError("保存済みWATER itデータを復元できませんでした。") from exc
+    expected_hash = str(payload.get("sha256") or "")
+    if expected_hash and hashlib.sha256(content).hexdigest() != expected_hash:
+        raise RuntimeError("保存済みWATER itデータの検証に失敗しました。")
+    return content, str(payload.get("filename") or "data.csv"), payload
+
+
+def save_water_it_snapshot_to_supabase(content, filename, dataframe):
+    """選択したCSVを既存Supabaseへ保存する。WATER itやExcelには書き込まない。"""
+    if not has_supabase_config():
+        raise RuntimeError("Supabase設定がないため、CSVを永続保存できません。")
+    now = get_jst_now().isoformat()
+    payload = {
+        "id": WATER_IT_STORAGE_ID,
+        "customer_key": None,
+        "customer_name": WATER_IT_STORAGE_CUSTOMER,
+        "field_name": WATER_IT_STORAGE_FIELD,
+        "content": make_water_it_snapshot_payload(content, filename, dataframe),
+        "sort_order": 0,
+        "created_at": now,
+        "updated_at": now,
+    }
+    try:
+        response = requests.post(
+            get_supabase_customer_information_url(),
+            headers=get_supabase_headers(
+                prefer="resolution=merge-duplicates,return=minimal"
+            ),
+            params={"on_conflict": "id"},
+            json=payload,
+            timeout=30,
+        )
+    except Exception as exc:
+        raise RuntimeError("WATER itデータをSupabaseへ保存できませんでした。") from exc
+    if response.status_code not in (200, 201):
+        detail = str(response.text or "").strip()[:500]
+        raise RuntimeError(
+            f"WATER itデータをSupabaseへ保存できませんでした（{response.status_code}）。"
+            + (f" {detail}" if detail else "")
+        )
+    load_saved_water_it_snapshot.clear()
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def load_saved_water_it_snapshot():
+    """Supabaseから最後に取り込んだCSVを取得する。未保存ならNoneを返す。"""
+    if not has_supabase_config():
+        return None
+    try:
+        response = requests.get(
+            get_supabase_customer_information_url(),
+            headers=get_supabase_headers(),
+            params={
+                "select": "content,updated_at",
+                "id": f"eq.{WATER_IT_STORAGE_ID}",
+                "limit": "1",
+            },
+            timeout=20,
+        )
+    except Exception:
+        return None
+    if response.status_code != 200:
+        return None
+    try:
+        rows = response.json()
+    except Exception:
+        return None
+    if not isinstance(rows, list) or not rows:
+        return None
+    try:
+        content, filename, metadata = decode_water_it_snapshot_payload(rows[0].get("content"))
+        dataframe = parse_water_it_csv(content)
+    except Exception:
+        return None
+    return {
+        "content": content,
+        "filename": filename,
+        "metadata": metadata,
+        "dataframe": dataframe,
+        "updated_at": rows[0].get("updated_at"),
+    }
+
+
+@st.cache_resource(show_spinner=False)
+def get_water_it_temporary_store():
+    """アプリ再起動まで、選択CSVをサーバーの一時メモリに保持する。"""
+    return {"content": None, "name": None, "hash": None}
+
+
+def get_active_water_it_data():
+    """選択中CSV、Supabase保存済みCSV、同梱data.csvの順で読み込む。"""
+    uploaded_content = st.session_state.get(WATER_IT_UPLOAD_BYTES_KEY)
+    uploaded_name = st.session_state.get(WATER_IT_UPLOAD_NAME_KEY)
+    persisted = bool(st.session_state.get(WATER_IT_UPLOAD_PERSISTED_KEY))
+    if not uploaded_content:
+        temporary_store = get_water_it_temporary_store()
+        uploaded_content = temporary_store.get("content")
+        uploaded_name = temporary_store.get("name")
+        persisted = bool(temporary_store.get("persisted"))
+    if uploaded_content:
+        uploaded_name = str(uploaded_name or "選択したCSV")
+        label = "スマホから選択・Supabase保存済み" if persisted else "スマホから選択（一時）"
+        return parse_water_it_csv(uploaded_content), f"{label}：{uploaded_name}"
+
+    saved = load_saved_water_it_snapshot()
+    if saved:
+        return saved["dataframe"].copy(), f"Supabase保存：{saved['filename']}"
+
+    return load_water_it_data()
+
+
+def remember_uploaded_water_it_csv(uploaded_file):
+    """選択されたCSVを検証し、Supabaseへ自動保存する。"""
+    content = uploaded_file.getvalue()
+    if not content:
+        raise RuntimeError("選択したCSVが空です。")
+    dataframe = parse_water_it_csv(content)
+    digest = hashlib.sha256(content).hexdigest()
+    uploaded_name = uploaded_file.name or "data.csv"
+
+    persisted = False
+    st.session_state.pop("water_it_persist_warning_message", None)
+    try:
+        save_water_it_snapshot_to_supabase(content, uploaded_name, dataframe)
+        persisted = True
+    except Exception as exc:
+        st.session_state["water_it_persist_warning_message"] = str(exc)
+
+    st.session_state[WATER_IT_UPLOAD_BYTES_KEY] = content
+    st.session_state[WATER_IT_UPLOAD_NAME_KEY] = uploaded_name
+    st.session_state[WATER_IT_UPLOAD_HASH_KEY] = digest
+    st.session_state[WATER_IT_UPLOAD_PERSISTED_KEY] = persisted
+    temporary_store = get_water_it_temporary_store()
+    temporary_store.update(
+        {
+            "content": content,
+            "name": uploaded_name,
+            "hash": digest,
+            "persisted": persisted,
+        }
+    )
+    label = "スマホから選択・Supabase保存済み" if persisted else "スマホから選択（一時）"
+    return dataframe, f"{label}：{uploaded_name}"
+
+
+def clear_uploaded_water_it_csv():
+    for key in (
+        WATER_IT_UPLOAD_BYTES_KEY,
+        WATER_IT_UPLOAD_NAME_KEY,
+        WATER_IT_UPLOAD_HASH_KEY,
+        WATER_IT_UPLOAD_PERSISTED_KEY,
+        "water_it_upload_success_message",
+        "water_it_persist_warning_message",
+        "water_it_upload_error_message",
+    ):
+        st.session_state.pop(key, None)
+    temporary_store = get_water_it_temporary_store()
+    temporary_store.update({"content": None, "name": None, "hash": None, "persisted": False})
+
+
+def handle_water_it_mobile_upload(widget_key):
+    """スマホのファイル選択完了直後にCSVを検証して保持する。"""
+    st.session_state.pop("water_it_upload_success_message", None)
+    st.session_state.pop("water_it_upload_error_message", None)
+    uploaded_file = st.session_state.get(widget_key)
+    if uploaded_file is None:
+        return
+    try:
+        dataframe, source = remember_uploaded_water_it_csv(uploaded_file)
+        latest_time = dataframe["測定日時_解析"].max()
+        saved_text = (
+            " Supabaseへ保存しました。"
+            if st.session_state.get(WATER_IT_UPLOAD_PERSISTED_KEY)
+            else " 一時表示には反映しました。"
+        )
+        st.session_state["water_it_upload_success_message"] = (
+            f"{uploaded_file.name or '選択したファイル'} を受け取りました。"
+            f" 最新測定日時：{latest_time.strftime('%Y/%m/%d %H:%M')}。"
+            + saved_text
+        )
+    except Exception as exc:
+        st.session_state["water_it_upload_error_message"] = str(exc)
+
+
+def get_water_it_latest_rows(dataframe):
+    if dataframe.empty:
+        return dataframe.copy()
+    keys = ["エリア", "ポイント", "測定項目"]
+    return (
+        dataframe.sort_values("測定日時_解析", ascending=False)
+        .drop_duplicates(subset=keys, keep="first")
+        .reset_index(drop=True)
+    )
+
+
+def normalize_water_it_customer_key(value):
+    """WATER itのポイント名と顧客名を安全に照合するための最小正規化。
+
+    表記ゆれを広く吸収すると別顧客を誤って結び付ける可能性があるため、
+    Unicode正規化と空白除去だけを行う。
+    """
+    text = clean_value(value, blank_text="").strip()
+    text = unicodedata.normalize("NFKC", text)
+    text = re.sub(r"[\s\u3000]+", "", text)
+    return text.casefold()
+
+
+def water_it_display_name(value):
+    """WATER itの元データを変えず、画面上だけ名称を統一する。"""
+    text = clean_value(value, blank_text="").strip()
+    return WATER_IT_POINT_DISPLAY_NAMES.get(text, text)
+
+
+def canonical_water_it_customer_key(value):
+    """明示した別名だけを同一顧客として扱う。曖昧な部分一致は行わない。"""
+    display_name = water_it_display_name(value)
+    return normalize_water_it_customer_key(display_name)
+
+
+def get_water_it_customer_rows(dataframe, customer_name):
+    """顧客名と対応するWATER itポイントだけを返す（読み取り専用）。"""
+    if dataframe is None or dataframe.empty:
+        return dataframe.iloc[0:0].copy() if dataframe is not None else pd.DataFrame()
+    target = canonical_water_it_customer_key(customer_name)
+    if not target:
+        return dataframe.iloc[0:0].copy()
+    point_keys = dataframe["ポイント"].map(canonical_water_it_customer_key)
+    return dataframe[point_keys == target].copy()
+
+
+def render_customer_water_it_card(customer_name):
+    """顧客詳細にWATER itの最新値を読み取り専用で表示する。
+
+    ポイント名と顧客名が一致しない顧客には何も表示しない。
+    ExcelやWATER itへの書き込み処理は行わない。
+    """
+    try:
+        dataframe, source = get_active_water_it_data()
+    except Exception:
+        # WATER it側が一時的に読めなくても、既存の顧客詳細は通常どおり表示する。
+        return
+
+    customer_rows = get_water_it_customer_rows(dataframe, customer_name)
+    if customer_rows.empty:
+        return
+
+    latest_rows = get_water_it_latest_rows(customer_rows)
+    if latest_rows.empty:
+        return
+
+    newest = latest_rows["測定日時_解析"].max()
+    point_names = [
+        water_it_display_name(value)
+        for value in latest_rows["ポイント"].drop_duplicates().tolist()
+    ]
+    areas = [
+        clean_value(value, blank_text="")
+        for value in latest_rows["エリア"].drop_duplicates().tolist()
+        if clean_value(value, blank_text="")
+    ]
+
+    st.markdown("---")
+    with st.container(border=True):
+        st.subheader("💧 WATER it タンク情報")
+        st.caption(
+            "読み取り専用表示です。ここからExcelやWATER itへの書き込みは行いません。"
+        )
+        st.caption(
+            f"ポイント：{' / '.join(point_names)}"
+            + (f"　｜　エリア：{' / '.join(areas)}" if areas else "")
+            + f"　｜　最終受信：{newest.strftime('%Y/%m/%d %H:%M')}"
+        )
+
+        rows = list(latest_rows.iterrows())
+        for start in range(0, len(rows), 3):
+            group = rows[start:start + 3]
+            columns = st.columns(len(group))
+            for display_column, (_, row) in zip(columns, group):
+                with display_column:
+                    label = clean_value(row.get("測定項目"))
+                    value = format_water_it_value(row.get("測定値_数値"))
+                    unit = normalize_water_it_unit(row.get("単位_表示"))
+                    st.metric(label, f"{value} {unit}".strip())
+                    st.caption(row["測定日時_解析"].strftime("%m/%d %H:%M"))
+
+        alert_messages = []
+        for _, row in latest_rows.iterrows():
+            item_name = clean_value(row.get("測定項目"))
+            for alert in get_water_it_alerts(row):
+                alert_messages.append(f"{item_name}｜{alert}")
+        if alert_messages:
+            st.warning(" / ".join(alert_messages))
+        else:
+            st.caption(f"状態：異常表示なし　｜　参照：{source}")
+
+
+def format_water_it_value(value):
+    if value is None or pd.isna(value):
+        return "未設定"
+    try:
+        number = float(value)
+    except Exception:
+        return clean_value(value)
+    if not math.isfinite(number):
+        return "未設定"
+    if number.is_integer():
+        return f"{int(number):,}"
+    return f"{number:,.2f}".rstrip("0").rstrip(".")
+
+
+def get_water_it_alerts(row):
+    alerts = []
+    for column in WATER_IT_ALERT_COLUMNS:
+        if column not in row.index:
+            continue
+        value = row.get(column)
+        if water_it_nonblank(value):
+            alerts.append(f"{column}: {clean_value(value)}")
+    return alerts
+
+
+def show_water_it_latest_cards(latest_rows):
+    for point in latest_rows["ポイント"].drop_duplicates().tolist():
+        point_rows = latest_rows[latest_rows["ポイント"] == point].copy()
+        if point_rows.empty:
+            continue
+        first = point_rows.iloc[0]
+        area = clean_value(first.get("エリア"), blank_text="未設定")
+        newest = point_rows["測定日時_解析"].max()
+
+        with st.container(border=True):
+            st.subheader(f"💧 {water_it_display_name(point)}")
+            st.caption(f"エリア：{area}　｜　最新：{newest.strftime('%Y/%m/%d %H:%M')}")
+
+            rows = list(point_rows.iterrows())
+            for start in range(0, len(rows), 3):
+                group = rows[start:start + 3]
+                columns = st.columns(len(group))
+                for display_column, (_, row) in zip(columns, group):
+                    with display_column:
+                        label = clean_value(row.get("測定項目"))
+                        value = format_water_it_value(row.get("測定値_数値"))
+                        unit = normalize_water_it_unit(row.get("単位_表示"))
+                        st.metric(label, f"{value} {unit}".strip())
+                        st.caption(row["測定日時_解析"].strftime("%m/%d %H:%M"))
+
+            alert_messages = []
+            for _, row in point_rows.iterrows():
+                item_name = clean_value(row.get("測定項目"))
+                for alert in get_water_it_alerts(row):
+                    alert_messages.append(f"{item_name}｜{alert}")
+            if alert_messages:
+                st.warning(" / ".join(alert_messages))
+            else:
+                st.caption("状態：異常表示なし")
+
+
+def show_water_it_history(dataframe):
+    st.markdown("### 測定履歴")
+    points = dataframe["ポイント"].drop_duplicates().tolist()
+    selected_point = st.selectbox(
+        "ポイント",
+        points,
+        key="water_it_history_point",
+        format_func=water_it_display_name,
+    )
+    point_rows = dataframe[dataframe["ポイント"] == selected_point].copy()
+    items = point_rows["測定項目"].drop_duplicates().tolist()
+    item_key_suffix = hashlib.sha1(selected_point.encode("utf-8")).hexdigest()[:12]
+    selected_item = st.selectbox(
+        "測定項目",
+        items,
+        key=f"water_it_history_item_{item_key_suffix}",
+    )
+    history = point_rows[point_rows["測定項目"] == selected_item].copy()
+    history.sort_values("測定日時_解析", inplace=True)
+
+    period = st.radio(
+        "表示期間",
+        ["24時間", "3日間", "7日間", "すべて"],
+        horizontal=True,
+        key="water_it_history_period",
+    )
+    if not history.empty and period != "すべて":
+        hours = {"24時間": 24, "3日間": 72, "7日間": 168}[period]
+        cutoff = history["測定日時_解析"].max() - timedelta(hours=hours)
+        history = history[history["測定日時_解析"] >= cutoff].copy()
+
+    chart_data = history.dropna(subset=["測定値_数値"]).set_index("測定日時_解析")[["測定値_数値"]]
+    if chart_data.empty:
+        st.info("グラフに表示できる数値データがありません。")
+    else:
+        chart_data = chart_data.rename(columns={"測定値_数値": selected_item})
+        st.line_chart(chart_data, use_container_width=True)
+
+    with st.expander("直近の測定値を表示"):
+        display = history.sort_values("測定日時_解析", ascending=False).head(100).copy()
+        display["測定日時"] = display["測定日時_解析"].dt.strftime("%Y/%m/%d %H:%M")
+        display["測定値"] = display["測定値_数値"].apply(format_water_it_value)
+        display["単位"] = display["単位_表示"]
+        display["ポイント"] = display["ポイント"].map(water_it_display_name)
+        st.dataframe(
+            display[["測定日時", "エリア", "ポイント", "測定項目", "測定値", "単位"]],
+            use_container_width=True,
+            hide_index=True,
+        )
+
+
+def show_water_it_test_page():
+    st.markdown("---")
+    st.header("💧 WATER it CSV取込・保存")
+    show_back_home_button("water_it_back_home")
+    st.markdown(
+        render_page_link("🧪 ソリュブル在庫", page="soluble_inventory"),
+        unsafe_allow_html=True,
+    )
+    st.caption(
+        "スマホでWATER itからCSVを手動ダウンロードし、そのCSVを選ぶだけで画面へ反映し、既存のSupabaseへ自動保存します。Excel・WATER it・Dropboxへの書き込みは行いません。"
+    )
+
+    st.link_button(
+        "🌐 WATER itを開く",
+        WATER_IT_LOGIN_URL,
+        use_container_width=True,
+    )
+
+    with st.container(border=True):
+        st.markdown("#### スマホでの手順")
+        st.write("1. 上のボタンからWATER itを開いてログインします。")
+        st.write("2. リスト画面の『ダウンロード』を押します。")
+        st.write("3. このカルテへ戻り、下の『CSVを選ぶ』を押します。")
+        st.write("4. ファイル画面で『最近使用したファイル』または『ダウンロード』を開き、一番新しいCSVを選びます。")
+
+    uploader_version = int(st.session_state.get("water_it_uploader_version", 0))
+    uploader_key = f"water_it_mobile_csv_uploader_{uploader_version}"
+
+    temporary_store_before_upload = get_water_it_temporary_store()
+    has_selected_water_it_csv = bool(
+        st.session_state.get(WATER_IT_UPLOAD_BYTES_KEY)
+        or temporary_store_before_upload.get("content")
+    )
+    if not has_selected_water_it_csv:
+        if st.button(
+            "CSV選択をリセット",
+            key=f"water_it_reset_uploader_{uploader_version}",
+            use_container_width=True,
+        ):
+            clear_uploaded_water_it_csv()
+            st.session_state["water_it_uploader_version"] = uploader_version + 1
+            st.rerun()
+
+    uploaded_file = st.file_uploader(
+        "ダウンロードしたファイルを選ぶ",
+        type=None,
+        accept_multiple_files=False,
+        key=uploader_key,
+        on_change=handle_water_it_mobile_upload,
+        args=(uploader_key,),
+        help=(
+            "Androidでは『最近使用したファイル』または『ダウンロード』から選びます。"
+            "端末によっては、ファイルをタップしたあとに『開く』『選択』『完了』または右上のチェックを押します。"
+        ),
+    )
+    st.caption(
+        "CSVだけに絞るとAndroidで選択が戻らない場合があるため、この版ではファイル種類を絞っていません。"
+        "選択後に中身を確認し、WATER it形式のCSVだけを反映します。"
+    )
+
+    success_message = st.session_state.pop("water_it_upload_success_message", None)
+    error_message = st.session_state.pop("water_it_upload_error_message", None)
+    persist_warning = st.session_state.pop("water_it_persist_warning_message", None)
+    if success_message:
+        st.success(success_message)
+    if persist_warning:
+        st.warning("CSVは画面へ反映しましたが、Supabaseへの保存は完了していません。")
+        st.write(persist_warning)
+    if error_message:
+        st.error("選択したファイルを読み込めませんでした。")
+        st.write(error_message)
+        st.info("WATER itのリスト画面からダウンロードしたCSVを選んでください。")
+
+    dataframe = None
+    source = ""
+
+    if uploaded_file is not None:
+        try:
+            uploaded_hash = hashlib.sha256(uploaded_file.getvalue()).hexdigest()
+            if uploaded_hash != st.session_state.get(WATER_IT_UPLOAD_HASH_KEY):
+                with st.spinner("選択したファイルを確認しています…"):
+                    dataframe, source = remember_uploaded_water_it_csv(uploaded_file)
+            else:
+                dataframe, source = get_active_water_it_data()
+            st.caption(
+                f"選択済み：{uploaded_file.name or '名前なし'}　"
+                f"{len(uploaded_file.getvalue()):,} bytes"
+            )
+        except Exception as exc:
+            st.error("選択したファイルを読み込めませんでした。")
+            st.write(str(exc))
+            st.info("WATER itのリスト画面からダウンロードしたCSVを選んでください。")
+            return
+    else:
+        try:
+            dataframe, source = get_active_water_it_data()
+        except Exception as exc:
+            st.info("まだCSVが選択されていません。まずWATER itからCSVをダウンロードし、上の欄から選んでください。")
+            st.caption(str(exc))
+            return
+
+    temporary_store = get_water_it_temporary_store()
+    if st.session_state.get(WATER_IT_UPLOAD_BYTES_KEY) or temporary_store.get("content"):
+        button_col, note_col = st.columns([1, 2])
+        with button_col:
+            if st.button("選択中のCSVを解除", key="water_it_clear_upload"):
+                clear_uploaded_water_it_csv()
+                st.session_state["water_it_uploader_version"] = uploader_version + 1
+                st.rerun()
+        with note_col:
+            st.caption("選択したCSVはSupabaseへ保存されます。ここで選択状態を解除しても、最後に保存したデータは残り、顧客詳細から引き続き確認できます。")
+
+    if dataframe is None or dataframe.empty:
+        st.warning("CSVに表示できる測定データがありません。")
+        return
+
+    latest_rows = get_water_it_latest_rows(dataframe)
+    latest_time = dataframe["測定日時_解析"].max()
+    oldest_time = dataframe["測定日時_解析"].min()
+
+    st.success(f"読込OK　｜　参照：{source}")
+    metric1, metric2, metric3 = st.columns(3)
+    with metric1:
+        st.metric("最新測定日時", latest_time.strftime("%Y/%m/%d %H:%M"))
+    with metric2:
+        st.metric("ポイント数", f"{dataframe['ポイント'].nunique()}件")
+    with metric3:
+        st.metric("読込行数", f"{len(dataframe):,}行")
+    st.caption(
+        f"データ期間：{oldest_time.strftime('%Y/%m/%d %H:%M')} ～ {latest_time.strftime('%Y/%m/%d %H:%M')}"
+    )
+
+    show_water_it_latest_cards(latest_rows)
+    show_water_it_history(dataframe)
 
 
 # =========================
@@ -8258,23 +9774,40 @@ def show_trade_notes_page():
                 partner_names[(partner_type, trade_partner_text(row.get("取引先ID")))] = trade_partner_text(row.get("会社名"))
     except Exception:
         partner_names = {}
-    tabs = st.tabs(["顧客", "仕入先", "運送会社"])
-    categories = ["customer", "supplier", "carrier"]
-    for tab, category in zip(tabs, categories):
-        with tab:
-            filtered = []
-            for note in notes:
-                parsed = parse_trade_partner_note_key(note.get("customer_name"))
-                if category == "customer" and parsed is None:
-                    filtered.append(note)
-                elif parsed and parsed["partner_type"] == category:
-                    filtered.append(note)
-            if not filtered:
-                st.info("メモはまだありません。")
-                continue
-            for note in filtered:
-                render_trade_note_card(note, category, partner_names=partner_names)
-                render_note_delete_controls(note)
+
+    # st.tabs は削除確認などで再実行されるたびに先頭の「顧客」へ戻るため、
+    # 選択値を session_state に保持できる横並びラジオで区分を切り替える。
+    # これにより、仕入先や運送会社のメモを続けて削除しても同じ区分を維持する。
+    category_labels = ["顧客", "仕入先", "運送会社"]
+    category_by_label = {
+        "顧客": "customer",
+        "仕入先": "supplier",
+        "運送会社": "carrier",
+    }
+    selected_label = st.radio(
+        "表示する区分",
+        category_labels,
+        horizontal=True,
+        key="trade_notes_selected_category",
+        label_visibility="collapsed",
+    )
+    category = category_by_label[selected_label]
+
+    filtered = []
+    for note in notes:
+        parsed = parse_trade_partner_note_key(note.get("customer_name"))
+        if category == "customer" and parsed is None:
+            filtered.append(note)
+        elif parsed and parsed["partner_type"] == category:
+            filtered.append(note)
+
+    if not filtered:
+        st.info("メモはまだありません。")
+        return
+
+    for note in filtered:
+        render_trade_note_card(note, category, partner_names=partner_names)
+        render_note_delete_controls(note)
 
 
 def show_top_home():
@@ -8322,6 +9855,10 @@ def show_home_menu():
     with col8:
         st.markdown(render_page_link("📝 メモ帳", page="notes"), unsafe_allow_html=True)
 
+    col9, _ = st.columns(2)
+    with col9:
+        st.markdown(render_page_link("💧 WATER it接続", page="water_it_test"), unsafe_allow_html=True)
+
     st.markdown("---")
 
 # =========================
@@ -8343,7 +9880,7 @@ handle_customer_query_param()
 current_page = st.session_state.get("page", "home")
 customer_pages = {
     "customer_home", "customer_list", "customer", "region", "product", "calendar",
-    "dispatch_table", "soluble_inventory", "notes", "detail",
+    "dispatch_table", "soluble_inventory", "water_it_test", "notes", "detail",
 }
 supplier_pages = {
     "supplier_home", "supplier_list", "supplier_search", "supplier_product",
@@ -8373,6 +9910,7 @@ with st.sidebar:
         st.markdown(render_page_link("🗓 配車カレンダー", page="calendar"), unsafe_allow_html=True)
         st.markdown(render_page_link("🚚 配車表", page="dispatch_table"), unsafe_allow_html=True)
         st.markdown(render_page_link("🧪 ソリュブル在庫", page="soluble_inventory"), unsafe_allow_html=True)
+        st.markdown(render_page_link("💧 WATER it接続", page="water_it_test"), unsafe_allow_html=True)
         st.markdown(render_page_link("📝 顧客メモ", page="notes"), unsafe_allow_html=True)
     elif current_page in supplier_pages or (
         current_page == "partner_detail" and st.session_state.get("selected_partner_type") == "supplier"
@@ -8459,6 +9997,9 @@ try:
 
     elif st.session_state["page"] == "soluble_inventory":
         show_soluble_inventory_page()
+
+    elif st.session_state["page"] == "water_it_test":
+        show_water_it_test_page()
 
     elif st.session_state["page"] == "notes":
         show_notes_page(None)
