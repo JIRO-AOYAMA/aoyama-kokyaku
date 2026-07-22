@@ -6584,6 +6584,52 @@ def get_soluble_water_it_history(dataframe, location):
     return tank_rows
 
 
+def get_soluble_water_it_daily_actuals(history):
+    """WATER it履歴から、各日の9:00実測値を日付ごとに返す。
+
+    CSVを数日取り込まなかった場合でも、次回CSVに含まれる過去日の9:00値を
+    アプリ表示へまとめて反映する。Excel本体は変更しない。
+    """
+    if history is None or history.empty:
+        return {}
+
+    daily = history.dropna(subset=["測定日時_解析", "測定値_数値"]).copy()
+    if daily.empty:
+        return {}
+
+    measured_at = pd.to_datetime(daily["測定日時_解析"], errors="coerce")
+    daily = daily[
+        measured_at.notna()
+        & measured_at.dt.hour.eq(9)
+        & measured_at.dt.minute.eq(0)
+    ].copy()
+    if daily.empty:
+        return {}
+
+    daily["_water_it_measured_at"] = pd.to_datetime(
+        daily["測定日時_解析"],
+        errors="coerce",
+    )
+    daily["_water_it_date"] = daily["_water_it_measured_at"].dt.date
+    daily.sort_values("_water_it_measured_at", inplace=True)
+
+    # 同じ日の9:00行が重複していても、CSV内で最後の1件だけを採用する。
+    daily = daily.groupby("_water_it_date", sort=True, as_index=False).tail(1)
+    result = {}
+    for _, row in daily.iterrows():
+        value = float(row["測定値_数値"])
+        if not math.isfinite(value):
+            continue
+        if value.is_integer():
+            value = int(value)
+        result[row["_water_it_date"]] = {
+            "value": value,
+            "measured_at": row["_water_it_measured_at"],
+            "source": "09:00",
+        }
+    return result
+
+
 def estimate_soluble_water_it_daily_usage(history, days):
     """WATER it履歴から1日平均使用量を参考値として推定する。
 
@@ -6706,6 +6752,16 @@ def get_soluble_water_it_context(location, rows):
         days: estimate_soluble_water_it_daily_usage(history, days)
         for days in SOLUBLE_WATER_IT_USAGE_WINDOWS
     }
+
+    # 過去日は各日9:00の実測値を使う。最新測定日は、従来どおり最新値を優先し、
+    # 今日のCSVが9:00より後に取得された場合も現在値を失わないようにする。
+    daily_actuals = get_soluble_water_it_daily_actuals(history)
+    daily_actuals[measured_date] = {
+        "value": actual_value,
+        "measured_at": measured_at,
+        "source": "latest",
+    }
+
     return {
         "source": source,
         "history": history,
@@ -6718,20 +6774,26 @@ def get_soluble_water_it_context(location, rows):
         "excel_usage": excel_usage,
         "difference": difference,
         "usage_averages": usage_averages,
+        "daily_actuals": daily_actuals,
     }
 
 
 def apply_soluble_water_it_forecast(rows, location, context):
-    """実測日以降のアプリ表示だけを、実測値起点で再計算する。
+    """WATER it実測を日付ごとに反映し、その間だけアプリ予測を行う。
 
-    Excel本体・元のrows・使用量/日・納品は変更しない。将来日に黄色の在庫が
-    ある場合は、既存ルールどおり人が決めた新しい基準値として尊重する。
+    CSVに各日の9:00実測値が含まれる場合は、過去日も含めてその日の在庫表示を
+    実測値へ置き換える。実測値がない日は、直前の実測または黄色い手入力基準から
+    Excelの使用量・納品を使って計算する。Excel本体・元のrows・使用量/日・納品は
+    変更しない。
     """
     display_rows = [dict(row) for row in rows]
-    if not context or context.get("excel_row") is None:
+    if not context:
         return display_rows
 
-    measured_date = context["measured_date"]
+    daily_actuals = context.get("daily_actuals") or {}
+    if not daily_actuals:
+        return display_rows
+
     previous_inventory = None
     started = False
     for row in sorted(display_rows, key=lambda item: item["date"]):
@@ -6739,24 +6801,26 @@ def apply_soluble_water_it_forecast(rows, location, context):
         display_key = f"{location}_inventory_display"
         source_key = f"{location}_inventory_display_source"
 
-        if row_date < measured_date:
-            row[display_key] = row.get(f"{location}_inventory")
-            row[source_key] = "excel"
-            continue
-
-        if row_date == measured_date:
-            previous_inventory = context["actual_value"]
-            row[display_key] = previous_inventory
-            row[source_key] = "water_it_actual"
-            started = True
-            continue
+        # CSV内にその日の9:00実測（最新日は最新測定値）があれば、
+        # Excelの計算値より優先して緑の実測値として表示する。
+        actual = daily_actuals.get(row_date)
+        if actual is not None:
+            actual_value = actual.get("value")
+            if isinstance(actual_value, (int, float)) and math.isfinite(float(actual_value)):
+                previous_inventory = actual_value
+                row[display_key] = actual_value
+                row[source_key] = "water_it_actual"
+                row[f"{location}_inventory_measured_at"] = actual.get("measured_at")
+                started = True
+                continue
 
         if not started:
             row[display_key] = row.get(f"{location}_inventory")
             row[source_key] = "excel"
             continue
 
-        # 将来の黄色い在庫は、人が指定した次の基準値としてそのまま使う。
+        # 実測値がない日の黄色い在庫は、人が指定した次の基準値として尊重する。
+        # 後日の9:00実測が現れた時点で、その実測値へ再び補正される。
         if row.get(f"{location}_inventory_manual"):
             manual_value = row.get(f"{location}_inventory")
             if isinstance(manual_value, (int, float)):
