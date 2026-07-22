@@ -6969,10 +6969,30 @@ def clear_uploaded_water_it_csv():
         WATER_IT_UPLOAD_BYTES_KEY,
         WATER_IT_UPLOAD_NAME_KEY,
         WATER_IT_UPLOAD_HASH_KEY,
+        "water_it_upload_success_message",
+        "water_it_upload_error_message",
     ):
         st.session_state.pop(key, None)
     temporary_store = get_water_it_temporary_store()
     temporary_store.update({"content": None, "name": None, "hash": None})
+
+
+def handle_water_it_mobile_upload(widget_key):
+    """スマホのファイル選択完了直後にCSVを検証して保持する。"""
+    st.session_state.pop("water_it_upload_success_message", None)
+    st.session_state.pop("water_it_upload_error_message", None)
+    uploaded_file = st.session_state.get(widget_key)
+    if uploaded_file is None:
+        return
+    try:
+        dataframe, source = remember_uploaded_water_it_csv(uploaded_file)
+        latest_time = dataframe["測定日時_解析"].max()
+        st.session_state["water_it_upload_success_message"] = (
+            f"{uploaded_file.name or '選択したファイル'} を受け取りました。"
+            f" 最新測定日時：{latest_time.strftime('%Y/%m/%d %H:%M')}"
+        )
+    except Exception as exc:
+        st.session_state["water_it_upload_error_message"] = str(exc)
 
 
 def get_water_it_latest_rows(dataframe):
@@ -7201,7 +7221,7 @@ def show_water_it_history(dataframe):
 
 def show_water_it_test_page():
     st.markdown("---")
-    st.header("💧 WATER it CSV取込テスト")
+    st.header("💧 WATER it CSV取込テスト（スマホ修正版）")
     show_back_home_button("water_it_back_home")
     st.caption(
         "スマホでWATER itからCSVを手動ダウンロードし、そのCSVを選ぶだけで読み取り専用表示へ反映します。Excel・WATER it・Dropboxへの書き込みは行いません。"
@@ -7221,13 +7241,32 @@ def show_water_it_test_page():
         st.write("4. ファイル画面で『最近使用したファイル』または『ダウンロード』を開き、一番新しいCSVを選びます。")
 
     uploader_version = int(st.session_state.get("water_it_uploader_version", 0))
+    uploader_key = f"water_it_mobile_csv_uploader_{uploader_version}"
     uploaded_file = st.file_uploader(
-        "ダウンロードしたCSVを選ぶ",
-        type=["csv"],
+        "ダウンロードしたファイルを選ぶ",
+        type=None,
         accept_multiple_files=False,
-        key=f"water_it_mobile_csv_uploader_{uploader_version}",
-        help="Androidでは『最近使用したファイル』または『ダウンロード』に表示されることが多いです。",
+        key=uploader_key,
+        on_change=handle_water_it_mobile_upload,
+        args=(uploader_key,),
+        help=(
+            "Androidでは『最近使用したファイル』または『ダウンロード』から選びます。"
+            "端末によっては、ファイルをタップしたあとに『開く』『選択』『完了』または右上のチェックを押します。"
+        ),
     )
+    st.caption(
+        "CSVだけに絞るとAndroidで選択が戻らない場合があるため、この版ではファイル種類を絞っていません。"
+        "選択後に中身を確認し、WATER it形式のCSVだけを反映します。"
+    )
+
+    success_message = st.session_state.pop("water_it_upload_success_message", None)
+    error_message = st.session_state.pop("water_it_upload_error_message", None)
+    if success_message:
+        st.success(success_message)
+    if error_message:
+        st.error("選択したファイルを読み込めませんでした。")
+        st.write(error_message)
+        st.info("WATER itのリスト画面からダウンロードしたCSVを選んでください。")
 
     dataframe = None
     source = ""
@@ -7236,13 +7275,16 @@ def show_water_it_test_page():
         try:
             uploaded_hash = hashlib.sha256(uploaded_file.getvalue()).hexdigest()
             if uploaded_hash != st.session_state.get(WATER_IT_UPLOAD_HASH_KEY):
-                with st.spinner("選択したCSVを確認しています…"):
+                with st.spinner("選択したファイルを確認しています…"):
                     dataframe, source = remember_uploaded_water_it_csv(uploaded_file)
-                st.success("CSVを読み込みました。画面と顧客詳細へ反映しました。")
             else:
                 dataframe, source = get_active_water_it_data()
+            st.caption(
+                f"選択済み：{uploaded_file.name or '名前なし'}　"
+                f"{len(uploaded_file.getvalue()):,} bytes"
+            )
         except Exception as exc:
-            st.error("選択したCSVを読み込めませんでした。")
+            st.error("選択したファイルを読み込めませんでした。")
             st.write(str(exc))
             st.info("WATER itのリスト画面からダウンロードしたCSVを選んでください。")
             return
