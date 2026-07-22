@@ -5328,6 +5328,8 @@ def render_dispatch_responsive_list(display_df, customer_names=None):
         .dispatch-excel-table tr:nth-child(even) td { background: #f8fafc; }
         .dispatch-excel-table .date-cell,
         .dispatch-excel-table .quantity-cell { text-align: center; white-space: nowrap; }
+        .dispatch-excel-table .dispatch-teshikaga-text,
+        .dispatch-excel-table .dispatch-teshikaga-text a { color: #dc2626 !important; }
         .dispatch-mobile-view { display: none; }
 
         @media (max-width: 768px) {
@@ -5388,6 +5390,7 @@ def render_dispatch_responsive_list(display_df, customer_names=None):
                 border-radius: 7px;
                 background: #fafcff;
             }
+            .dispatch-route-box.dispatch-teshikaga-destination { background: #fee2e2; }
             .dispatch-route-label,
             .dispatch-detail-label { display: block; color: #64748b; font-size: 10px; font-weight: 700; }
             .dispatch-route-value { display: block; margin-top: 2px; font-size: 13px; font-weight: 800; overflow-wrap: anywhere; }
@@ -5420,14 +5423,21 @@ def render_dispatch_responsive_list(display_df, customer_names=None):
         text = normalize_dispatch_text(value) or "未入力"
         return html.escape(text)
 
-    def destination_value(value):
+    def is_teshikaga_destination(value):
+        return normalize_dispatch_text(value) == "弟子屈"
+
+    def destination_value(value, highlight_text=False):
         destination = normalize_dispatch_text(value) or "未入力"
         if destination in customer_names:
-            return build_customer_detail_link(
+            rendered = build_customer_detail_link(
                 destination,
                 class_name="dispatch-month-link",
             )
-        return html.escape(destination)
+        else:
+            rendered = html.escape(destination)
+        if highlight_text and destination == "弟子屈":
+            return f'<span class="dispatch-teshikaga-text">{rendered}</span>'
+        return rendered
 
     columns = ["引取日", "引取先", "商品名", "数量", "運送会社", "納品先", "着日"]
     desktop_parts = [
@@ -5441,7 +5451,7 @@ def render_dispatch_responsive_list(display_df, customer_names=None):
         for column in columns:
             css_class = "date-cell" if column in ["引取日", "着日"] else "quantity-cell" if column == "数量" else ""
             cell_value = (
-                destination_value(row.get(column))
+                destination_value(row.get(column), highlight_text=True)
                 if column == "納品先"
                 else safe_value(row.get(column))
             )
@@ -5468,7 +5478,7 @@ def render_dispatch_responsive_list(display_df, customer_names=None):
                     '<div class="dispatch-route">',
                     f'<div class="dispatch-route-box"><span class="dispatch-route-label">引取先</span><span class="dispatch-route-value">{safe_value(row.get("引取先"))}</span></div>',
                     '<div class="dispatch-route-arrow">→</div>',
-                    f'<div class="dispatch-route-box"><span class="dispatch-route-label">納品先</span><span class="dispatch-route-value">{destination_value(row.get("納品先"))}</span></div>',
+                    f'<div class="dispatch-route-box{" dispatch-teshikaga-destination" if is_teshikaga_destination(row.get("納品先")) else ""}"><span class="dispatch-route-label">納品先</span><span class="dispatch-route-value">{destination_value(row.get("納品先"))}</span></div>',
                     '</div>',
                     '<div class="dispatch-details">',
                     f'<div class="dispatch-detail-box"><span class="dispatch-detail-label">商品名</span><span class="dispatch-detail-value">{safe_value(row.get("商品名"))}</span></div>',
