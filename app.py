@@ -4144,41 +4144,39 @@ def show_customer_search(df=None, show_home_link=False):
 # =========================
 # 商品検索
 # =========================
-def get_active_product_search_rows(df):
-    """使用数量/日が0・空白ではなく、商品名と顧客名がある行だけを返す。"""
+def get_product_search_rows(df):
+    """商品名・顧客名がある全行を、現在・過去を問わず商品検索用に返す。"""
     required_columns = {
         "顧客名",
         "地域",
         "商品名",
         "使用数量/日",
-        "次回配達予定",
-        "メーカー",
     }
     if not required_columns.issubset(df.columns):
         return pd.DataFrame(columns=list(required_columns))
 
-    active = df[~df["使用数量/日"].apply(is_blank_or_zero)].copy()
-    active["_商品名検索"] = active["商品名"].apply(
+    rows = df.copy()
+    rows["_商品名検索"] = rows["商品名"].apply(
         lambda value: clean_value(value, blank_text="").strip()
     )
-    active["_顧客名検索"] = active["顧客名"].apply(
+    rows["_顧客名検索"] = rows["顧客名"].apply(
         lambda value: clean_value(value, blank_text="").strip()
     )
-    active = active[
-        (active["_商品名検索"] != "")
-        & (active["_顧客名検索"] != "")
+    rows = rows[
+        (rows["_商品名検索"] != "")
+        & (rows["_顧客名検索"] != "")
     ].copy()
-    return active
+    return rows
 
 
-def get_product_search_candidates(active_rows, keyword):
-    """入力文字を含む、現在使用中の商品名を候補タブ用に返す。"""
+def get_product_search_candidates(product_rows, keyword):
+    """入力文字を含む、現在または過去に登録された商品名を候補タブ用に返す。"""
     keyword = str(keyword or "").strip()
-    if active_rows.empty or not keyword:
+    if product_rows.empty or not keyword:
         return []
 
-    matches = active_rows[
-        active_rows["_商品名検索"].str.contains(
+    matches = product_rows[
+        product_rows["_商品名検索"].str.contains(
             keyword,
             case=False,
             na=False,
@@ -4199,41 +4197,20 @@ def get_product_search_candidates(active_rows, keyword):
     )
 
 
-def build_exact_product_search_results(active_rows, product_name):
-    """商品名の完全一致結果を顧客単位にまとめ、次回配達予定の早い順にする。"""
-    exact = active_rows[active_rows["_商品名検索"] == product_name].copy()
+def build_exact_product_search_results(product_rows, product_name):
+    """商品名の完全一致結果を顧客単位にまとめ、現在使用中と過去使用に分ける。"""
+    exact = product_rows[product_rows["_商品名検索"] == product_name].copy()
     if exact.empty:
-        return []
+        return [], []
 
-    results = []
+    current_results = []
+    past_results = []
+
     for customer_name, group in exact.groupby("_顧客名検索", sort=False):
         group = group.copy()
-        parsed_dates = pd.to_datetime(group["次回配達予定"], errors="coerce")
-        valid_dates = parsed_dates.dropna()
-        earliest_timestamp = valid_dates.min() if not valid_dates.empty else pd.NaT
-        latest_timestamp = valid_dates.max() if not valid_dates.empty else pd.NaT
-
-        # 既存の商品カードと同じく、同じ顧客・商品に使用中行が複数あれば
-        # 1件にまとめて警告し、値を断定しない。
-        duplicate_count = len(group)
-        source_row = group.iloc[0]
-        if duplicate_count == 1:
-            next_delivery_text = format_date(source_row["次回配達予定"])
-            usage_text = format_number(source_row["使用数量/日"])
-            maker_text = clean_value(
-                source_row.get("メーカー"),
-                blank_text="未設定",
-            ).strip() or "未設定"
-        else:
-            next_delivery_text = (
-                format_date(earliest_timestamp)
-                if not pd.isna(earliest_timestamp)
-                else "未設定"
-            )
-            if next_delivery_text != "未設定":
-                next_delivery_text += "（複数行）"
-            usage_text = "複数行（確認が必要）"
-            maker_text = "複数行（確認が必要）"
+        active_group = group[
+            ~group["使用数量/日"].apply(is_blank_or_zero)
+        ].copy()
 
         region_values = [
             clean_value(value, blank_text="").strip()
@@ -4241,106 +4218,91 @@ def build_exact_product_search_results(active_rows, product_name):
         ]
         region = next((value for value in region_values if value), "未設定")
 
-        results.append(
-            {
-                "顧客名": customer_name,
-                "地域": region,
-                "次回配達予定": next_delivery_text,
-                "使用数量/日": usage_text,
-                "メーカー": maker_text,
-                "重複件数": duplicate_count,
-                "並び順日付": earliest_timestamp,
-                # 重複行では、すべての日付が古い場合だけ非表示にする。
-                # 1行でも期間内または未来の日付があれば、確認できるよう残す。
-                "古い予定判定日付": latest_timestamp,
-            }
-        )
-
-    return sorted(
-        results,
-        key=lambda item: (
-            pd.isna(item["並び順日付"]),
-            item["並び順日付"] if not pd.isna(item["並び順日付"]) else pd.Timestamp.max,
-            item["顧客名"],
-        ),
-    )
-
-
-def filter_old_product_search_results(results, age_limit_days, search_date=None):
-    """検索日より指定日数を超えて古い予定だけを非表示にする。日付未設定は残す。"""
-    if search_date is None:
-        search_date = get_jst_now().date()
-    cutoff = pd.Timestamp(search_date) - pd.Timedelta(days=int(age_limit_days))
-
-    visible = []
-    hidden_count = 0
-    for item in results:
-        comparison_date = item.get("古い予定判定日付", item.get("並び順日付"))
-        if not pd.isna(comparison_date) and pd.Timestamp(comparison_date) < cutoff:
-            hidden_count += 1
-            continue
-        visible.append(item)
-    return visible, hidden_count
-
-
-def render_product_search_results(active_rows, product_name, keyword, age_limit_days):
-    """選択した商品名の完全一致結果を表示する。"""
-    all_results = build_exact_product_search_results(active_rows, product_name)
-    results, hidden_count = filter_old_product_search_results(
-        all_results,
-        age_limit_days,
-    )
-    st.write(f"該当顧客：{len(results)}件")
-    if hidden_count:
-        st.caption(
-            f"検索日から{age_limit_days}日より前の古い予定{hidden_count}件を"
-            "非表示にしています。"
-        )
-
-    if not all_results:
-        st.info("この商品を現在使用している顧客は見つかりませんでした。")
-        return
-    if not results:
-        st.info("指定した期間内の予定、または日付未設定の顧客はありません。")
-        return
-
-    for index, item in enumerate(results):
-        customer_name = item["顧客名"]
-        with st.container(border=True):
-            # 顧客名そのものを押すと、既存の顧客詳細画面へ移動する。
-            st.markdown(
-                render_page_link(
-                    f"👤 {customer_name}",
-                    page="detail",
-                    customer=customer_name,
-                    product_search=keyword,
-                ),
-                unsafe_allow_html=True,
+        if not active_group.empty:
+            duplicate_count = len(active_group)
+            usage_text = (
+                format_number(active_group.iloc[0]["使用数量/日"])
+                if duplicate_count == 1
+                else "複数行（確認が必要）"
+            )
+            current_results.append(
+                {
+                    "顧客名": customer_name,
+                    "地域": region,
+                    "使用数量/日": usage_text,
+                    "重複件数": duplicate_count,
+                }
+            )
+        else:
+            past_results.append(
+                {
+                    "顧客名": customer_name,
+                    "地域": region,
+                }
             )
 
-            st.caption("次回配達予定")
-            st.markdown(
-                '<div style="font-size:2.25rem;font-weight:800;line-height:1.15;'
-                'margin:0.05rem 0 0.8rem 0;">'
-                f"{html.escape(item['次回配達予定'])}</div>",
-                unsafe_allow_html=True,
-            )
+    current_results.sort(key=lambda item: item["顧客名"])
+    past_results.sort(key=lambda item: item["顧客名"])
+    return current_results, past_results
 
-            col_left, col_right = st.columns(2)
-            with col_left:
-                st.caption("地域")
-                st.markdown(f"**{html.escape(item['地域'])}**")
-                st.caption("使用数量/日")
-                st.markdown(f"**{html.escape(item['使用数量/日'])}**")
-            with col_right:
-                st.caption("メーカー")
-                st.markdown(f"**{html.escape(item['メーカー'])}**")
 
+def render_product_search_customer(item, keyword, current):
+    """商品検索の顧客カードを、現在使用中・過去使用の共通形式で表示する。"""
+    customer_name = item["顧客名"]
+    with st.container(border=True):
+        st.markdown(
+            render_page_link(
+                f"👤 {customer_name}",
+                page="detail",
+                customer=customer_name,
+                product_search=keyword,
+            ),
+            unsafe_allow_html=True,
+        )
+
+        st.caption("地域")
+        st.markdown(f"**{html.escape(item['地域'])}**")
+
+        if current:
+            st.caption("使用数量/日")
+            st.markdown(f"**{html.escape(item['使用数量/日'])}**")
             if item["重複件数"] > 1:
                 st.warning(
                     "同じ顧客名・商品名の使用中行が複数見つかりました。"
                     "顧客詳細で確認してください。"
                 )
+        else:
+            st.caption("この商品を過去に使用")
+
+
+def render_product_search_results(product_rows, product_name, keyword):
+    """選択した商品の顧客を、現在使用中と過去使用に分けて表示する。"""
+    current_results, past_results = build_exact_product_search_results(
+        product_rows,
+        product_name,
+    )
+
+    st.markdown(
+        f"**現在使用中 {len(current_results)}件 ／ "
+        f"過去に使用 {len(past_results)}件**"
+    )
+
+    st.markdown(f"### 🟢 現在使用中　{len(current_results)}件")
+    if not current_results:
+        st.info("この商品を現在使用している顧客はいません。")
+    else:
+        for item in current_results:
+            render_product_search_customer(item, keyword, current=True)
+
+    with st.expander(
+        f"⚪ 過去に使用　{len(past_results)}件",
+        expanded=False,
+    ):
+        if not past_results:
+            st.info("この商品を過去に使用した顧客はいません。")
+        else:
+            for item in past_results:
+                render_product_search_customer(item, keyword, current=False)
 
 
 def show_product_search(df=None):
@@ -4348,7 +4310,7 @@ def show_product_search(df=None):
     show_back_home_button("product_back_home")
     st.caption(
         "商品名の一部を入力し、候補タブを選んでください。"
-        "結果は選んだ商品名との完全一致で、次回配達予定の早い順に表示します。"
+        "次回配達日や残数には関係なく、現在使用中の顧客と過去に使用した顧客を分けて表示します。"
     )
 
     default_keyword = str(get_query_value("product_search", "")).strip()
@@ -4377,16 +4339,6 @@ def show_product_search(df=None):
     else:
         update_query_params(page="product", product_search=None)
 
-    age_limit_days = st.radio(
-        "古い予定を非表示",
-        options=[30, 60, 90],
-        index=1,
-        format_func=lambda days: f"{days}日",
-        horizontal=True,
-        key="product_search_age_limit_days",
-        help="検索日から選択した日数より前の予定を非表示にします。日付未設定は表示します。",
-    )
-
     if not keyword:
         st.info("商品名を入力してください。")
         return
@@ -4395,11 +4347,11 @@ def show_product_search(df=None):
         with st.spinner("商品データを読み込んでいます…"):
             df = load_data()
 
-    active_rows = get_active_product_search_rows(df)
-    candidates = get_product_search_candidates(active_rows, keyword)
+    product_rows = get_product_search_rows(df)
+    candidates = get_product_search_candidates(product_rows, keyword)
 
     if not candidates:
-        st.warning("現在使用中の商品に、該当する商品名がありません。")
+        st.warning("該当する商品名がありません。")
         return
 
     st.write(f"商品候補：{len(candidates)}件")
@@ -4408,10 +4360,9 @@ def show_product_search(df=None):
         with tab:
             st.markdown(f"#### {html.escape(product_name)}")
             render_product_search_results(
-                active_rows,
+                product_rows,
                 product_name,
                 keyword,
-                age_limit_days,
             )
 
 
