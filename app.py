@@ -9824,7 +9824,7 @@ def show_home_menu():
 
     col5, col6 = st.columns(2)
     with col5:
-        st.markdown(render_page_link("🗓 配車カレンダー", page="calendar"), unsafe_allow_html=True)
+        st.markdown(render_page_link("🗓 在庫カレンダー", page="calendar"), unsafe_allow_html=True)
     with col6:
         st.markdown(render_page_link("🚚 配車表", page="dispatch_table"), unsafe_allow_html=True)
 
@@ -9886,7 +9886,7 @@ with st.sidebar:
         st.markdown(render_page_link("🔍 顧客検索", page="customer"), unsafe_allow_html=True)
         st.markdown(render_page_link("📍 地域検索", page="region"), unsafe_allow_html=True)
         st.markdown(render_page_link("🔎 商品検索", page="product"), unsafe_allow_html=True)
-        st.markdown(render_page_link("🗓 配車カレンダー", page="calendar"), unsafe_allow_html=True)
+        st.markdown(render_page_link("🗓 在庫カレンダー", page="calendar"), unsafe_allow_html=True)
         st.markdown(render_page_link("🚚 配車表", page="dispatch_table"), unsafe_allow_html=True)
         st.markdown(render_page_link("🧪 ソリュブル在庫", page="soluble_inventory"), unsafe_allow_html=True)
         st.markdown(render_page_link("💧 WATER it接続", page="water_it_test"), unsafe_allow_html=True)
