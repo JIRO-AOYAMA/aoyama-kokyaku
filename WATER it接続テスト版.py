@@ -9734,23 +9734,40 @@ def show_trade_notes_page():
                 partner_names[(partner_type, trade_partner_text(row.get("取引先ID")))] = trade_partner_text(row.get("会社名"))
     except Exception:
         partner_names = {}
-    tabs = st.tabs(["顧客", "仕入先", "運送会社"])
-    categories = ["customer", "supplier", "carrier"]
-    for tab, category in zip(tabs, categories):
-        with tab:
-            filtered = []
-            for note in notes:
-                parsed = parse_trade_partner_note_key(note.get("customer_name"))
-                if category == "customer" and parsed is None:
-                    filtered.append(note)
-                elif parsed and parsed["partner_type"] == category:
-                    filtered.append(note)
-            if not filtered:
-                st.info("メモはまだありません。")
-                continue
-            for note in filtered:
-                render_trade_note_card(note, category, partner_names=partner_names)
-                render_note_delete_controls(note)
+
+    # st.tabs は削除確認などで再実行されるたびに先頭の「顧客」へ戻るため、
+    # 選択値を session_state に保持できる横並びラジオで区分を切り替える。
+    # これにより、仕入先や運送会社のメモを続けて削除しても同じ区分を維持する。
+    category_labels = ["顧客", "仕入先", "運送会社"]
+    category_by_label = {
+        "顧客": "customer",
+        "仕入先": "supplier",
+        "運送会社": "carrier",
+    }
+    selected_label = st.radio(
+        "表示する区分",
+        category_labels,
+        horizontal=True,
+        key="trade_notes_selected_category",
+        label_visibility="collapsed",
+    )
+    category = category_by_label[selected_label]
+
+    filtered = []
+    for note in notes:
+        parsed = parse_trade_partner_note_key(note.get("customer_name"))
+        if category == "customer" and parsed is None:
+            filtered.append(note)
+        elif parsed and parsed["partner_type"] == category:
+            filtered.append(note)
+
+    if not filtered:
+        st.info("メモはまだありません。")
+        return
+
+    for note in filtered:
+        render_trade_note_card(note, category, partner_names=partner_names)
+        render_note_delete_controls(note)
 
 
 def show_top_home():
