@@ -7147,7 +7147,7 @@ def render_soluble_water_it_summary(location, context):
         difference_label = "—" if difference is None else f"{difference:+,.0f} kg"
         st.markdown(
             '<div class="soluble-waterit-summary-grid">'
-            + summary_card("現在の実測在庫", actual_label, "actual")
+            + summary_card(f"現在の実測在庫/{measured_at.strftime('%H:%M')}", actual_label, "actual")
             + summary_card("同日のExcel計算在庫", excel_label, "excel")
             + summary_card("実測 − Excel", difference_label, "difference")
             + '</div>',
