@@ -10407,12 +10407,10 @@ with st.sidebar:
         st.markdown(render_page_link("🗺 運送条件検索", page="carrier_condition"), unsafe_allow_html=True)
 
     st.markdown("---")
-    if st.button(
-        "📦 全データバックアップ",
-        key="open_full_data_backup",
-        use_container_width=True,
-    ):
-        set_page("data_backup", rerun=True)
+    st.markdown(
+        render_page_link("📦 全データバックアップ", page="data_backup"),
+        unsafe_allow_html=True,
+    )
 
 
 col_title, col_logout = st.columns([3, 1])
