@@ -10286,6 +10286,24 @@ def create_full_data_backup_zip():
     }
 
 
+@st.fragment
+def show_full_data_backup_download_button():
+    """ダウンロード操作ではアプリ全体を再実行せず、ZIPをブラウザへ渡す。"""
+    zip_content = st.session_state.get("full_data_backup_zip_bytes")
+    zip_name = st.session_state.get("full_data_backup_zip_name")
+    if not zip_content or not zip_name:
+        return
+
+    st.download_button(
+        "⬇ ZIPをダウンロード",
+        data=BytesIO(zip_content),
+        file_name=zip_name,
+        mime="application/zip",
+        key="download_full_data_backup",
+        use_container_width=True,
+    )
+
+
 def show_full_data_backup_page():
     """ボタンを押した時だけ全データを取得してZIPを作成する。"""
     st.header("📦 全データバックアップ")
@@ -10323,14 +10341,7 @@ def show_full_data_backup_page():
         summary = st.session_state.get(summary_key)
         if summary:
             st.success(summary)
-        st.download_button(
-            "⬇ ZIPをダウンロード",
-            data=zip_content,
-            file_name=zip_name,
-            mime="application/zip",
-            key="download_full_data_backup",
-            use_container_width=True,
-        )
+        show_full_data_backup_download_button()
 
 
 # =========================
