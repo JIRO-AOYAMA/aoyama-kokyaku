@@ -54,6 +54,10 @@ DROPBOX_ACCESS_TOKEN = st.secrets.get("DROPBOX_ACCESS_TOKEN", "")
 DROPBOX_DEFAULT_FILE_PATH = "/1共有　青山商店　本社/配車表-北海道-/配車予定 次郎.xlsm"
 DROPBOX_FILE_PATH = st.secrets.get("DROPBOX_FILE_PATH", DROPBOX_DEFAULT_FILE_PATH)
 DROPBOX_BACKUP_FOLDER = "/1共有　青山商店　本社/配車表-北海道-/Backups"
+FULL_DATA_BACKUP_DROPBOX_FOLDER = st.secrets.get(
+    "FULL_DATA_BACKUP_DROPBOX_FOLDER",
+    str(DROPBOX_FILE_PATH).rsplit("/", 1)[0] + "/顧客カルテ全データ_Backups",
+)
 DROPBOX_FAST_CACHE_FILE = "/1共有　青山商店　本社/配車表-北海道-/顧客検索キャッシュ.json"
 # Excelの列構成や読み込み処理を変更した時は、この番号を上げて古いJSONを無効化する。
 DROPBOX_FAST_CACHE_VERSION = 2
@@ -10092,6 +10096,63 @@ def backup_add_entry(entries, path, content, description, count=""):
     )
 
 
+def ensure_full_data_backup_dropbox_folder(access_token):
+    """全データバックアップ専用フォルダを作る。既存フォルダは成功扱いにする。"""
+    folder = str(FULL_DATA_BACKUP_DROPBOX_FOLDER or "").strip().rstrip("/")
+    if not folder:
+        raise RuntimeError("全データバックアップのDropbox保存先が設定されていません。")
+
+    response = call_dropbox_rpc(
+        "files/create_folder_v2",
+        {"path": folder, "autorename": False},
+        access_token,
+    )
+    if response.status_code == 200:
+        return folder
+    if response.status_code == 409:
+        try:
+            summary = str(response.json().get("error_summary", ""))
+            if "conflict" in summary and "folder" in summary:
+                return folder
+        except Exception:
+            pass
+    raise RuntimeError(
+        "Dropboxに全データバックアップ用フォルダを作成できませんでした。\n"
+        + dropbox_error_text(response)
+    )
+
+
+def save_full_data_backup_to_dropbox(filename, content):
+    """作成済みZIPを専用Dropboxフォルダへ追加保存し、内容を検証する。"""
+    if not filename or not isinstance(content, (bytes, bytearray)) or not content:
+        raise RuntimeError("Dropboxへ保存するバックアップZIPが空です。")
+
+    access_token = get_dropbox_access_token()
+    folder = ensure_full_data_backup_dropbox_folder(access_token)
+    target_path = f"{folder}/{filename}"
+    response = upload_dropbox_file(
+        target_path,
+        bytes(content),
+        access_token,
+        mode="add",
+    )
+    if response.status_code == 409:
+        raise RuntimeError(
+            "同じ名前のバックアップがDropboxに存在します。もう一度作成してください。"
+        )
+    if response.status_code != 200:
+        raise RuntimeError(
+            "Dropboxへ全データバックアップを保存できませんでした。\n"
+            + dropbox_error_text(response)
+        )
+
+    metadata = get_dropbox_response_metadata(response)
+    if not metadata.get("content_hash") or metadata.get("size") is None:
+        metadata = get_dropbox_file_metadata(target_path, access_token)
+    verify_dropbox_file_metadata(metadata, bytes(content))
+    return target_path
+
+
 def create_full_data_backup_zip():
     """現在の保存処理を変更せず、読み取りだけで全データZIPを作る。"""
     created_at = get_jst_now()
@@ -10250,7 +10311,7 @@ def create_full_data_backup_zip():
         *[f"- {source}" for source in sources],
         "",
         "注意:",
-        "- この機能は読み取り専用です。Excel・Dropbox・Supabaseへ書き込みません。",
+        "- 元のExcel・Supabaseデータは変更しません。作成したZIPだけをDropboxへ追加保存します。",
         "- パスワード、接続キー、secrets.tomlは含みません。",
         "- WATER itの元CSV本体および圧縮保存本文は含みません。",
         "- CSVはUTF-8 BOM付きです。",
@@ -10305,14 +10366,17 @@ def show_full_data_backup_download_button():
 
 
 def show_full_data_backup_page():
-    """ボタンを押した時だけ全データを取得してZIPを作成する。"""
+    """ボタンを押した時だけZIPを作り、Dropboxへ追加保存する。"""
     st.header("📦 全データバックアップ")
-    st.write("現在のExcel保存ルールは変更せず、読み取りだけでバックアップを作成します。")
-    st.caption("作成には少し時間がかかる場合があります。完了するまでこの画面を閉じないでください。")
+    st.write("現在のExcel保存ルールは変更せず、元データを変更せずにバックアップを作成します。")
+    st.caption("作成したZIPはDropboxの専用フォルダへ自動保存し、端末にもダウンロードできます。")
+    st.caption(f"Dropbox保存先：{FULL_DATA_BACKUP_DROPBOX_FOLDER}")
 
     bytes_key = "full_data_backup_zip_bytes"
     name_key = "full_data_backup_zip_name"
     summary_key = "full_data_backup_summary"
+    dropbox_path_key = "full_data_backup_dropbox_path"
+    dropbox_error_key = "full_data_backup_dropbox_error"
 
     if st.button(
         "📦 全データバックアップを作成",
@@ -10320,9 +10384,14 @@ def show_full_data_backup_page():
         type="primary",
         use_container_width=True,
     ):
-        st.session_state.pop(bytes_key, None)
-        st.session_state.pop(name_key, None)
-        st.session_state.pop(summary_key, None)
+        for key in (
+            bytes_key,
+            name_key,
+            summary_key,
+            dropbox_path_key,
+            dropbox_error_key,
+        ):
+            st.session_state.pop(key, None)
         try:
             with st.spinner("全データを読み取り、ZIPを作成しています…"):
                 result = create_full_data_backup_zip()
@@ -10330,8 +10399,18 @@ def show_full_data_backup_page():
             st.session_state[name_key] = result["filename"]
             st.session_state[summary_key] = (
                 f"{result['file_count']}ファイル・"
-                f"{result['customer_count']}顧客をバックアップしました。"
+                f"{result['customer_count']}顧客のZIPを作成しました。"
             )
+
+            try:
+                with st.spinner("作成したZIPをDropboxへ保存しています…"):
+                    dropbox_path = save_full_data_backup_to_dropbox(
+                        result["filename"],
+                        result["content"],
+                    )
+                st.session_state[dropbox_path_key] = dropbox_path
+            except Exception as exc:
+                st.session_state[dropbox_error_key] = str(exc)
         except Exception as exc:
             st.error(f"完全バックアップを作成できませんでした：{exc}")
 
@@ -10341,6 +10420,17 @@ def show_full_data_backup_page():
         summary = st.session_state.get(summary_key)
         if summary:
             st.success(summary)
+
+        dropbox_path = st.session_state.get(dropbox_path_key)
+        dropbox_error = st.session_state.get(dropbox_error_key)
+        if dropbox_path:
+            st.success(f"Dropboxへ保存しました：{dropbox_path}")
+        elif dropbox_error:
+            st.warning(
+                "Dropboxへの保存に失敗しました。下のボタンから端末へダウンロードしてください。"
+            )
+            st.error(dropbox_error)
+
         show_full_data_backup_download_button()
 
 
