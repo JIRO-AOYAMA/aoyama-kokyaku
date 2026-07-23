@@ -3400,6 +3400,7 @@ def sync_page_from_query_params():
         "carrier_condition",
         "carrier_register",
         "partner_detail",
+        "data_backup",
     }
 
     raw_page = str(get_query_value("page", "")).strip()
@@ -9851,6 +9852,488 @@ def show_home_menu():
     st.markdown("---")
 
 # =========================
+# 全データバックアップ（読み取り専用）
+# =========================
+def backup_safe_value(value):
+    """CSVへ安全に書き出せる値へ変換する。"""
+    if value is None:
+        return ""
+    if isinstance(value, float) and math.isnan(value):
+        return ""
+    if isinstance(value, (pd.Timestamp, datetime, date)):
+        return value.isoformat()
+    if isinstance(value, (dict, list, tuple, set)):
+        return json.dumps(value, ensure_ascii=False, default=str)
+    return value
+
+
+def backup_csv_bytes(dataframe):
+    """Excelで文字化けしにくいUTF-8 BOM付きCSVを返す。"""
+    export_df = dataframe.copy()
+    for column in export_df.columns:
+        export_df[column] = export_df[column].map(backup_safe_value)
+    return b"\xef\xbb\xbf" + export_df.to_csv(
+        index=False,
+        lineterminator="\n",
+    ).encode("utf-8")
+
+
+def backup_dataframe(records, columns=None):
+    """空の一覧でも必要な見出しを残す。"""
+    dataframe = pd.DataFrame(records or [])
+    if columns:
+        for column in columns:
+            if column not in dataframe.columns:
+                dataframe[column] = ""
+        ordered = list(columns) + [
+            column for column in dataframe.columns if column not in columns
+        ]
+        dataframe = dataframe[ordered]
+    return dataframe
+
+
+def backup_read_all_supabase_rows(url, label):
+    """Supabaseのテーブルを読み取り専用で全件取得する。"""
+    if not has_supabase_config():
+        raise RuntimeError(f"{label}を取得するためのSupabase設定がありません。")
+
+    rows = []
+    page_size = 1000
+    offset = 0
+    while True:
+        try:
+            response = requests.get(
+                url,
+                headers=get_supabase_headers(),
+                params={
+                    "select": "*",
+                    "limit": str(page_size),
+                    "offset": str(offset),
+                },
+                timeout=30,
+            )
+        except Exception as exc:
+            raise RuntimeError(f"{label}の取得中にSupabaseへ接続できませんでした。") from exc
+
+        if response.status_code != 200:
+            detail = str(response.text or "").strip()[:500]
+            raise RuntimeError(
+                f"{label}を取得できませんでした（{response.status_code}）。"
+                + (f" {detail}" if detail else "")
+            )
+
+        try:
+            page = response.json()
+        except Exception as exc:
+            raise RuntimeError(f"{label}の応答形式が正しくありません。") from exc
+        if not isinstance(page, list):
+            raise RuntimeError(f"{label}の応答形式が正しくありません。")
+
+        rows.extend(page)
+        if len(page) < page_size:
+            break
+        offset += page_size
+    return rows
+
+
+def backup_get_main_excel_bytes():
+    """顧客・在庫の元Excelを読み取り専用で取得する。"""
+    if has_dropbox_auth_config():
+        content = get_cached_dropbox_excel_content()
+        path = get_dropbox_file_path()
+        return content, Path(path).name or "配車予定 次郎.xlsm", f"Dropbox: {path}"
+
+    path = Path(EXCEL_FILE)
+    if not path.exists():
+        raise FileNotFoundError(f"顧客・在庫の元Excelが見つかりません：{path}")
+    return path.read_bytes(), path.name, f"ローカル: {path}"
+
+
+def backup_get_dispatch_excel_bytes():
+    """配車表の元Excelを画面と同じ優先順位で取得する。"""
+    dropbox_error = None
+    if has_dropbox_auth_config():
+        try:
+            content = get_cached_dispatch_dropbox_content()
+            path = str(DISPATCH_DROPBOX_FILE_PATH or DISPATCH_DROPBOX_DEFAULT_FILE_PATH).strip()
+            return content, Path(path).name or "配車表1.xlsm", f"Dropbox: {path}"
+        except Exception as exc:
+            dropbox_error = exc
+
+    path = Path(str(DISPATCH_LOCAL_FILE or "").strip())
+    if path.exists():
+        return path.read_bytes(), path.name, f"ローカル: {path}"
+
+    message = f"配車表の元Excelが見つかりません：{path}"
+    if dropbox_error is not None:
+        message += f"\nDropbox取得エラー：{dropbox_error}"
+    raise FileNotFoundError(message)
+
+
+def backup_get_soluble_excel_bytes():
+    """ソリュブル在庫の元Excelを読み取り専用で取得する。"""
+    content, source = load_soluble_workbook_content()
+    return content, SOLUBLE_FILE_NAME, source
+
+
+def backup_get_trade_partner_excel_bytes():
+    """仕入先・運送会社の元Excelを読み取り専用で取得する。"""
+    access_token = get_dropbox_access_token()
+    path = get_trade_partner_file_path()
+    content, response = download_dropbox_file(path, access_token)
+    if content is None:
+        raise RuntimeError(
+            "取引先カルテ.xlsxをDropboxから取得できませんでした。\n"
+            + dropbox_error_text(response)
+        )
+    return content, TRADE_PARTNER_FILE_NAME, f"Dropbox: {path}"
+
+
+def backup_build_product_usage(customer_df):
+    """商品検索と同じ基準で現在使用中・過去使用を一覧化する。"""
+    product_rows = get_product_search_rows(customer_df)
+    records = []
+    if product_rows.empty:
+        return backup_dataframe(
+            [],
+            ["商品名", "利用区分", "顧客名", "地域", "使用数量/日", "使用中行数"],
+        )
+
+    for product_name, product_group in product_rows.groupby("_商品名検索", sort=True):
+        for customer_name, group in product_group.groupby("_顧客名検索", sort=True):
+            current_group = group[
+                ~group["使用数量/日"].apply(is_blank_or_zero)
+            ].copy()
+            regions = [
+                clean_value(value, blank_text="").strip()
+                for value in group["地域"].tolist()
+            ]
+            region = next((value for value in regions if value), "")
+            if current_group.empty:
+                status = "過去に使用"
+                usage = ""
+                current_count = 0
+            else:
+                status = "現在使用中"
+                current_count = len(current_group)
+                usage_values = [
+                    clean_value(value, blank_text="").strip()
+                    for value in current_group["使用数量/日"].tolist()
+                ]
+                usage = " / ".join(dict.fromkeys(value for value in usage_values if value))
+            records.append(
+                {
+                    "商品名": product_name,
+                    "利用区分": status,
+                    "顧客名": customer_name,
+                    "地域": region,
+                    "使用数量/日": usage,
+                    "使用中行数": current_count,
+                }
+            )
+    return pd.DataFrame(records)
+
+
+def backup_build_calendar_export(customer_df):
+    """在庫カレンダーで使う基本項目を元データから書き出す。"""
+    candidates = [
+        "ID", "顧客名", "地域", "商品名", "メーカー",
+        "使用数量/日", "次回配達予定", "残数",
+    ]
+    columns = [column for column in candidates if column in customer_df.columns]
+    if not columns:
+        return pd.DataFrame()
+    result = customer_df[columns].copy()
+    if "次回配達予定" in result.columns:
+        result["次回配達予定_解析"] = pd.to_datetime(
+            result["次回配達予定"], errors="coerce"
+        )
+        result.sort_values(
+            ["次回配達予定_解析", "顧客名"],
+            na_position="last",
+            inplace=True,
+        )
+    return result.reset_index(drop=True)
+
+
+def backup_build_note_exports(raw_notes):
+    """notesテーブルを通常メモとLINE状態へ分ける。"""
+    normal_notes = []
+    line_statuses = []
+    for row in raw_notes:
+        row_id = clean_value(row.get("id"), blank_text="")
+        if row_id.startswith(LINE_STATUS_NOTE_PREFIX):
+            line_statuses.append(
+                {
+                    "顧客名": row.get("customer_name", ""),
+                    "LINE状態": "接続中",
+                    "保存ID": row_id,
+                    "作成日時": row.get("created_at", ""),
+                }
+            )
+        else:
+            normal_notes.append(row)
+    return backup_dataframe(normal_notes), backup_dataframe(
+        line_statuses,
+        ["顧客名", "LINE状態", "保存ID", "作成日時"],
+    )
+
+
+def backup_add_entry(entries, path, content, description, count=""):
+    if not isinstance(content, (bytes, bytearray)) or not content:
+        raise RuntimeError(f"バックアップ内容が空です：{path}")
+    entries.append(
+        {
+            "path": path,
+            "content": bytes(content),
+            "description": description,
+            "count": count,
+        }
+    )
+
+
+def create_full_data_backup_zip():
+    """現在の保存処理を変更せず、読み取りだけで全データZIPを作る。"""
+    created_at = get_jst_now()
+    timestamp = created_at.strftime("%Y%m%d_%H%M%S")
+    entries = []
+    sources = []
+
+    main_excel, main_name, main_source = backup_get_main_excel_bytes()
+    dispatch_excel, dispatch_name, dispatch_source = backup_get_dispatch_excel_bytes()
+    soluble_excel, soluble_name, soluble_source = backup_get_soluble_excel_bytes()
+    trade_excel, trade_name, trade_source = backup_get_trade_partner_excel_bytes()
+    sources.extend([main_source, dispatch_source, soluble_source, trade_source])
+
+    customer_df = normalize_excel_table(BytesIO(main_excel))
+    dispatch_df = read_dispatch_month_sheets(BytesIO(dispatch_excel))
+    soluble_rows_df = backup_dataframe(read_soluble_rows(soluble_excel))
+    soluble_summary_df = backup_dataframe(
+        list(read_soluble_customer_summaries(soluble_excel).values())
+    )
+
+    trade_editor = TradePartnerXlsxEditor(trade_excel)
+    missing_sheets = [
+        name for name in TRADE_PARTNER_REQUIRED_SHEETS
+        if not trade_editor.has_sheet(name)
+    ]
+    if missing_sheets:
+        raise RuntimeError(
+            "取引先カルテ.xlsxに必要なシートがありません："
+            + "、".join(missing_sheets)
+        )
+    trade_data = {
+        name: trade_editor.read_sheet(name)
+        for name in TRADE_PARTNER_REQUIRED_SHEETS
+    }
+
+    water_df, water_source = get_active_water_it_data()
+    sources.append(f"WATER it表示データ: {water_source}")
+
+    raw_notes = backup_read_all_supabase_rows(
+        get_supabase_notes_url(),
+        "メモ・LINE状態",
+    )
+    raw_customer_information = backup_read_all_supabase_rows(
+        get_supabase_customer_information_url(),
+        "顧客情報",
+    )
+    customer_information = [
+        row for row in raw_customer_information
+        if clean_value(row.get("id"), blank_text="") != WATER_IT_STORAGE_ID
+        and clean_value(row.get("customer_name"), blank_text="") != WATER_IT_STORAGE_CUSTOMER
+        and clean_value(row.get("field_name"), blank_text="") != WATER_IT_STORAGE_FIELD
+    ]
+    water_storage_rows = [
+        row for row in raw_customer_information
+        if row not in customer_information
+    ]
+    water_metadata = []
+    for row in water_storage_rows:
+        metadata = {
+            "id": row.get("id", ""),
+            "customer_name": row.get("customer_name", ""),
+            "field_name": row.get("field_name", ""),
+            "updated_at": row.get("updated_at", ""),
+        }
+        try:
+            payload = json.loads(str(row.get("content") or "{}"))
+            metadata.update(
+                {
+                    "保存ファイル名": payload.get("filename", ""),
+                    "SHA256": payload.get("sha256", ""),
+                    "行数": payload.get("row_count", ""),
+                    "ポイント数": payload.get("point_count", ""),
+                    "最古測定日時": payload.get("oldest_time", ""),
+                    "最新測定日時": payload.get("latest_time", ""),
+                    "取込日時": payload.get("imported_at", ""),
+                    "保存形式バージョン": payload.get("version", ""),
+                }
+            )
+        except Exception:
+            metadata["解析結果"] = "保存メタデータを解析できませんでした"
+        water_metadata.append(metadata)
+
+    notes_df, line_df = backup_build_note_exports(raw_notes)
+    product_usage_df = backup_build_product_usage(customer_df)
+    calendar_df = backup_build_calendar_export(customer_df)
+
+    backup_add_entry(entries, f"元Excel/{main_name}", main_excel, "顧客・在庫の元Excel")
+    backup_add_entry(entries, f"元Excel/{dispatch_name}", dispatch_excel, "配車表の元Excel")
+    backup_add_entry(entries, f"元Excel/{soluble_name}", soluble_excel, "ソリュブル在庫の元Excel")
+    backup_add_entry(entries, f"元Excel/{trade_name}", trade_excel, "仕入先・運送会社の元Excel")
+
+    csv_exports = [
+        ("CSV/01_顧客商品在庫_全行.csv", customer_df, "アプリが読み取る顧客・商品・在庫の全行"),
+        ("CSV/02_商品利用状況.csv", product_usage_df, "現在使用中・過去使用の分類"),
+        ("CSV/03_在庫カレンダー.csv", calendar_df, "在庫カレンダーの基本情報"),
+        ("CSV/04_配車表.csv", dispatch_df.drop(columns=["_引取日", "_着日"], errors="ignore"), "配車表1月～12月"),
+        ("CSV/05_ソリュブル在庫履歴.csv", soluble_rows_df, "ソリュブル在庫の日別情報"),
+        ("CSV/06_ソリュブル顧客概要.csv", soluble_summary_df, "ソリュブル顧客の概要"),
+        ("CSV/07_WATER_it表示データ.csv", water_df, "アプリで表示できるWATER it情報（元CSVは含まない）"),
+        ("CSV/08_WATER_it保存メタデータ.csv", backup_dataframe(water_metadata), "WATER it保存データの概要のみ"),
+        ("CSV/09_顧客情報_Supabase生データ.csv", backup_dataframe(customer_information), "顧客情報・過去商品メモの生データ"),
+        ("CSV/10_メモ_Supabase生データ.csv", notes_df, "通常メモ・取引先メモの生データ"),
+        ("CSV/11_LINE状態.csv", line_df, "LINE接続状態"),
+    ]
+
+    next_number = 12
+    for sheet_name in TRADE_PARTNER_REQUIRED_SHEETS:
+        sheet = trade_data[sheet_name]
+        sheet_df = backup_dataframe(
+            sheet["rows"],
+            list(sheet["headers"]) + ["_row_number"],
+        )
+        csv_exports.append(
+            (
+                f"CSV/{next_number:02d}_{sheet_name}.csv",
+                sheet_df,
+                f"取引先カルテ.xlsxの{sheet_name}シート",
+            )
+        )
+        next_number += 1
+
+    for path, dataframe, description in csv_exports:
+        backup_add_entry(
+            entries,
+            path,
+            backup_csv_bytes(dataframe),
+            description,
+            len(dataframe),
+        )
+
+    manifest = pd.DataFrame(
+        [
+            {
+                "ファイル": entry["path"],
+                "内容": entry["description"],
+                "件数": entry["count"],
+                "バイト数": len(entry["content"]),
+                "SHA256": hashlib.sha256(entry["content"]).hexdigest(),
+            }
+            for entry in entries
+        ]
+    )
+    backup_add_entry(
+        entries,
+        "バックアップ一覧.csv",
+        backup_csv_bytes(manifest),
+        "ZIP内ファイルの一覧・件数・SHA256",
+        len(manifest),
+    )
+
+    info_lines = [
+        f"作成日時: {created_at.strftime('%Y/%m/%d %H:%M:%S %z')}",
+        f"アプリ名: {APP_TITLE}",
+        "",
+        "取得元:",
+        *[f"- {source}" for source in sources],
+        "",
+        "注意:",
+        "- この機能は読み取り専用です。Excel・Dropbox・Supabaseへ書き込みません。",
+        "- パスワード、接続キー、secrets.tomlは含みません。",
+        "- WATER itの元CSV本体および圧縮保存本文は含みません。",
+        "- CSVはUTF-8 BOM付きです。",
+        "- 元ExcelとCSVの重複は、データ保全のため意図的に残しています。",
+    ]
+    backup_add_entry(
+        entries,
+        "バックアップ情報.txt",
+        ("\ufeff" + "\n".join(info_lines) + "\n").encode("utf-8"),
+        "バックアップの作成日時・取得元・注意事項",
+    )
+
+    output = BytesIO()
+    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for entry in entries:
+            archive.writestr(entry["path"], entry["content"])
+    zip_content = output.getvalue()
+
+    with zipfile.ZipFile(BytesIO(zip_content), "r") as archive:
+        bad_file = archive.testzip()
+        if bad_file:
+            raise RuntimeError(f"ZIP内の検証に失敗しました：{bad_file}")
+        archived_names = set(archive.namelist())
+    expected_names = {entry["path"] for entry in entries}
+    if archived_names != expected_names:
+        raise RuntimeError("ZIP内のファイル一覧が作成前と一致しません。")
+
+    return {
+        "content": zip_content,
+        "filename": f"取引先カルテ全データ_{timestamp}.zip",
+        "file_count": len(entries),
+        "customer_count": int(customer_df["顧客名"].nunique()) if "顧客名" in customer_df.columns else 0,
+    }
+
+
+def show_full_data_backup_page():
+    """ボタンを押した時だけ全データを取得してZIPを作成する。"""
+    st.header("📦 全データバックアップ")
+    st.write("現在のExcel保存ルールは変更せず、読み取りだけでバックアップを作成します。")
+    st.caption("作成には少し時間がかかる場合があります。完了するまでこの画面を閉じないでください。")
+
+    bytes_key = "full_data_backup_zip_bytes"
+    name_key = "full_data_backup_zip_name"
+    summary_key = "full_data_backup_summary"
+
+    if st.button(
+        "📦 全データバックアップを作成",
+        key="create_full_data_backup",
+        type="primary",
+        use_container_width=True,
+    ):
+        st.session_state.pop(bytes_key, None)
+        st.session_state.pop(name_key, None)
+        st.session_state.pop(summary_key, None)
+        try:
+            with st.spinner("全データを読み取り、ZIPを作成しています…"):
+                result = create_full_data_backup_zip()
+            st.session_state[bytes_key] = result["content"]
+            st.session_state[name_key] = result["filename"]
+            st.session_state[summary_key] = (
+                f"{result['file_count']}ファイル・"
+                f"{result['customer_count']}顧客をバックアップしました。"
+            )
+        except Exception as exc:
+            st.error(f"完全バックアップを作成できませんでした：{exc}")
+
+    zip_content = st.session_state.get(bytes_key)
+    zip_name = st.session_state.get(name_key)
+    if zip_content and zip_name:
+        summary = st.session_state.get(summary_key)
+        if summary:
+            st.success(summary)
+        st.download_button(
+            "⬇ ZIPをダウンロード",
+            data=zip_content,
+            file_name=zip_name,
+            mime="application/zip",
+            key="download_full_data_backup",
+            use_container_width=True,
+        )
+
+
+# =========================
 # メイン
 # =========================
 if "page" not in st.session_state:
@@ -9922,6 +10405,14 @@ with st.sidebar:
         st.markdown(render_page_link("📋 運送会社一覧", page="carrier_list"), unsafe_allow_html=True)
         st.markdown(render_page_link("🔍 運送会社検索", page="carrier_search"), unsafe_allow_html=True)
         st.markdown(render_page_link("🗺 運送条件検索", page="carrier_condition"), unsafe_allow_html=True)
+
+    st.markdown("---")
+    if st.button(
+        "📦 全データバックアップ",
+        key="open_full_data_backup",
+        use_container_width=True,
+    ):
+        set_page("data_backup", rerun=True)
 
 
 col_title, col_logout = st.columns([3, 1])
@@ -9995,6 +10486,9 @@ try:
 
     elif st.session_state["page"] == "trade_notes":
         show_trade_notes_page()
+
+    elif st.session_state["page"] == "data_backup":
+        show_full_data_backup_page()
 
     elif st.session_state["page"] == "detail":
         selected = st.session_state.get("selected_customer")
