@@ -148,6 +148,8 @@ LINE_STATUS_NOTE_PREFIX = "line_status_"
 LINE_STATUS_BODY = "__LINE_CONNECTED__"
 VOICE_INPUT_HELP = "スマホではキーボードのマイクを押して音声入力できます。"
 PAST_PRODUCT_NOTE_PREFIX = "__past_product_note__:"
+ESTIMATE_PREFIX = "__estimate__:"
+ESTIMATE_VERSION = 1
 CHANGE_HISTORY_CUSTOMER = "__CHANGE_HISTORY__"
 CHANGE_HISTORY_VERSION = 1
 CHANGE_HISTORY_PAGE_SIZE = 30
@@ -3170,6 +3172,597 @@ def render_past_products_section(customer_name, customer_key, detail, visible_de
                             st.rerun()
 
 
+
+def make_estimate_field_name():
+    """顧客情報テーブル内で、見積りを通常項目と分ける内部項目名を作る。"""
+    return f"{ESTIMATE_PREFIX}{uuid.uuid4()}"
+
+
+def is_estimate_item(item):
+    """顧客情報テーブル上の提案・見積り専用レコードか判定する。"""
+    return clean_value(item.get("field_name"), blank_text="").startswith(ESTIMATE_PREFIX)
+
+
+def estimate_date_text(value):
+    """見積りの日付をYYYY-MM-DDへそろえる。"""
+    if isinstance(value, datetime):
+        return value.date().isoformat()
+    if isinstance(value, date):
+        return value.isoformat()
+    text = clean_value(value, blank_text="").strip()
+    match = re.match(r"^(\d{4})[-/](\d{1,2})[-/](\d{1,2})", text)
+    if not match:
+        return text
+    year, month, day = (int(part) for part in match.groups())
+    try:
+        return date(year, month, day).isoformat()
+    except ValueError:
+        return text
+
+
+def estimate_date_input_value(value):
+    """保存済みの日付をst.date_inputで使えるdateへ変換する。"""
+    text = estimate_date_text(value)
+    try:
+        return date.fromisoformat(text)
+    except (TypeError, ValueError):
+        return get_jst_now().date()
+
+
+def format_estimate_date(value):
+    text = estimate_date_text(value)
+    try:
+        return date.fromisoformat(text).strftime("%Y/%m/%d")
+    except (TypeError, ValueError):
+        return text or "未入力"
+
+
+def serialize_estimate(proposal_date, product_name, manufacturer, unit_price, price_unit, remarks):
+    payload = {
+        "version": ESTIMATE_VERSION,
+        "proposal_date": estimate_date_text(proposal_date),
+        "product_name": clean_value(product_name, blank_text="").strip(),
+        "manufacturer": clean_value(manufacturer, blank_text="").strip(),
+        "unit_price": clean_value(unit_price, blank_text="").strip(),
+        "price_unit": clean_value(price_unit, blank_text="").strip(),
+        "remarks": clean_value(remarks, blank_text="").strip(),
+    }
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+
+
+def parse_estimate_item(item):
+    """Supabase内部レコードを画面表示用の見積り辞書へ変換する。"""
+    if not is_estimate_item(item):
+        return None
+    try:
+        payload = json.loads(str(item.get("content") or "{}"))
+    except Exception:
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+    return {
+        "id": clean_value(item.get("id"), blank_text=""),
+        "field_name": clean_value(item.get("field_name"), blank_text=""),
+        "customer_key": clean_value(item.get("customer_key"), blank_text=""),
+        "customer_name": clean_value(item.get("customer_name"), blank_text=""),
+        "proposal_date": estimate_date_text(payload.get("proposal_date")),
+        "product_name": clean_value(payload.get("product_name"), blank_text="").strip(),
+        "manufacturer": clean_value(payload.get("manufacturer"), blank_text="").strip(),
+        "unit_price": clean_value(payload.get("unit_price"), blank_text="").strip(),
+        "price_unit": clean_value(payload.get("price_unit"), blank_text="").strip(),
+        "remarks": clean_value(payload.get("remarks"), blank_text="").strip(),
+        "created_at": item.get("created_at", ""),
+        "updated_at": item.get("updated_at", ""),
+        "sort_order": item.get("sort_order", 0),
+    }
+
+
+def estimate_sort_key(item):
+    return (
+        estimate_date_text(item.get("proposal_date")),
+        str(item.get("updated_at") or item.get("created_at") or ""),
+        str(item.get("id") or ""),
+    )
+
+
+def get_customer_estimates(customer_name, customer_key):
+    items = load_customer_information(customer_name, customer_key)
+    estimates = []
+    for item in items:
+        parsed = parse_estimate_item(item)
+        if parsed:
+            estimates.append(parsed)
+    estimates.sort(key=estimate_sort_key, reverse=True)
+    return estimates
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def load_all_estimates_from_supabase():
+    """ホームの見積り画面で使う全顧客分の見積りを読み込む。"""
+    if not has_supabase_config():
+        return []
+
+    rows = []
+    page_size = 1000
+    offset = 0
+    while True:
+        params = {
+            "select": "id,customer_key,customer_name,field_name,content,sort_order,created_at,updated_at",
+            "field_name": f"like.{ESTIMATE_PREFIX}*",
+            "order": "created_at.desc,id.desc",
+            "limit": str(page_size),
+            "offset": str(offset),
+        }
+        try:
+            response = requests.get(
+                get_supabase_customer_information_url(),
+                headers=get_supabase_headers(),
+                params=params,
+                timeout=30,
+            )
+        except Exception as exc:
+            raise RuntimeError("見積りの読み込み中にSupabaseへ接続できませんでした。") from exc
+
+        check_customer_information_response("読み込み", response, (200,))
+        page = response.json()
+        if not isinstance(page, list):
+            raise RuntimeError("Supabaseから返った見積りの形式が正しくありません。")
+
+        rows.extend(item for item in page if is_estimate_item(item))
+        if len(page) < page_size:
+            break
+        offset += page_size
+
+    return rows
+
+
+def clear_estimate_cache():
+    try:
+        load_all_estimates_from_supabase.clear()
+    except Exception:
+        pass
+
+
+def estimate_values(item):
+    return {
+        "提案日": estimate_date_text(item.get("proposal_date")),
+        "商品名": clean_value(item.get("product_name"), blank_text=""),
+        "メーカー": clean_value(item.get("manufacturer"), blank_text=""),
+        "単価": clean_value(item.get("unit_price"), blank_text=""),
+        "単価の単位": clean_value(item.get("price_unit"), blank_text=""),
+        "備考": clean_value(item.get("remarks"), blank_text=""),
+    }
+
+
+def estimate_history_changes(before, after):
+    before_values = estimate_values(before or {})
+    after_values = estimate_values(after or {})
+    return {
+        field_name: (before_values.get(field_name, ""), after_values.get(field_name, ""))
+        for field_name in after_values
+        if before_values.get(field_name, "") != after_values.get(field_name, "")
+    }
+
+
+def save_customer_estimate(
+    customer_name,
+    customer_key,
+    proposal_date,
+    product_name,
+    manufacturer,
+    unit_price,
+    price_unit,
+    remarks,
+    existing=None,
+):
+    content = serialize_estimate(
+        proposal_date,
+        product_name,
+        manufacturer,
+        unit_price,
+        price_unit,
+        remarks,
+    )
+    if existing:
+        update_customer_information(existing["id"], existing["field_name"], content)
+    else:
+        items = load_customer_information(customer_name, customer_key)
+        next_order = max(
+            (int(item.get("sort_order", 0)) for item in items),
+            default=0,
+        ) + 10
+        insert_customer_information(
+            customer_name,
+            customer_key,
+            make_estimate_field_name(),
+            content,
+            next_order,
+        )
+    clear_estimate_cache()
+
+
+def delete_customer_estimate(item):
+    item_id = clean_value(item.get("id"), blank_text="")
+    if not item_id:
+        raise RuntimeError("削除する見積りが見つかりません。")
+    delete_customer_information(item_id)
+    clear_estimate_cache()
+
+
+def estimate_price_label(item):
+    price = clean_value(item.get("unit_price"), blank_text="").strip()
+    unit = clean_value(item.get("price_unit"), blank_text="").strip()
+    if price and unit:
+        return f"{price} {unit}"
+    return price or unit or "未入力"
+
+
+def render_customer_estimates_section(customer_name, customer_key=None):
+    """顧客詳細に、折りたたみ式の提案・見積りを表示する。"""
+    identity = customer_key or customer_name
+    state_suffix = hashlib.sha256(
+        f"estimate|{identity}".encode("utf-8")
+    ).hexdigest()[:16]
+    add_key = f"estimate_add_{state_suffix}"
+    edit_key = f"estimate_edit_{state_suffix}"
+    delete_key = f"estimate_delete_{state_suffix}"
+    success_key = f"estimate_success_{state_suffix}"
+
+    try:
+        estimates = get_customer_estimates(customer_name, customer_key)
+    except Exception as exc:
+        estimates = []
+        load_error = str(exc)
+    else:
+        load_error = ""
+
+    success_message = st.session_state.pop(success_key, None)
+    expanded = bool(
+        success_message
+        or st.session_state.get(add_key)
+        or st.session_state.get(edit_key)
+        or st.session_state.get(delete_key)
+    )
+
+    with st.expander(f"📄 提案・見積り　{len(estimates)}件", expanded=expanded):
+        if not has_supabase_config():
+            st.warning("提案・見積りを使うにはSupabase設定が必要です。")
+            return
+        if load_error:
+            st.warning(f"見積りを読み込めませんでした：{load_error}")
+            return
+        if success_message:
+            st.success(success_message)
+
+        if not st.session_state.get(add_key):
+            if st.button(
+                "＋ 見積りを追加",
+                key=f"estimate_add_button_{state_suffix}",
+                use_container_width=True,
+            ):
+                st.session_state[add_key] = True
+                st.session_state.pop(edit_key, None)
+                st.session_state.pop(delete_key, None)
+                st.rerun()
+        else:
+            st.markdown("**新しい見積り**")
+            with st.form(f"estimate_add_form_{state_suffix}"):
+                proposal_date = st.date_input(
+                    "提案日",
+                    value=get_jst_now().date(),
+                )
+                product_name = st.text_input("商品名")
+                manufacturer = st.text_input("メーカー")
+                price_col, unit_col = st.columns(2)
+                with price_col:
+                    unit_price = st.text_input("単価", placeholder="例：85、3,500")
+                with unit_col:
+                    price_unit = st.text_input("単価の単位", placeholder="例：円/kg、円/袋")
+                remarks = st.text_area("備考", height=110)
+                save_col, cancel_col = st.columns(2)
+                with save_col:
+                    save = st.form_submit_button(
+                        "保存", type="primary", use_container_width=True
+                    )
+                with cancel_col:
+                    cancel = st.form_submit_button(
+                        "キャンセル", use_container_width=True
+                    )
+
+            if cancel:
+                st.session_state.pop(add_key, None)
+                st.rerun()
+            if save:
+                if not clean_value(product_name, blank_text="").strip():
+                    st.warning("商品名を入力してください。")
+                else:
+                    after = {
+                        "proposal_date": proposal_date,
+                        "product_name": product_name,
+                        "manufacturer": manufacturer,
+                        "unit_price": unit_price,
+                        "price_unit": price_unit,
+                        "remarks": remarks,
+                    }
+                    try:
+                        save_customer_estimate(
+                            customer_name,
+                            customer_key,
+                            proposal_date,
+                            product_name,
+                            manufacturer,
+                            unit_price,
+                            price_unit,
+                            remarks,
+                        )
+                        remember_change_history_warning(
+                            record_change_history_safely(
+                                "顧客",
+                                customer_key or "",
+                                customer_name,
+                                "追加",
+                                estimate_history_changes({}, after),
+                                section="提案・見積り",
+                            )
+                        )
+                        st.session_state.pop(add_key, None)
+                        st.session_state[success_key] = "見積りを保存しました。"
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(f"見積りを保存できませんでした：{exc}")
+
+        if not estimates:
+            st.info("提案・見積りはまだありません。")
+            return
+
+        active_edit_id = st.session_state.get(edit_key)
+        active_delete_id = st.session_state.get(delete_key)
+
+        for estimate in estimates:
+            estimate_id = estimate["id"]
+            with st.container(border=True):
+                if active_edit_id == estimate_id:
+                    st.markdown("**見積りを編集**")
+                    with st.form(f"estimate_edit_form_{estimate_id}"):
+                        proposal_date = st.date_input(
+                            "提案日",
+                            value=estimate_date_input_value(estimate.get("proposal_date")),
+                        )
+                        product_name = st.text_input(
+                            "商品名", value=estimate.get("product_name", "")
+                        )
+                        manufacturer = st.text_input(
+                            "メーカー", value=estimate.get("manufacturer", "")
+                        )
+                        price_col, unit_col = st.columns(2)
+                        with price_col:
+                            unit_price = st.text_input(
+                                "単価", value=estimate.get("unit_price", "")
+                            )
+                        with unit_col:
+                            price_unit = st.text_input(
+                                "単価の単位", value=estimate.get("price_unit", "")
+                            )
+                        remarks = st.text_area(
+                            "備考", value=estimate.get("remarks", ""), height=110
+                        )
+                        save_col, cancel_col = st.columns(2)
+                        with save_col:
+                            save = st.form_submit_button(
+                                "保存", type="primary", use_container_width=True
+                            )
+                        with cancel_col:
+                            cancel = st.form_submit_button(
+                                "キャンセル", use_container_width=True
+                            )
+
+                    if cancel:
+                        st.session_state.pop(edit_key, None)
+                        st.rerun()
+                    if save:
+                        if not clean_value(product_name, blank_text="").strip():
+                            st.warning("商品名を入力してください。")
+                        else:
+                            after = {
+                                "proposal_date": proposal_date,
+                                "product_name": product_name,
+                                "manufacturer": manufacturer,
+                                "unit_price": unit_price,
+                                "price_unit": price_unit,
+                                "remarks": remarks,
+                            }
+                            changes = estimate_history_changes(estimate, after)
+                            if not changes:
+                                st.warning("変更された項目がありません。")
+                            else:
+                                try:
+                                    save_customer_estimate(
+                                        customer_name,
+                                        customer_key,
+                                        proposal_date,
+                                        product_name,
+                                        manufacturer,
+                                        unit_price,
+                                        price_unit,
+                                        remarks,
+                                        existing=estimate,
+                                    )
+                                    remember_change_history_warning(
+                                        record_change_history_safely(
+                                            "顧客",
+                                            customer_key or "",
+                                            customer_name,
+                                            "変更",
+                                            changes,
+                                            section="提案・見積り",
+                                        )
+                                    )
+                                    st.session_state.pop(edit_key, None)
+                                    st.session_state[success_key] = "見積りを保存しました。"
+                                    st.rerun()
+                                except Exception as exc:
+                                    st.error(f"見積りを保存できませんでした：{exc}")
+                    continue
+
+                st.markdown(
+                    f"**{html.escape(estimate.get('product_name') or '商品名未入力')}**"
+                )
+                st.caption(f"提案日：{format_estimate_date(estimate.get('proposal_date'))}")
+                info_col, price_col = st.columns(2)
+                with info_col:
+                    st.caption("メーカー")
+                    st.write(estimate.get("manufacturer") or "未入力")
+                with price_col:
+                    st.caption("単価")
+                    st.write(estimate_price_label(estimate))
+                if estimate.get("remarks"):
+                    st.caption("備考")
+                    st.write(estimate["remarks"])
+
+                edit_col, delete_col = st.columns(2)
+                with edit_col:
+                    if st.button(
+                        "編集",
+                        key=f"estimate_edit_button_{estimate_id}",
+                        use_container_width=True,
+                    ):
+                        st.session_state[edit_key] = estimate_id
+                        st.session_state.pop(add_key, None)
+                        st.session_state.pop(delete_key, None)
+                        st.rerun()
+                with delete_col:
+                    if active_delete_id == estimate_id:
+                        st.warning("この見積りを削除しますか？")
+                        confirm_col, cancel_col = st.columns(2)
+                        with confirm_col:
+                            if st.button(
+                                "削除する",
+                                key=f"estimate_delete_confirm_{estimate_id}",
+                                use_container_width=True,
+                            ):
+                                try:
+                                    delete_customer_estimate(estimate)
+                                    remember_change_history_warning(
+                                        record_change_history_safely(
+                                            "顧客",
+                                            customer_key or "",
+                                            customer_name,
+                                            "削除",
+                                            estimate_history_changes(estimate, {}),
+                                            section="提案・見積り",
+                                        )
+                                    )
+                                    st.session_state.pop(delete_key, None)
+                                    st.session_state[success_key] = "見積りを削除しました。"
+                                    st.rerun()
+                                except Exception as exc:
+                                    st.error(f"見積りを削除できませんでした：{exc}")
+                        with cancel_col:
+                            if st.button(
+                                "キャンセル",
+                                key=f"estimate_delete_cancel_{estimate_id}",
+                                use_container_width=True,
+                            ):
+                                st.session_state.pop(delete_key, None)
+                                st.rerun()
+                    elif st.button(
+                        "削除",
+                        key=f"estimate_delete_button_{estimate_id}",
+                        use_container_width=True,
+                    ):
+                        st.session_state[delete_key] = estimate_id
+                        st.session_state.pop(add_key, None)
+                        st.session_state.pop(edit_key, None)
+                        st.rerun()
+
+
+def estimate_rows_to_dataframe(rows):
+    records = []
+    for row in rows or []:
+        estimate = parse_estimate_item(row)
+        if not estimate:
+            continue
+        records.append(
+            {
+                "提案日": estimate.get("proposal_date", ""),
+                "顧客ID": estimate.get("customer_key", ""),
+                "顧客名": estimate.get("customer_name", ""),
+                "商品名": estimate.get("product_name", ""),
+                "メーカー": estimate.get("manufacturer", ""),
+                "単価": estimate.get("unit_price", ""),
+                "単価の単位": estimate.get("price_unit", ""),
+                "備考": estimate.get("remarks", ""),
+                "保存ID": estimate.get("id", ""),
+                "作成日時": estimate.get("created_at", ""),
+                "更新日時": estimate.get("updated_at", ""),
+            }
+        )
+    records.sort(
+        key=lambda record: (
+            estimate_date_text(record.get("提案日")),
+            str(record.get("更新日時") or record.get("作成日時") or ""),
+        ),
+        reverse=True,
+    )
+    return backup_dataframe(
+        records,
+        [
+            "提案日", "顧客ID", "顧客名", "商品名", "メーカー",
+            "単価", "単価の単位", "備考", "保存ID", "作成日時", "更新日時",
+        ],
+    )
+
+
+def show_estimates_page():
+    st.header("📄 提案・見積り")
+    st.caption("全顧客の提案・見積りを、提案日の新しい順に表示します。")
+
+    if not has_supabase_config():
+        st.warning("提案・見積りを使うにはSupabase設定が必要です。")
+        return
+
+    try:
+        rows = load_all_estimates_from_supabase()
+    except Exception as exc:
+        st.error(str(exc))
+        return
+
+    estimates = []
+    for row in rows:
+        parsed = parse_estimate_item(row)
+        if parsed:
+            estimates.append(parsed)
+    estimates.sort(key=estimate_sort_key, reverse=True)
+
+    if not estimates:
+        st.info("提案・見積りはまだありません。")
+        return
+
+    st.write(f"見積り：{len(estimates)}件")
+    for estimate in estimates:
+        with st.container(border=True):
+            customer_name = estimate.get("customer_name") or "顧客名未設定"
+            customer_link = build_customer_detail_link(
+                customer_name,
+                class_name="dispatch-month-link",
+            )
+            st.markdown(customer_link, unsafe_allow_html=True)
+            st.markdown(
+                f"**{html.escape(estimate.get('product_name') or '商品名未入力')}**"
+            )
+            st.caption(f"提案日：{format_estimate_date(estimate.get('proposal_date'))}")
+            info_col, price_col = st.columns(2)
+            with info_col:
+                st.caption("メーカー")
+                st.write(estimate.get("manufacturer") or "未入力")
+            with price_col:
+                st.caption("単価")
+                st.write(estimate_price_label(estimate))
+            if estimate.get("remarks"):
+                st.caption("備考")
+                st.write(estimate["remarks"])
+
+
 def render_customer_information_form(customer_name, customer_key, items, state_suffix):
     add_key = f"customer_information_add_{state_suffix}"
     if not st.session_state.get(add_key):
@@ -3259,7 +3852,10 @@ def render_customer_information_card(customer_name, customer_key=None):
 
         try:
             items = load_customer_information(customer_name, customer_key)
-            items = [item for item in items if not is_past_product_note_item(item)]
+            items = [
+                item for item in items
+                if not is_past_product_note_item(item) and not is_estimate_item(item)
+            ]
         except Exception as exc:
             st.warning(str(exc))
             return
@@ -3900,6 +4496,7 @@ def sync_page_from_query_params():
         "carrier_register",
         "partner_detail",
         "change_history",
+        "estimates",
         "data_backup",
     }
 
@@ -4395,6 +4992,7 @@ def show_customer_detail(df, customer_name):
 
     customer_key = get_stable_customer_key(detail)
     render_customer_information_card(customer_name, customer_key)
+    render_customer_estimates_section(customer_name, customer_key)
 
     # WATER itのポイント名と顧客名が一致する場合だけ、最新値を読み取り専用で表示する。
     render_customer_water_it_card(customer_name)
@@ -10498,9 +11096,11 @@ def show_top_home():
         st.markdown(render_page_link("🚚 運送会社", page="carrier_home"), unsafe_allow_html=True)
     with col4:
         st.markdown(render_page_link("📝 取引先メモ", page="trade_notes"), unsafe_allow_html=True)
-    col5, _ = st.columns(2)
+    col5, col6 = st.columns(2)
     with col5:
         st.markdown(render_page_link("🕘 変更確認", page="change_history"), unsafe_allow_html=True)
+    with col6:
+        st.markdown(render_page_link("📄 見積り", page="estimates"), unsafe_allow_html=True)
 
 
 # =========================
@@ -10927,6 +11527,7 @@ def create_full_data_backup_zip():
     notes_df, line_df = backup_build_note_exports(raw_notes)
     product_usage_df = backup_build_product_usage(customer_df)
     calendar_df = backup_build_calendar_export(customer_df)
+    estimates_df = estimate_rows_to_dataframe(customer_information)
 
     backup_add_entry(entries, f"元Excel/{main_name}", main_excel, "顧客・在庫の元Excel")
     backup_add_entry(entries, f"元Excel/{dispatch_name}", dispatch_excel, "配車表の元Excel")
@@ -10942,7 +11543,7 @@ def create_full_data_backup_zip():
         ("CSV/06_ソリュブル顧客概要.csv", soluble_summary_df, "ソリュブル顧客の概要"),
         ("CSV/07_WATER_it表示データ.csv", water_df, "アプリで表示できるWATER it情報（元CSVは含まない）"),
         ("CSV/08_WATER_it保存メタデータ.csv", backup_dataframe(water_metadata), "WATER it保存データの概要のみ"),
-        ("CSV/09_顧客情報_Supabase生データ.csv", backup_dataframe(customer_information), "顧客情報・過去商品メモの生データ"),
+        ("CSV/09_顧客情報_Supabase生データ.csv", backup_dataframe(customer_information), "顧客情報・過去商品メモ・提案見積りの生データ"),
         ("CSV/10_メモ_Supabase生データ.csv", notes_df, "通常メモ・取引先メモの生データ"),
         ("CSV/11_LINE状態.csv", line_df, "LINE接続状態"),
     ]
@@ -10974,6 +11575,11 @@ def create_full_data_backup_zip():
                 f"CSV/{next_number + 1:02d}_変更履歴_Supabase生データ.csv",
                 backup_dataframe(change_history_rows),
                 "変更履歴のSupabase生データ",
+            ),
+            (
+                f"CSV/{next_number + 2:02d}_提案見積り.csv",
+                estimates_df,
+                "顧客ごとの提案・見積り一覧",
             ),
         ]
     )
@@ -11296,6 +11902,9 @@ try:
 
     elif st.session_state["page"] == "change_history":
         show_change_history_page()
+
+    elif st.session_state["page"] == "estimates":
+        show_estimates_page()
 
     elif st.session_state["page"] == "data_backup":
         show_full_data_backup_page()
