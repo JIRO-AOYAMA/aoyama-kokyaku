@@ -733,6 +733,26 @@ def download_onedrive_thumbnail(access_token, item_id):
     return image_response.content
 
 
+@st.dialog("画像を表示", width="large")
+def show_onedrive_image_dialog(image_content, filename):
+    """現在の画面位置を保ったまま、画像だけを大きく表示する。"""
+    st.image(image_content, caption=filename, use_column_width=True)
+
+
+@st.dialog("PDFを表示", width="large")
+def show_onedrive_pdf_dialog(pdf_content, filename, mime_type, metadata_id):
+    """現在の画面位置を保ったまま、PDFをダイアログ内に表示する。"""
+    render_onedrive_pdf_inline(pdf_content, filename)
+    st.download_button(
+        "PDFを端末に保存",
+        data=pdf_content,
+        file_name=filename,
+        mime=mime_type or "application/pdf",
+        use_container_width=True,
+        key=f"onedrive_attachment_pdf_dialog_download_{metadata_id}",
+    )
+
+
 # Microsoftから戻った時は、アプリの共通パスワード画面より先に認証を完了する。
 process_onedrive_callback_if_present()
 
@@ -3651,8 +3671,6 @@ def render_customer_attachments_section(customer_name, customer_key=None):
     edit_key = f"onedrive_attachment_edit_{suffix}"
     delete_key = f"onedrive_attachment_delete_{suffix}"
     limit_key = f"onedrive_attachment_limit_{suffix}"
-    preview_key = f"onedrive_attachment_preview_{suffix}"
-    preview_data_key = f"onedrive_attachment_preview_data_{suffix}"
 
     if not has_supabase_config():
         with st.expander("📎 写真・資料"):
@@ -3724,20 +3742,14 @@ def render_customer_attachments_section(customer_name, customer_key=None):
                 st.error(f"OneDriveへの接続を開始できませんでした：{exc}")
         else:
             st.markdown("#### 追加")
-            source_mode = st.radio(
-                "追加方法",
-                ["写真を撮る", "画像・PDFを選ぶ"],
-                horizontal=True,
-                key=f"onedrive_attachment_source_{suffix}",
-            )
             camera_file = None
             selected_file = None
-            if source_mode == "写真を撮る":
+            with st.popover("📷 写真を撮る", use_container_width=True):
                 camera_file = st.camera_input(
                     "カメラで撮影",
                     key=f"onedrive_attachment_camera_{suffix}",
                 )
-            else:
+            with st.popover("🖼 画像・PDFを選ぶ", use_container_width=True):
                 selected_file = st.file_uploader(
                     "画像またはPDFを1つ選択",
                     type=["jpg", "jpeg", "png", "webp", "pdf"],
@@ -3767,7 +3779,7 @@ def render_customer_attachments_section(customer_name, customer_key=None):
                 use_container_width=True,
                 key=f"onedrive_attachment_upload_{suffix}",
             ):
-                uploaded = camera_file if source_mode == "写真を撮る" else selected_file
+                uploaded = camera_file if camera_file is not None else selected_file
                 if uploaded is None:
                     st.warning("写真を撮るか、画像・PDFを選んでください。")
                 else:
@@ -3834,7 +3846,6 @@ def render_customer_attachments_section(customer_name, customer_key=None):
         limit = int(st.session_state.get(limit_key, ONEDRIVE_PAGE_SIZE))
         active_edit_id = st.session_state.get(edit_key)
         active_delete_id = st.session_state.get(delete_key)
-        active_preview_id = st.session_state.get(preview_key)
 
         if not filtered:
             st.info("条件に一致する写真・資料はありません。")
@@ -3867,12 +3878,8 @@ def render_customer_attachments_section(customer_name, customer_key=None):
                 if attachment.get("remarks"):
                     st.write(attachment["remarks"])
                 preview_label = (
-                    "画像を閉じる"
-                    if attachment.get("file_type") == "image" and active_preview_id == metadata_id
-                    else "画像を大きく表示"
+                    "画像を大きく表示"
                     if attachment.get("file_type") == "image"
-                    else "PDFを閉じる"
-                    if active_preview_id == metadata_id
                     else "PDFを表示"
                 )
                 if st.button(
@@ -3880,50 +3887,23 @@ def render_customer_attachments_section(customer_name, customer_key=None):
                     key=f"onedrive_attachment_preview_button_{metadata_id}",
                     use_container_width=True,
                 ):
-                    if active_preview_id == metadata_id:
-                        st.session_state.pop(preview_key, None)
-                        st.session_state.pop(preview_data_key, None)
-                    else:
-                        st.session_state[preview_key] = metadata_id
-                        st.session_state.pop(preview_data_key, None)
-                    st.rerun()
-
-                if active_preview_id == metadata_id:
                     if not access_token or not item_id:
                         st.error("表示するにはOneDriveへ接続してください。")
                     else:
-                        preview_data = st.session_state.get(preview_data_key)
-                        if not (
-                            isinstance(preview_data, dict)
-                            and preview_data.get("metadata_id") == metadata_id
-                            and isinstance(preview_data.get("content"), bytes)
-                        ):
-                            try:
-                                with st.spinner("ファイルを読み込んでいます…"):
-                                    content = download_onedrive_file(access_token, item_id)
-                                preview_data = {
-                                    "metadata_id": metadata_id,
-                                    "content": content,
-                                }
-                                st.session_state[preview_data_key] = preview_data
-                            except Exception as exc:
-                                preview_data = None
-                                st.error(f"表示できませんでした：{exc}")
-
-                        if isinstance(preview_data, dict):
-                            content = preview_data.get("content", b"")
+                        try:
+                            with st.spinner("ファイルを読み込んでいます…"):
+                                content = download_onedrive_file(access_token, item_id)
                             if attachment.get("file_type") == "image":
-                                st.image(content, caption=filename, use_column_width=True)
+                                show_onedrive_image_dialog(content, filename)
                             else:
-                                render_onedrive_pdf_inline(content, filename)
-                                st.download_button(
-                                    "PDFを端末に保存",
-                                    data=content,
-                                    file_name=filename,
-                                    mime=attachment.get("mime_type") or "application/pdf",
-                                    use_container_width=True,
-                                    key=f"onedrive_attachment_pdf_download_{metadata_id}",
+                                show_onedrive_pdf_dialog(
+                                    content,
+                                    filename,
+                                    attachment.get("mime_type") or "application/pdf",
+                                    metadata_id,
                                 )
+                        except Exception as exc:
+                            st.error(f"表示できませんでした：{exc}")
 
                 if active_edit_id == metadata_id:
                     current_fixed = [tag for tag in attachment.get("tags", []) if tag in ONEDRIVE_FIXED_TAGS]
@@ -4021,9 +4001,6 @@ def render_customer_attachments_section(customer_name, customer_key=None):
                                     )
                                     st.session_state.pop(delete_key, None)
                                     st.session_state.pop(f"onedrive_thumbnail_{item_id}", None)
-                                    if st.session_state.get(preview_key) == metadata_id:
-                                        st.session_state.pop(preview_key, None)
-                                        st.session_state.pop(preview_data_key, None)
                                     st.session_state[success_key] = "写真・資料を削除しました。"
                                     st.rerun()
                                 except Exception as exc:
