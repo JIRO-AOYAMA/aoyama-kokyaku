@@ -745,10 +745,313 @@ def download_onedrive_thumbnail(access_token, item_id):
     return image_response.content
 
 
-@st.dialog("画像を表示", width="large")
 def show_onedrive_image_dialog(image_content, filename):
-    """現在の画面位置を保ったまま、画像だけを大きく表示する。"""
-    st.image(image_content, caption=filename, use_column_width=True)
+    """ページを移動せず、ピンチ操作対応の全画面画像ビューアーを開く。"""
+    image_bytes = bytes(image_content or b"")
+    if not image_bytes:
+        st.error("画像データが空のため表示できません。")
+        return
+
+    guessed_type = mimetypes.guess_type(str(filename or ""))[0] or "image/jpeg"
+    if not str(guessed_type).startswith("image/"):
+        guessed_type = "image/jpeg"
+    encoded = base64.b64encode(image_bytes).decode("ascii")
+    image_data_url = f"data:{guessed_type};base64,{encoded}"
+    viewer_id = "onedrive_fullscreen_image_" + hashlib.sha256(
+        (str(filename or "") + str(len(image_bytes))).encode("utf-8")
+    ).hexdigest()[:16]
+
+    # components.html の小さなiframe内ではなく、親画面へ全画面ビューアーを配置する。
+    # そのため、スマホでも画面全体を使い、ピンチ・パン・ダブルタップができる。
+    components.html(
+        f"""
+        <script>
+        (() => {{
+          const parentWindow = window.parent;
+          const parentDocument = parentWindow.document;
+          const viewerId = {json.dumps(viewer_id)};
+          const imageUrl = {json.dumps(image_data_url)};
+          const filename = {json.dumps(str(filename or "画像"))};
+
+          const previousViewer = parentDocument.getElementById(viewerId);
+          if (previousViewer) previousViewer.remove();
+          const anyViewer = parentDocument.querySelector('[data-onedrive-fullscreen-viewer="1"]');
+          if (anyViewer) anyViewer.remove();
+
+          const oldOverflow = parentDocument.body.style.overflow;
+          const overlay = parentDocument.createElement('div');
+          overlay.id = viewerId;
+          overlay.dataset.onedriveFullscreenViewer = '1';
+          overlay.setAttribute('role', 'dialog');
+          overlay.setAttribute('aria-modal', 'true');
+          overlay.setAttribute('aria-label', '画像を全画面表示');
+          overlay.innerHTML = `
+            <div class="odv-stage">
+              <img class="odv-image" alt="">
+            </div>
+            <div class="odv-toolbar">
+              <div class="odv-filename"></div>
+              <button class="odv-fullscreen" type="button" aria-label="全画面表示">⛶</button>
+              <button class="odv-close" type="button" aria-label="閉じる">×</button>
+            </div>
+            <div class="odv-help">2本指で拡大・縮小　ダブルタップで切替</div>
+          `;
+
+          const style = parentDocument.createElement('style');
+          style.textContent = `
+            #${{viewerId}} {{
+              position: fixed;
+              inset: 0;
+              z-index: 2147483647;
+              width: 100vw;
+              height: 100dvh;
+              background: #000;
+              overflow: hidden;
+              overscroll-behavior: none;
+              touch-action: none;
+              -webkit-user-select: none;
+              user-select: none;
+            }}
+            #${{viewerId}} .odv-stage {{
+              position: absolute;
+              inset: 0;
+              display: flex;
+              align-items: center;
+              justify-content: center;
+              overflow: hidden;
+              touch-action: none;
+            }}
+            #${{viewerId}} .odv-image {{
+              display: block;
+              max-width: 100vw;
+              max-height: 100dvh;
+              width: auto;
+              height: auto;
+              object-fit: contain;
+              transform-origin: center center;
+              will-change: transform;
+              pointer-events: none;
+              -webkit-user-drag: none;
+            }}
+            #${{viewerId}} .odv-toolbar {{
+              position: absolute;
+              top: 0;
+              left: 0;
+              right: 0;
+              min-height: 58px;
+              display: flex;
+              align-items: center;
+              gap: 8px;
+              padding: max(8px, env(safe-area-inset-top)) 10px 8px 14px;
+              box-sizing: border-box;
+              color: #fff;
+              background: linear-gradient(rgba(0,0,0,.78), rgba(0,0,0,0));
+              font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+            }}
+            #${{viewerId}} .odv-filename {{
+              flex: 1;
+              min-width: 0;
+              overflow: hidden;
+              text-overflow: ellipsis;
+              white-space: nowrap;
+              font-size: 14px;
+              text-shadow: 0 1px 2px #000;
+            }}
+            #${{viewerId}} button {{
+              width: 44px;
+              height: 44px;
+              flex: 0 0 44px;
+              border: 0;
+              border-radius: 22px;
+              background: rgba(35,35,35,.78);
+              color: #fff;
+              font-size: 28px;
+              line-height: 1;
+              cursor: pointer;
+              touch-action: manipulation;
+            }}
+            #${{viewerId}} .odv-fullscreen {{ font-size: 22px; }}
+            #${{viewerId}} .odv-help {{
+              position: absolute;
+              left: 50%;
+              bottom: max(16px, env(safe-area-inset-bottom));
+              transform: translateX(-50%);
+              max-width: calc(100vw - 32px);
+              padding: 7px 12px;
+              border-radius: 16px;
+              color: #fff;
+              background: rgba(20,20,20,.68);
+              font: 13px/1.4 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+              white-space: nowrap;
+              pointer-events: none;
+              opacity: 1;
+              transition: opacity .35s ease;
+            }}
+            @media (min-width: 900px) {{
+              #${{viewerId}} .odv-help {{ font-size: 14px; }}
+            }}
+          `;
+          overlay.appendChild(style);
+          parentDocument.body.appendChild(overlay);
+          parentDocument.body.style.overflow = 'hidden';
+
+          const stage = overlay.querySelector('.odv-stage');
+          const image = overlay.querySelector('.odv-image');
+          const closeButton = overlay.querySelector('.odv-close');
+          const fullscreenButton = overlay.querySelector('.odv-fullscreen');
+          const filenameNode = overlay.querySelector('.odv-filename');
+          const helpNode = overlay.querySelector('.odv-help');
+          image.alt = filename;
+          image.src = imageUrl;
+          filenameNode.textContent = filename;
+
+          let scale = 1;
+          let translateX = 0;
+          let translateY = 0;
+          let lastTapAt = 0;
+          let lastTapX = 0;
+          let lastTapY = 0;
+          let helpTimer = parentWindow.setTimeout(() => {{
+            helpNode.style.opacity = '0';
+          }}, 2400);
+          const pointers = new Map();
+          let lastSinglePoint = null;
+          let lastPinchDistance = 0;
+          let lastPinchMidpoint = null;
+
+          const clamp = (value, min, max) => Math.min(max, Math.max(min, value));
+          const applyTransform = () => {{
+            image.style.transform = `translate3d(${{translateX}}px, ${{translateY}}px, 0) scale(${{scale}})`;
+          }};
+          const resetView = () => {{
+            scale = 1;
+            translateX = 0;
+            translateY = 0;
+            applyTransform();
+          }};
+          const zoomAt = (newScale, clientX, clientY) => {{
+            newScale = clamp(newScale, 1, 8);
+            const rect = stage.getBoundingClientRect();
+            const centerX = rect.left + rect.width / 2;
+            const centerY = rect.top + rect.height / 2;
+            const ratio = newScale / scale;
+            translateX = (clientX - centerX) - ((clientX - centerX) - translateX) * ratio;
+            translateY = (clientY - centerY) - ((clientY - centerY) - translateY) * ratio;
+            scale = newScale;
+            if (scale <= 1.001) resetView();
+            else applyTransform();
+          }};
+          const midpoint = (a, b) => ({{
+            x: (a.x + b.x) / 2,
+            y: (a.y + b.y) / 2
+          }});
+          const distance = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+
+          const closeViewer = () => {{
+            parentWindow.clearTimeout(helpTimer);
+            parentDocument.removeEventListener('keydown', onKeyDown, true);
+            if (parentDocument.fullscreenElement === overlay && parentDocument.exitFullscreen) {{
+              parentDocument.exitFullscreen().catch(() => {{}});
+            }}
+            parentDocument.body.style.overflow = oldOverflow;
+            overlay.remove();
+          }};
+          const onKeyDown = (event) => {{
+            if (event.key === 'Escape') closeViewer();
+          }};
+          parentDocument.addEventListener('keydown', onKeyDown, true);
+          closeButton.addEventListener('click', closeViewer);
+
+          fullscreenButton.addEventListener('click', async () => {{
+            try {{
+              if (parentDocument.fullscreenElement) {{
+                await parentDocument.exitFullscreen();
+              }} else if (overlay.requestFullscreen) {{
+                await overlay.requestFullscreen();
+              }}
+            }} catch (_) {{}}
+          }});
+
+          stage.addEventListener('pointerdown', (event) => {{
+            event.preventDefault();
+            stage.setPointerCapture?.(event.pointerId);
+            pointers.set(event.pointerId, {{x: event.clientX, y: event.clientY}});
+            if (pointers.size === 1) {{
+              lastSinglePoint = {{x: event.clientX, y: event.clientY}};
+            }} else if (pointers.size === 2) {{
+              const values = Array.from(pointers.values());
+              lastPinchDistance = distance(values[0], values[1]);
+              lastPinchMidpoint = midpoint(values[0], values[1]);
+            }}
+          }}, {{passive: false}});
+
+          stage.addEventListener('pointermove', (event) => {{
+            if (!pointers.has(event.pointerId)) return;
+            event.preventDefault();
+            pointers.set(event.pointerId, {{x: event.clientX, y: event.clientY}});
+            if (pointers.size >= 2) {{
+              const values = Array.from(pointers.values()).slice(0, 2);
+              const currentDistance = distance(values[0], values[1]);
+              const currentMidpoint = midpoint(values[0], values[1]);
+              if (lastPinchDistance > 0 && lastPinchMidpoint) {{
+                const targetScale = scale * (currentDistance / lastPinchDistance);
+                zoomAt(targetScale, currentMidpoint.x, currentMidpoint.y);
+                translateX += currentMidpoint.x - lastPinchMidpoint.x;
+                translateY += currentMidpoint.y - lastPinchMidpoint.y;
+                applyTransform();
+              }}
+              lastPinchDistance = currentDistance;
+              lastPinchMidpoint = currentMidpoint;
+              lastSinglePoint = null;
+            }} else if (pointers.size === 1 && lastSinglePoint && scale > 1) {{
+              translateX += event.clientX - lastSinglePoint.x;
+              translateY += event.clientY - lastSinglePoint.y;
+              lastSinglePoint = {{x: event.clientX, y: event.clientY}};
+              applyTransform();
+            }}
+          }}, {{passive: false}});
+
+          const finishPointer = (event) => {{
+            const point = pointers.get(event.pointerId) || {{x: event.clientX, y: event.clientY}};
+            pointers.delete(event.pointerId);
+            if (pointers.size === 1) {{
+              const remaining = Array.from(pointers.values())[0];
+              lastSinglePoint = {{x: remaining.x, y: remaining.y}};
+              lastPinchDistance = 0;
+              lastPinchMidpoint = null;
+            }} else if (pointers.size === 0) {{
+              lastSinglePoint = null;
+              lastPinchDistance = 0;
+              lastPinchMidpoint = null;
+              const now = Date.now();
+              if (now - lastTapAt < 320 && Math.hypot(point.x - lastTapX, point.y - lastTapY) < 36) {{
+                if (scale > 1.05) resetView();
+                else zoomAt(2.5, point.x, point.y);
+                lastTapAt = 0;
+              }} else {{
+                lastTapAt = now;
+                lastTapX = point.x;
+                lastTapY = point.y;
+              }}
+            }}
+          }};
+          stage.addEventListener('pointerup', finishPointer, {{passive: false}});
+          stage.addEventListener('pointercancel', finishPointer, {{passive: false}});
+
+          stage.addEventListener('wheel', (event) => {{
+            event.preventDefault();
+            const factor = event.deltaY < 0 ? 1.18 : 1 / 1.18;
+            zoomAt(scale * factor, event.clientX, event.clientY);
+          }}, {{passive: false}});
+
+          image.addEventListener('load', resetView, {{once: true}});
+        }})();
+        </script>
+        """,
+        height=1,
+        width=1,
+        scrolling=False,
+    )
 
 
 @st.dialog("PDFを表示", width="large")
