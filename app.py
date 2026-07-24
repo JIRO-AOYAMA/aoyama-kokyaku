@@ -1130,6 +1130,125 @@ def show_onedrive_pdf_dialog(pdf_content, filename, mime_type, metadata_id):
     )
 
 
+
+def render_onedrive_attachment_scroll_keeper(suffix, restore=False):
+    """写真・資料の削除前後で、現在の画面位置をブラウザー側に保持する。"""
+    safe_suffix = re.sub(r"[^0-9A-Za-z_-]", "", str(suffix or ""))
+    storage_key = f"onedrive_attachment_scroll_{safe_suffix}"
+    listener_key = f"__onedrive_attachment_scroll_listener_{safe_suffix}"
+    restore_script = ""
+    if restore:
+        restore_script = f"""
+          const savedY = Number(parentWindow.sessionStorage.getItem({json.dumps(storage_key)}));
+          if (Number.isFinite(savedY)) {{
+            const restorePosition = () => parentWindow.scrollTo({{top: savedY, left: 0, behavior: 'auto'}});
+            parentWindow.requestAnimationFrame(() => {{
+              restorePosition();
+              parentWindow.setTimeout(restorePosition, 80);
+              parentWindow.setTimeout(restorePosition, 240);
+            }});
+            parentWindow.sessionStorage.removeItem({json.dumps(storage_key)});
+          }}
+        """
+
+    components.html(
+        f"""
+        <script>
+        (() => {{
+          const parentWindow = window.parent;
+          const parentDocument = parentWindow.document;
+          const listenerKey = {json.dumps(listener_key)};
+          const storageKey = {json.dumps(storage_key)};
+
+          if (!parentWindow[listenerKey]) {{
+            const rememberScroll = (event) => {{
+              const button = event.target && event.target.closest
+                ? event.target.closest('button')
+                : null;
+              if (!button) return;
+              const label = (button.innerText || button.textContent || '')
+                .replace(/\\s+/g, ' ')
+                .trim();
+              if (label === '削除' || label === '削除する') {{
+                parentWindow.sessionStorage.setItem(storageKey, String(parentWindow.scrollY || 0));
+              }}
+            }};
+            parentDocument.addEventListener('click', rememberScroll, true);
+            parentWindow[listenerKey] = true;
+          }}
+
+          {restore_script}
+        }})();
+        </script>
+        """,
+        height=1,
+        width=1,
+        scrolling=False,
+    )
+
+
+@st.dialog("写真・資料を削除")
+def confirm_onedrive_attachment_delete_dialog(
+    access_token,
+    attachment,
+    customer_key,
+    customer_name,
+    success_key,
+    open_key,
+    restore_key,
+):
+    """現在位置を保ったまま、写真・資料の削除を確認して実行する。"""
+    metadata_id = attachment.get("id", "")
+    item_id = attachment.get("file_id", "")
+    filename = attachment.get("original_name", "名称未設定")
+
+    st.warning(f"「{filename}」をOneDriveから削除します。")
+    st.caption("この操作は元に戻せません。")
+    delete_col, cancel_col = st.columns(2)
+
+    with delete_col:
+        if st.button(
+            "削除する",
+            key=f"onedrive_attachment_delete_dialog_yes_{metadata_id}",
+            type="primary",
+            use_container_width=True,
+        ):
+            if not access_token:
+                st.error("削除するにはOneDriveへ接続してください。")
+            else:
+                try:
+                    with st.spinner("削除しています…"):
+                        delete_onedrive_file(access_token, item_id)
+                        delete_customer_information(metadata_id)
+                    remember_change_history_warning(
+                        record_change_history_safely(
+                            "顧客",
+                            customer_key or "",
+                            customer_name,
+                            "削除",
+                            {"ファイル": (filename, "")},
+                            section="写真・資料",
+                        )
+                    )
+                    st.session_state.pop(f"onedrive_thumbnail_{item_id}", None)
+                    st.session_state[success_key] = "写真・資料を削除しました。"
+                    st.session_state[open_key] = True
+                    st.session_state[restore_key] = True
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"削除できませんでした：{exc}")
+
+    with cancel_col:
+        if st.button(
+            "キャンセル",
+            key=f"onedrive_attachment_delete_dialog_no_{metadata_id}",
+            use_container_width=True,
+        ):
+            st.session_state[open_key] = True
+            st.session_state[restore_key] = True
+            st.rerun()
+
+
 # Microsoftから戻った時は、アプリの共通パスワード画面より先に認証を完了する。
 process_onedrive_callback_if_present()
 
@@ -4046,8 +4165,9 @@ def render_customer_attachments_section(customer_name, customer_key=None):
     suffix = hashlib.sha256(str(identity).encode("utf-8")).hexdigest()[:16]
     success_key = f"onedrive_attachment_success_{suffix}"
     edit_key = f"onedrive_attachment_edit_{suffix}"
-    delete_key = f"onedrive_attachment_delete_{suffix}"
     limit_key = f"onedrive_attachment_limit_{suffix}"
+    open_key = f"onedrive_attachment_force_open_{suffix}"
+    restore_key = f"onedrive_attachment_restore_scroll_{suffix}"
 
     if not has_supabase_config():
         with st.expander("📎 写真・資料"):
@@ -4061,7 +4181,10 @@ def render_customer_attachments_section(customer_name, customer_key=None):
             st.warning(f"写真・資料の一覧を読み込めませんでした：{exc}")
         return
 
-    with st.expander(f"📎 写真・資料　{len(attachments)}件", expanded=False):
+    force_open = bool(st.session_state.pop(open_key, False))
+    restore_scroll = bool(st.session_state.pop(restore_key, False))
+    with st.expander(f"📎 写真・資料　{len(attachments)}件", expanded=force_open):
+        render_onedrive_attachment_scroll_keeper(suffix, restore=restore_scroll)
         success_message = st.session_state.pop(success_key, None)
         if success_message:
             st.success(success_message)
@@ -4234,7 +4357,6 @@ def render_customer_attachments_section(customer_name, customer_key=None):
 
         limit = int(st.session_state.get(limit_key, ONEDRIVE_PAGE_SIZE))
         active_edit_id = st.session_state.get(edit_key)
-        active_delete_id = st.session_state.get(delete_key)
 
         if not filtered:
             st.info("条件に一致する写真・資料はありません。")
@@ -4361,49 +4483,6 @@ def render_customer_attachments_section(customer_name, customer_key=None):
                             st.rerun()
                     continue
 
-                if active_delete_id == metadata_id:
-                    st.warning(f"「{filename}」をOneDriveから削除します。")
-                    delete_col, cancel_col = st.columns(2)
-                    with delete_col:
-                        if st.button(
-                            "削除する",
-                            key=f"onedrive_attachment_delete_yes_{metadata_id}",
-                            type="primary",
-                            use_container_width=True,
-                        ):
-                            if not access_token:
-                                st.error("削除するにはOneDriveへ接続してください。")
-                            else:
-                                try:
-                                    with st.spinner("削除しています…"):
-                                        delete_onedrive_file(access_token, item_id)
-                                        delete_customer_information(metadata_id)
-                                    remember_change_history_warning(
-                                        record_change_history_safely(
-                                            "顧客",
-                                            customer_key or "",
-                                            customer_name,
-                                            "削除",
-                                            {"ファイル": (filename, "")},
-                                            section="写真・資料",
-                                        )
-                                    )
-                                    st.session_state.pop(delete_key, None)
-                                    st.session_state.pop(f"onedrive_thumbnail_{item_id}", None)
-                                    st.session_state[success_key] = "写真・資料を削除しました。"
-                                    st.rerun()
-                                except Exception as exc:
-                                    st.error(f"削除できませんでした：{exc}")
-                    with cancel_col:
-                        if st.button(
-                            "キャンセル",
-                            key=f"onedrive_attachment_delete_no_{metadata_id}",
-                            use_container_width=True,
-                        ):
-                            st.session_state.pop(delete_key, None)
-                            st.rerun()
-                    continue
-
                 action_col, delete_col = st.columns(2)
                 with action_col:
                     if st.button(
@@ -4412,7 +4491,6 @@ def render_customer_attachments_section(customer_name, customer_key=None):
                         use_container_width=True,
                     ):
                         st.session_state[edit_key] = metadata_id
-                        st.session_state.pop(delete_key, None)
                         st.rerun()
                 with delete_col:
                     if st.button(
@@ -4420,9 +4498,16 @@ def render_customer_attachments_section(customer_name, customer_key=None):
                         key=f"onedrive_attachment_delete_button_{metadata_id}",
                         use_container_width=True,
                     ):
-                        st.session_state[delete_key] = metadata_id
                         st.session_state.pop(edit_key, None)
-                        st.rerun()
+                        confirm_onedrive_attachment_delete_dialog(
+                            access_token,
+                            attachment,
+                            customer_key,
+                            customer_name,
+                            success_key,
+                            open_key,
+                            restore_key,
+                        )
 
         if len(filtered) > limit:
             if st.button(
