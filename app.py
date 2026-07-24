@@ -4881,10 +4881,18 @@ def render_customer_attachments_section(customer_name, customer_key=None):
                         attachment_date = format_attachment_datetime(
                             attachment.get("created_at")
                         ).split(" ", 1)[0]
+                        attachment_tags = normalize_attachment_tags(
+                            attachment.get("tags") or []
+                        )
+                        date_and_tags = []
                         if attachment_date:
-                            st.caption(attachment_date)
-                        if attachment.get("tags"):
-                            st.markdown(" ".join(f"`#{tag}`" for tag in attachment["tags"]))
+                            date_and_tags.append(attachment_date)
+                        if attachment_tags:
+                            date_and_tags.append(
+                                " ".join(f"`#{tag}`" for tag in attachment_tags)
+                            )
+                        if date_and_tags:
+                            st.caption("　".join(date_and_tags))
                         if attachment.get("remarks"):
                             st.caption(attachment["remarks"])
 
