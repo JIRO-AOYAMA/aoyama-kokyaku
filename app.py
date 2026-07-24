@@ -148,6 +148,10 @@ LINE_STATUS_NOTE_PREFIX = "line_status_"
 LINE_STATUS_BODY = "__LINE_CONNECTED__"
 VOICE_INPUT_HELP = "スマホではキーボードのマイクを押して音声入力できます。"
 PAST_PRODUCT_NOTE_PREFIX = "__past_product_note__:"
+CHANGE_HISTORY_CUSTOMER = "__CHANGE_HISTORY__"
+CHANGE_HISTORY_VERSION = 1
+CHANGE_HISTORY_PAGE_SIZE = 30
+CHANGE_HISTORY_TARGETS = ("顧客", "仕入先", "運送会社")
 
 REQUIRED_COLUMNS = [
     "ID",
@@ -2081,6 +2085,7 @@ def get_line_connected(customer_name):
 
 def save_line_connected(customer_name, connected):
     """Excelを変更せず、LINE状態だけをSupabaseへ保存する。"""
+    previous_connected = get_line_connected(customer_name)
     if not has_supabase_config():
         st.error("LINE状態を保存するための接続設定がありません。")
         return False
@@ -2121,6 +2126,15 @@ def save_line_connected(customer_name, connected):
         return False
 
     load_line_statuses_from_supabase.clear()
+    warning = record_change_history_safely(
+        "顧客",
+        "",
+        customer,
+        "変更",
+        {"LINE状態": ("○" if previous_connected else "×", "○" if connected else "×")},
+        section="LINE状態",
+    )
+    remember_change_history_warning(warning)
     return True
 
 
@@ -2396,6 +2410,348 @@ def get_supabase_customer_information_url():
     base_url = str(SUPABASE_URL or "").strip().rstrip("/")
     table_name = urllib.parse.quote(get_supabase_customer_information_table(), safe="")
     return f"{base_url}/rest/v1/{table_name}"
+
+
+def change_history_value(value):
+    """変更前後の値を、JSONと画面表示で安定して扱える文字列へ変換する。"""
+    if value is None:
+        return ""
+    if isinstance(value, float) and math.isnan(value):
+        return ""
+    if isinstance(value, pd.Timestamp):
+        value = value.to_pydatetime()
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, date):
+        return value.isoformat()
+    return str(value)
+
+
+def normalize_change_history_changes(changes):
+    """辞書または変更明細リストを、共通の変更明細リストへ整形する。"""
+    normalized = []
+    if isinstance(changes, dict):
+        iterable = []
+        for field_name, values in changes.items():
+            if isinstance(values, dict):
+                before = values.get("before")
+                after = values.get("after")
+            elif isinstance(values, (list, tuple)) and len(values) >= 2:
+                before, after = values[0], values[1]
+            else:
+                before, after = "", values
+            iterable.append(
+                {
+                    "field": field_name,
+                    "before": before,
+                    "after": after,
+                }
+            )
+    elif isinstance(changes, list):
+        iterable = changes
+    else:
+        iterable = []
+
+    for item in iterable:
+        if not isinstance(item, dict):
+            continue
+        field_name = clean_value(
+            item.get("field") or item.get("項目"),
+            blank_text="",
+        )
+        if not field_name:
+            continue
+        before = change_history_value(item.get("before"))
+        after = change_history_value(item.get("after"))
+        if before == after:
+            continue
+        normalized.append(
+            {
+                "field": field_name,
+                "before": before,
+                "after": after,
+            }
+        )
+    return normalized
+
+
+def clear_change_history_cache():
+    try:
+        load_change_history_page.clear()
+    except Exception:
+        pass
+
+
+def record_change_history(
+    target_type,
+    target_id,
+    target_name,
+    action,
+    changes,
+    section="",
+):
+    """既存のcustomer_informationテーブルへ、通常顧客情報と分離して履歴を保存する。"""
+    if not has_supabase_config():
+        raise RuntimeError("Supabase設定がないため変更履歴を保存できません。")
+
+    target_type = clean_value(target_type, blank_text="")
+    target_name = clean_value(target_name, blank_text="")
+    action = clean_value(action, blank_text="")
+    normalized_changes = normalize_change_history_changes(changes)
+    if not target_type or not target_name or not action or not normalized_changes:
+        return
+
+    now = get_jst_now().isoformat()
+    history_id = str(uuid.uuid4())
+    content = json.dumps(
+        {
+            "version": CHANGE_HISTORY_VERSION,
+            "target_type": target_type,
+            "target_id": clean_value(target_id, blank_text=""),
+            "target_name": target_name,
+            "action": action,
+            "section": clean_value(section, blank_text=""),
+            "changes": normalized_changes,
+            "source": "app",
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    payload = {
+        "id": history_id,
+        "customer_key": None,
+        "customer_name": CHANGE_HISTORY_CUSTOMER,
+        "field_name": target_type,
+        "content": content,
+        "sort_order": 0,
+        "created_at": now,
+        "updated_at": now,
+    }
+    try:
+        response = requests.post(
+            get_supabase_customer_information_url(),
+            headers=get_supabase_headers(prefer="return=minimal"),
+            json=payload,
+            timeout=30,
+        )
+    except Exception as exc:
+        raise RuntimeError("変更履歴の保存中にSupabaseへ接続できませんでした。") from exc
+    if response.status_code not in (200, 201):
+        detail = str(response.text or "").strip()[:500]
+        message = f"変更履歴を保存できませんでした（{response.status_code}）。"
+        if detail:
+            message += f" {detail}"
+        raise RuntimeError(message)
+    clear_change_history_cache()
+
+
+def record_change_history_safely(*args, **kwargs):
+    """本体の保存成功を取り消さず、履歴保存だけを警告として返す。"""
+    try:
+        record_change_history(*args, **kwargs)
+        return ""
+    except Exception as exc:
+        return f"本体の保存は完了しましたが、変更履歴を保存できませんでした：{exc}"
+
+
+def remember_change_history_warning(warning):
+    if warning:
+        st.session_state["change_history_warning"] = str(warning)
+
+
+@st.cache_data(ttl=15, show_spinner=False)
+def load_change_history_page(target_type="", start_iso="", offset=0, limit=CHANGE_HISTORY_PAGE_SIZE):
+    """変更履歴を新しい順に必要件数だけ取得する。"""
+    if not has_supabase_config():
+        raise RuntimeError("Supabase設定がありません。")
+    params = {
+        "select": "id,customer_name,field_name,content,created_at,updated_at",
+        "customer_name": f"eq.{CHANGE_HISTORY_CUSTOMER}",
+        "order": "created_at.desc,id.desc",
+        "limit": str(int(limit) + 1),
+        "offset": str(max(0, int(offset))),
+    }
+    if target_type:
+        params["field_name"] = f"eq.{target_type}"
+    if start_iso:
+        params["created_at"] = f"gte.{start_iso}"
+    try:
+        response = requests.get(
+            get_supabase_customer_information_url(),
+            headers=get_supabase_headers(),
+            params=params,
+            timeout=30,
+        )
+    except Exception as exc:
+        raise RuntimeError("変更履歴の読み込み中にSupabaseへ接続できませんでした。") from exc
+    if response.status_code != 200:
+        raise RuntimeError(
+            f"変更履歴を読み込めませんでした（{response.status_code}）。"
+        )
+    rows = response.json()
+    if not isinstance(rows, list):
+        raise RuntimeError("Supabaseから返った変更履歴の形式が正しくありません。")
+    return rows
+
+
+def parse_change_history_row(row):
+    payload = {}
+    try:
+        parsed = json.loads(str(row.get("content") or "{}"))
+        if isinstance(parsed, dict):
+            payload = parsed
+    except Exception:
+        payload = {}
+    return {
+        "id": clean_value(row.get("id"), blank_text=""),
+        "created_at": clean_value(row.get("created_at"), blank_text=""),
+        "target_type": clean_value(
+            payload.get("target_type") or row.get("field_name"),
+            blank_text="",
+        ),
+        "target_id": clean_value(payload.get("target_id"), blank_text=""),
+        "target_name": clean_value(payload.get("target_name"), blank_text=""),
+        "action": clean_value(payload.get("action"), blank_text=""),
+        "section": clean_value(payload.get("section"), blank_text=""),
+        "changes": normalize_change_history_changes(payload.get("changes", [])),
+        "raw_content": clean_value(row.get("content"), blank_text=""),
+    }
+
+
+def change_history_rows_to_dataframe(rows):
+    """変更履歴を、1変更項目につき1行のCSV向け表へ変換する。"""
+    records = []
+    for row in rows:
+        parsed = parse_change_history_row(row)
+        changes = parsed["changes"] or [
+            {"field": "解析できない履歴", "before": "", "after": parsed["raw_content"]}
+        ]
+        for change in changes:
+            records.append(
+                {
+                    "変更日時": parsed["created_at"],
+                    "対象区分": parsed["target_type"],
+                    "対象ID": parsed["target_id"],
+                    "対象名": parsed["target_name"],
+                    "操作": parsed["action"],
+                    "変更箇所": parsed["section"],
+                    "項目": change.get("field", ""),
+                    "変更前": change.get("before", ""),
+                    "変更後": change.get("after", ""),
+                    "履歴ID": parsed["id"],
+                }
+            )
+    return backup_dataframe(
+        records,
+        [
+            "変更日時", "対象区分", "対象ID", "対象名", "操作",
+            "変更箇所", "項目", "変更前", "変更後", "履歴ID",
+        ],
+    )
+
+
+def show_change_history_page():
+    st.header("🕘 変更確認")
+    st.caption("アプリから正常に保存された変更を新しい順に表示します。メモ帳は対象外です。")
+
+    target_label = st.selectbox(
+        "対象",
+        ["すべて", *CHANGE_HISTORY_TARGETS],
+        key="change_history_target_filter",
+    )
+    period_label = st.selectbox(
+        "期間",
+        ["今日", "7日間", "30日間", "すべて"],
+        index=2,
+        key="change_history_period_filter",
+    )
+    target_type = "" if target_label == "すべて" else target_label
+    now = get_jst_now()
+    if period_label == "今日":
+        start_iso = now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+    elif period_label == "7日間":
+        start_iso = (now - timedelta(days=7)).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        ).isoformat()
+    elif period_label == "30日間":
+        start_iso = (now - timedelta(days=30)).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        ).isoformat()
+    else:
+        start_iso = ""
+
+    signature = f"{target_type}|{start_iso}"
+    if st.session_state.get("change_history_filter_signature") != signature:
+        st.session_state["change_history_filter_signature"] = signature
+        st.session_state["change_history_offset"] = 0
+    offset = max(0, int(st.session_state.get("change_history_offset", 0)))
+
+    try:
+        rows = load_change_history_page(
+            target_type=target_type,
+            start_iso=start_iso,
+            offset=offset,
+            limit=CHANGE_HISTORY_PAGE_SIZE,
+        )
+    except Exception as exc:
+        st.error(str(exc))
+        return
+
+    has_next = len(rows) > CHANGE_HISTORY_PAGE_SIZE
+    visible_rows = rows[:CHANGE_HISTORY_PAGE_SIZE]
+    if not visible_rows:
+        st.info("該当する変更履歴はありません。")
+    else:
+        st.caption(
+            f"{offset + 1}件目～{offset + len(visible_rows)}件目を表示"
+        )
+        for row in visible_rows:
+            parsed = parse_change_history_row(row)
+            title = "　".join(
+                part for part in (
+                    parsed["target_type"],
+                    parsed["target_name"],
+                ) if part
+            ) or "変更履歴"
+            with st.container(border=True):
+                st.markdown(f"**{html.escape(title)}**")
+                meta = " ｜ ".join(
+                    part for part in (
+                        format_note_datetime(parsed["created_at"]),
+                        parsed["action"],
+                        parsed["section"],
+                    ) if part
+                )
+                if meta:
+                    st.caption(meta)
+                for change in parsed["changes"]:
+                    before = display_change_value(change.get("before", ""))
+                    after = display_change_value(change.get("after", ""))
+                    st.write(f"{change.get('field', '')}：{before} → {after}")
+
+    previous_col, page_col, next_col = st.columns([1, 1, 1])
+    with previous_col:
+        if st.button(
+            "← 前の30件",
+            key="change_history_previous",
+            disabled=offset == 0,
+            use_container_width=True,
+        ):
+            st.session_state["change_history_offset"] = max(
+                0, offset - CHANGE_HISTORY_PAGE_SIZE
+            )
+            st.rerun()
+    with page_col:
+        st.caption(f"ページ {offset // CHANGE_HISTORY_PAGE_SIZE + 1}")
+    with next_col:
+        if st.button(
+            "次の30件 →",
+            key="change_history_next",
+            disabled=not has_next,
+            use_container_width=True,
+        ):
+            st.session_state["change_history_offset"] = offset + CHANGE_HISTORY_PAGE_SIZE
+            st.rerun()
 
 
 def get_stable_customer_key(detail):
@@ -2788,6 +3144,16 @@ def render_customer_information_form(customer_name, customer_key, items, state_s
                 content,
                 next_order,
             )
+            remember_change_history_warning(
+                record_change_history_safely(
+                    "顧客",
+                    customer_key or "",
+                    customer_name,
+                    "追加",
+                    {str(field_name).strip(): ("", content)},
+                    section="顧客情報",
+                )
+            )
             st.session_state.pop(add_key, None)
             st.session_state[f"customer_information_success_{state_suffix}"] = "項目を追加しました。"
             st.rerun()
@@ -2872,6 +3238,24 @@ def render_customer_information_card(customer_name, customer_key=None):
                             update_customer_information(
                                 item_id, edited_name, edited_content
                             )
+                            history_changes = {}
+                            if str(edited_name).strip() != field_name:
+                                history_changes["項目名"] = (field_name, str(edited_name).strip())
+                            if str(edited_content) != content:
+                                history_changes[str(edited_name).strip() or field_name] = (
+                                    content,
+                                    edited_content,
+                                )
+                            remember_change_history_warning(
+                                record_change_history_safely(
+                                    "顧客",
+                                    customer_key or "",
+                                    customer_name,
+                                    "変更",
+                                    history_changes,
+                                    section="顧客情報",
+                                )
+                            )
                             st.session_state.pop(editing_item_key, None)
                             st.session_state[success_key] = "項目を更新しました。"
                             st.rerun()
@@ -2890,6 +3274,16 @@ def render_customer_information_card(customer_name, customer_key=None):
                     ):
                         try:
                             delete_customer_information(item_id)
+                            remember_change_history_warning(
+                                record_change_history_safely(
+                                    "顧客",
+                                    customer_key or "",
+                                    customer_name,
+                                    "削除",
+                                    {field_name: (content, "")},
+                                    section="顧客情報",
+                                )
+                            )
                             st.session_state.pop(deleting_item_key, None)
                             st.session_state[success_key] = "項目を削除しました。"
                             st.rerun()
@@ -2916,7 +3310,23 @@ def render_customer_information_card(customer_name, customer_key=None):
                         disabled=index == 0,
                     ):
                         try:
-                            reorder_customer_information(item, items[index - 1])
+                            other_item = items[index - 1]
+                            reorder_customer_information(item, other_item)
+                            remember_change_history_warning(
+                                record_change_history_safely(
+                                    "顧客",
+                                    customer_key or "",
+                                    customer_name,
+                                    "並び替え",
+                                    {
+                                        "表示順": (
+                                            f"{clean_value(other_item.get('field_name'), blank_text='')} → {field_name}",
+                                            f"{field_name} → {clean_value(other_item.get('field_name'), blank_text='')}",
+                                        )
+                                    },
+                                    section="顧客情報",
+                                )
+                            )
                             st.rerun()
                         except RuntimeError as exc:
                             st.error(str(exc))
@@ -2927,7 +3337,23 @@ def render_customer_information_card(customer_name, customer_key=None):
                         disabled=index == len(items) - 1,
                     ):
                         try:
-                            reorder_customer_information(item, items[index + 1])
+                            other_item = items[index + 1]
+                            reorder_customer_information(item, other_item)
+                            remember_change_history_warning(
+                                record_change_history_safely(
+                                    "顧客",
+                                    customer_key or "",
+                                    customer_name,
+                                    "並び替え",
+                                    {
+                                        "表示順": (
+                                            f"{field_name} → {clean_value(other_item.get('field_name'), blank_text='')}",
+                                            f"{clean_value(other_item.get('field_name'), blank_text='')} → {field_name}",
+                                        )
+                                    },
+                                    section="顧客情報",
+                                )
+                            )
                             st.rerun()
                         except RuntimeError as exc:
                             st.error(str(exc))
@@ -3404,6 +3830,7 @@ def sync_page_from_query_params():
         "carrier_condition",
         "carrier_register",
         "partner_detail",
+        "change_history",
         "data_backup",
     }
 
@@ -3562,6 +3989,14 @@ def render_customer_excel_editor(customer_name, product_name, current):
                 try:
                     with st.spinner("バックアップを作成して保存しています…"):
                         result = save_customer_excel_changes(customer_name, product_name, pending["proposed"])
+                        result["history_warning"] = record_change_history_safely(
+                            "顧客",
+                            "",
+                            customer_name,
+                            "変更",
+                            pending["changes"],
+                            section=f"商品：{product_name}",
+                        )
                     st.session_state.pop(confirm_key, None)
                     st.session_state.pop(edit_key, None)
                     st.session_state["excel_save_success"] = {
@@ -3648,6 +4083,14 @@ def render_customer_excel_editor(customer_name, product_name, current):
                         product_name,
                         proposed,
                     )
+                    result["history_warning"] = record_change_history_safely(
+                        "顧客",
+                        "",
+                        customer_name,
+                        "変更",
+                        changes,
+                        section=f"商品：{product_name}",
+                    )
                 st.session_state.pop(confirm_key, None)
                 st.session_state.pop(edit_key, None)
                 st.session_state["excel_save_success"] = {
@@ -3702,6 +4145,14 @@ def render_customer_map_editor(customer_name, current):
                             customer_name,
                             pending["住所"],
                             pending["マップ位置"],
+                        )
+                        result["history_warning"] = record_change_history_safely(
+                            "顧客",
+                            "",
+                            customer_name,
+                            "変更",
+                            pending["changes"],
+                            section="住所・マップ位置",
                         )
                     st.session_state.pop(confirm_key, None)
                     st.session_state.pop(edit_key, None)
@@ -3776,6 +4227,14 @@ def render_customer_map_editor(customer_name, current):
                         proposed_address,
                         proposed_map,
                     )
+                    result["history_warning"] = record_change_history_safely(
+                        "顧客",
+                        "",
+                        customer_name,
+                        "変更",
+                        changes,
+                        section="住所・マップ位置",
+                    )
                 st.session_state.pop(confirm_key, None)
                 st.session_state.pop(edit_key, None)
                 st.session_state["excel_save_success"] = {
@@ -3846,6 +4305,8 @@ def show_customer_detail(df, customer_name):
         st.write(f"**更新した商品名：** {success['product_name']}")
         if success.get("cleanup_warning"):
             st.warning(success["cleanup_warning"])
+        if success.get("history_warning"):
+            st.warning(success["history_warning"])
 
     try:
         map_info = get_customer_map_info(detail)
@@ -6508,6 +6969,26 @@ def render_soluble_customer_editor(customer_name, current, key_scope):
 
             with st.spinner("元ファイルをバックアップして保存しています…"):
                 changed = save_soluble_customer_changes(customer_name, updates)
+                field_map = {
+                    "delivery_date": ("配達日", current.get("配達日")),
+                    "delivery_quantity": ("配達数量", current.get("配達数量")),
+                    "usage": ("使用数量/日", current.get("使用数量/日")),
+                }
+                history_changes = {
+                    field_map[field][0]: (field_map[field][1], value)
+                    for field, value in updates.items()
+                    if field in field_map
+                }
+                remember_change_history_warning(
+                    record_change_history_safely(
+                        "顧客",
+                        "",
+                        customer_name,
+                        "変更",
+                        history_changes,
+                        section="ソリュブル",
+                    )
+                )
             st.session_state.pop(edit_key, None)
             st.session_state["soluble_customer_save_success"] = {
                 "customer_name": customer_name,
@@ -7242,6 +7723,16 @@ def render_soluble_water_it_summary(location, context):
             try:
                 with st.spinner("元ファイルをバックアップし、9:00実測値を保存・確認しています…"):
                     changed = save_soluble_water_it_baseline(location, context)
+                    remember_change_history_warning(
+                        record_change_history_safely(
+                            "顧客",
+                            "",
+                            SOLUBLE_LOCATION_DISPLAY_NAMES.get(location, location),
+                            "変更",
+                            {"在庫基準値": (baseline_excel_value, baseline_value)},
+                            section="ソリュブル在庫（WATER it実測反映）",
+                        )
+                    )
                 st.session_state["soluble_water_it_excel_success"] = {
                     "location": location,
                     "date": today.strftime("%Y/%m/%d"),
@@ -7515,6 +8006,25 @@ def show_soluble_inventory_page():
                             row["row"],
                             location,
                             updates,
+                        )
+                        history_changes = {}
+                        if "usage" in updates:
+                            history_changes["使用量/日"] = (usage, new_usage)
+                        if "delivery" in updates:
+                            history_changes["納品"] = (delivery, new_delivery)
+                        if "inventory" in updates:
+                            before_inventory = "自動計算" if current_formula else inventory
+                            after_inventory = "自動計算" if auto_inventory else new_inventory
+                            history_changes["在庫"] = (before_inventory, after_inventory)
+                        remember_change_history_warning(
+                            record_change_history_safely(
+                                "顧客",
+                                "",
+                                SOLUBLE_LOCATION_DISPLAY_NAMES.get(location, location),
+                                "変更",
+                                history_changes,
+                                section=f"ソリュブル在庫 {day.strftime('%Y/%m/%d')}",
+                            )
                         )
                     st.success(f"保存しました（{len(changed)}セル更新）。黄色は手入力値です。")
                     st.rerun()
@@ -9159,7 +9669,7 @@ def update_trade_partner_row(sheet_name, record_id, values):
                 break
         if target_row is None:
             raise ValueError(f"{sheet_name}で対象IDが見つかりません。")
-        changed = 0
+        changes = {}
         for header, value in values.items():
             if header not in header_map or header == id_field or header == "会社名（確認用）":
                 continue
@@ -9167,10 +9677,20 @@ def update_trade_partner_row(sheet_name, record_id, values):
             new_value = trade_partner_input_value(header, value)
             if not same_excel_value(old_value, new_value):
                 editor.set_cell_value(sheet_name, target_row, header_map[header], new_value)
-                changed += 1
-        if changed == 0:
+                changes[header] = (old_value, new_value)
+        if not changes:
             raise ValueError("変更された項目がありません。")
-        return {"record_id": target_id, "changed": changed}
+        partner_id = target_id
+        if sheet_name != TRADE_PARTNER_MASTER_SHEET and "取引先ID" in header_map:
+            partner_id = trade_partner_text(
+                editor.get_cell_value(sheet_name, target_row, header_map["取引先ID"])
+            )
+        return {
+            "record_id": target_id,
+            "partner_id": partner_id,
+            "changed": len(changes),
+            "changes": changes,
+        }
 
     return save_trade_partner_workbook(mutator)
 
@@ -9219,16 +9739,28 @@ def create_trade_partner_record(sheet_name, values):
                 )
                 if existing and normalize_match_value(existing) == normalize_match_value(company):
                     raise ValueError("同じ会社名がすでに登録されています。")
+        changes = {}
         for header, value in values.items():
             if header not in header_map or header in {id_field, "会社名（確認用）"}:
                 continue
+            new_value = trade_partner_input_value(header, value)
             editor.set_cell_value(
                 sheet_name,
                 row_number,
                 header_map[header],
-                trade_partner_input_value(header, value),
+                new_value,
             )
-        return {"record_id": record_id, "row_number": row_number}
+            if new_value not in (None, ""):
+                changes[header] = ("", new_value)
+        partner_id = record_id
+        if sheet_name != TRADE_PARTNER_MASTER_SHEET:
+            partner_id = trade_partner_text(values.get("取引先ID"))
+        return {
+            "record_id": record_id,
+            "partner_id": partner_id,
+            "row_number": row_number,
+            "changes": changes,
+        }
 
     return save_trade_partner_workbook(mutator)
 
@@ -9521,7 +10053,23 @@ def render_trade_partner_fields(row, headers, excluded=None):
                 st.markdown(f"**{html.escape(value)}**")
 
 
-def render_trade_partner_row_editor(sheet_name, row, headers, key_prefix):
+def trade_partner_history_section(sheet_name):
+    return {
+        TRADE_PARTNER_MASTER_SHEET: "基本情報",
+        TRADE_PARTNER_CONTACT_SHEET: "担当者",
+        TRADE_PARTNER_PRODUCT_SHEET: "仕入商品",
+        TRADE_PARTNER_TRANSPORT_SHEET: "運送条件",
+    }.get(sheet_name, sheet_name)
+
+
+def render_trade_partner_row_editor(
+    sheet_name,
+    row,
+    headers,
+    key_prefix,
+    partner_type,
+    company_name,
+):
     id_field = TRADE_PARTNER_ID_FIELDS[sheet_name]
     record_id = trade_partner_text(row.get(id_field))
     excluded_headers = {id_field, "取引先ID", "会社名（確認用）"}
@@ -9541,14 +10089,37 @@ def render_trade_partner_row_editor(sheet_name, row, headers, key_prefix):
         if submitted:
             try:
                 with st.spinner("バックアップを作成して保存しています…"):
-                    update_trade_partner_row(sheet_name, record_id, inputs)
+                    result = update_trade_partner_row(sheet_name, record_id, inputs)
+                    new_company_name = (
+                        trade_partner_text(inputs.get("会社名"))
+                        if sheet_name == TRADE_PARTNER_MASTER_SHEET
+                        else company_name
+                    ) or company_name
+                    remember_change_history_warning(
+                        record_change_history_safely(
+                            trade_partner_type_label(partner_type),
+                            result.get("partner_id") or trade_partner_text(row.get("取引先ID")),
+                            new_company_name,
+                            "変更",
+                            result.get("changes", {}),
+                            section=trade_partner_history_section(sheet_name),
+                        )
+                    )
                 st.success("保存しました。")
                 st.rerun()
             except Exception as error:
                 st.error(str(error))
 
 
-def render_trade_partner_related_section(data, sheet_name, partner_id, title, add_label):
+def render_trade_partner_related_section(
+    data,
+    sheet_name,
+    partner_id,
+    title,
+    add_label,
+    partner_type,
+    company_name,
+):
     headers = data[sheet_name]["headers"]
     rows = get_trade_partner_related_rows(data, sheet_name, partner_id)
     id_field = TRADE_PARTNER_ID_FIELDS[sheet_name]
@@ -9571,6 +10142,8 @@ def render_trade_partner_related_section(data, sheet_name, partner_id, title, ad
                 row,
                 headers,
                 key_prefix=f"{sheet_name}_{partner_id}",
+                partner_type=partner_type,
+                company_name=company_name,
             )
 
     with st.expander(f"＋ {add_label}"):
@@ -9591,7 +10164,17 @@ def render_trade_partner_related_section(data, sheet_name, partner_id, title, ad
                 if not trade_partner_text(values.get(primary_field)):
                     raise ValueError(f"{primary_field}を入力してください。")
                 with st.spinner("バックアップを作成して保存しています…"):
-                    create_trade_partner_record(sheet_name, values)
+                    result = create_trade_partner_record(sheet_name, values)
+                    remember_change_history_warning(
+                        record_change_history_safely(
+                            trade_partner_type_label(partner_type),
+                            result.get("partner_id") or partner_id,
+                            company_name,
+                            "追加",
+                            result.get("changes", {}),
+                            section=trade_partner_history_section(sheet_name),
+                        )
+                    )
                 st.success("追加しました。")
                 st.rerun()
             except Exception as error:
@@ -9656,6 +10239,8 @@ def show_trade_partner_detail(partner_type, partner_id):
         master,
         master_headers,
         key_prefix=f"master_{partner_type}",
+        partner_type=partner_type,
+        company_name=company,
     )
 
     render_trade_partner_related_section(
@@ -9664,6 +10249,8 @@ def show_trade_partner_detail(partner_type, partner_id):
         partner_id,
         "担当者",
         "担当者を追加",
+        partner_type,
+        company,
     )
     if partner_type == "supplier":
         render_trade_partner_related_section(
@@ -9672,6 +10259,8 @@ def show_trade_partner_detail(partner_type, partner_id):
             partner_id,
             "取扱商品",
             "商品を追加",
+            partner_type,
+            company,
         )
     else:
         render_trade_partner_related_section(
@@ -9680,6 +10269,8 @@ def show_trade_partner_detail(partner_type, partner_id):
             partner_id,
             "運送条件",
             "運送条件を追加",
+            partner_type,
+            company,
         )
     show_trade_partner_notes(partner_type, partner_id, company)
 
@@ -9713,6 +10304,16 @@ def show_trade_partner_register(partner_type):
                 values[trade_partner_category_field("carrier" if partner_type == "supplier" else "supplier")] = "○"
             with st.spinner("バックアップを作成して登録しています…"):
                 result = create_trade_partner_record(TRADE_PARTNER_MASTER_SHEET, values)
+                remember_change_history_warning(
+                    record_change_history_safely(
+                        trade_partner_type_label(partner_type),
+                        result.get("partner_id") or result.get("record_id"),
+                        trade_partner_text(values.get("会社名")),
+                        "登録",
+                        result.get("changes", {}),
+                        section="基本情報",
+                    )
+                )
             partner_id = result["record_id"]
             st.session_state["selected_partner_id"] = partner_id
             st.session_state["selected_partner_type"] = partner_type
@@ -9816,6 +10417,9 @@ def show_top_home():
         st.markdown(render_page_link("🚚 運送会社", page="carrier_home"), unsafe_allow_html=True)
     with col4:
         st.markdown(render_page_link("📝 取引先メモ", page="trade_notes"), unsafe_allow_html=True)
+    col5, _ = st.columns(2)
+    with col5:
+        st.markdown(render_page_link("🕘 変更確認", page="change_history"), unsafe_allow_html=True)
 
 
 # =========================
@@ -10199,15 +10803,19 @@ def create_full_data_backup_zip():
         get_supabase_customer_information_url(),
         "顧客情報",
     )
-    customer_information = [
+    change_history_rows = [
         row for row in raw_customer_information
-        if clean_value(row.get("id"), blank_text="") != WATER_IT_STORAGE_ID
-        and clean_value(row.get("customer_name"), blank_text="") != WATER_IT_STORAGE_CUSTOMER
-        and clean_value(row.get("field_name"), blank_text="") != WATER_IT_STORAGE_FIELD
+        if clean_value(row.get("customer_name"), blank_text="") == CHANGE_HISTORY_CUSTOMER
     ]
     water_storage_rows = [
         row for row in raw_customer_information
-        if row not in customer_information
+        if clean_value(row.get("id"), blank_text="") == WATER_IT_STORAGE_ID
+        or clean_value(row.get("customer_name"), blank_text="") == WATER_IT_STORAGE_CUSTOMER
+        or clean_value(row.get("field_name"), blank_text="") == WATER_IT_STORAGE_FIELD
+    ]
+    customer_information = [
+        row for row in raw_customer_information
+        if row not in water_storage_rows and row not in change_history_rows
     ]
     water_metadata = []
     for row in water_storage_rows:
@@ -10273,6 +10881,21 @@ def create_full_data_backup_zip():
             )
         )
         next_number += 1
+
+    csv_exports.extend(
+        [
+            (
+                f"CSV/{next_number:02d}_変更履歴.csv",
+                change_history_rows_to_dataframe(change_history_rows),
+                "アプリから保存した変更履歴（メモ帳は対象外）",
+            ),
+            (
+                f"CSV/{next_number + 1:02d}_変更履歴_Supabase生データ.csv",
+                backup_dataframe(change_history_rows),
+                "変更履歴のSupabase生データ",
+            ),
+        ]
+    )
 
     for path, dataframe, description in csv_exports:
         backup_add_entry(
@@ -10534,6 +11157,10 @@ with col_logout:
             pass
         st.rerun()
 
+history_warning = st.session_state.pop("change_history_warning", None)
+if history_warning:
+    st.warning(history_warning)
+
 # 各機能ページから、区分メニューを経由せずトップへ直接戻れるようにする。
 # 顧客・仕入先・運送会社の各ホームと取引先メモは、従来から同じリンクを
 # 表示しているため、二重表示にならないようここでは除外する。
@@ -10585,6 +11212,9 @@ try:
 
     elif st.session_state["page"] == "trade_notes":
         show_trade_notes_page()
+
+    elif st.session_state["page"] == "change_history":
+        show_change_history_page()
 
     elif st.session_state["page"] == "data_backup":
         show_full_data_backup_page()
