@@ -2650,6 +2650,24 @@ def change_history_rows_to_dataframe(rows):
     )
 
 
+def display_change_history_value(value):
+    """変更確認画面では、ISO形式の日時を日付だけで表示する。"""
+    if value is None or value == "":
+        return "（空欄）"
+    if isinstance(value, (datetime, date)):
+        return value.strftime("%Y/%m/%d")
+
+    text = str(value).strip()
+    iso_date_match = re.fullmatch(
+        r"(\d{4})-(\d{2})-(\d{2})(?:[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?)?",
+        text,
+    )
+    if iso_date_match:
+        year, month, day = iso_date_match.groups()
+        return f"{year}/{month}/{day}"
+    return text
+
+
 def show_change_history_page():
     st.header("🕘 変更確認")
     st.caption("アプリから正常に保存された変更を新しい順に表示します。メモ帳は対象外です。")
@@ -2719,15 +2737,19 @@ def show_change_history_page():
                     part for part in (
                         format_note_datetime(parsed["created_at"]),
                         parsed["action"],
-                        parsed["section"],
                     ) if part
                 )
                 if meta:
                     st.caption(meta)
+                if parsed["section"]:
+                    st.markdown(
+                        f"**変更箇所：{html.escape(parsed['section'])}**"
+                    )
                 for change in parsed["changes"]:
-                    before = display_change_value(change.get("before", ""))
-                    after = display_change_value(change.get("after", ""))
-                    st.write(f"{change.get('field', '')}：{before} → {after}")
+                    before = display_change_history_value(change.get("before", ""))
+                    after = display_change_history_value(change.get("after", ""))
+                    field_name = html.escape(clean_value(change.get("field"), blank_text="変更内容"))
+                    st.write(f"{field_name}：{before} → {after}")
 
     previous_col, page_col, next_col = st.columns([1, 1, 1])
     with previous_col:
