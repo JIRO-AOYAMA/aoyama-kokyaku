@@ -299,6 +299,68 @@ def is_mobile_browser():
     )
 
 
+def enable_mobile_camera_capture(uploader_label):
+    """指定した画像アップローダーへ、スマホ背面カメラの起動指定を付ける。"""
+    label_json = json.dumps(str(uploader_label), ensure_ascii=False)
+    script = r'''<script>
+(() => {
+  const targetLabel = __TARGET_LABEL__;
+  let stopped = false;
+  let attempts = 0;
+
+  const normalize = (value) => String(value || '').replace(/\s+/g, ' ').trim();
+
+  const applyCapture = () => {
+    if (stopped) return true;
+    let parentDocument;
+    try {
+      parentDocument = window.parent.document;
+    } catch (_) {
+      return false;
+    }
+    if (!parentDocument) return false;
+
+    const uploaders = Array.from(
+      parentDocument.querySelectorAll('[data-testid="stFileUploader"]')
+    );
+    const target = uploaders.find((node) => {
+      const label = node.querySelector('label');
+      const text = normalize(label ? label.textContent : node.textContent);
+      return text.includes(targetLabel);
+    });
+    if (!target) return false;
+
+    const input = target.querySelector('input[type="file"]');
+    if (!input) return false;
+
+    input.setAttribute('accept', 'image/*');
+    input.setAttribute('capture', 'environment');
+    input.dataset.aoyamaCameraCapture = 'environment';
+    return true;
+  };
+
+  const retry = () => {
+    if (applyCapture() || attempts >= 60) return;
+    attempts += 1;
+    window.setTimeout(retry, 100);
+  };
+
+  retry();
+
+  let observer;
+  try {
+    observer = new MutationObserver(() => applyCapture());
+    observer.observe(window.parent.document.body, {childList: true, subtree: true});
+    window.setTimeout(() => {
+      stopped = true;
+      observer.disconnect();
+    }, 12000);
+  } catch (_) {}
+})();
+</script>'''.replace('__TARGET_LABEL__', label_json)
+    components.html(script, height=0, scrolling=False)
+
+
 def read_onedrive_settings():
     """Streamlit SecretsからOneDrive接続設定を読む。"""
     try:
@@ -4058,17 +4120,25 @@ def render_customer_attachments_section(customer_name, customer_key=None):
         else:
             st.markdown("#### 追加")
             mobile_browser = is_mobile_browser()
-            photo_file = st.file_uploader(
-                "📷 写真を撮る／画像を選ぶ" if mobile_browser else "🖼 画像を選ぶ",
+            camera_file = None
+            if mobile_browser:
+                camera_label = "📷 写真を撮る"
+                camera_file = st.file_uploader(
+                    camera_label,
+                    type=["jpg", "jpeg", "png", "webp"],
+                    accept_multiple_files=False,
+                    key=f"onedrive_attachment_camera_uploader_{suffix}",
+                    help="スマホの背面カメラを起動して撮影します。",
+                )
+                enable_mobile_camera_capture(camera_label)
+
+            selected_image_file = st.file_uploader(
+                "🖼 保存済み画像を選ぶ" if mobile_browser else "🖼 画像を選ぶ",
                 type=["jpg", "jpeg", "png", "webp"],
                 accept_multiple_files=False,
                 key=f"onedrive_attachment_photo_uploader_{suffix}",
-                help=(
-                    "端末の標準画面からカメラ撮影または保存済み画像を選べます。"
-                    if mobile_browser
-                    else None
-                ),
             )
+            photo_file = camera_file if camera_file is not None else selected_image_file
             pdf_file = st.file_uploader(
                 "📄 PDFを選ぶ",
                 type=["pdf"],
