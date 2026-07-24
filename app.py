@@ -9433,13 +9433,13 @@ def build_two_day_panel_html(target_day, items):
     return "".join(parts)
 
 
-def show_dispatch_month_switcher(month_start):
+def show_dispatch_month_switcher(month_start, key_suffix="top"):
     col_prev, col_month, col_next = st.columns([1, 2, 1])
 
     with col_prev:
         st.button(
             "◀",
-            key="dispatch_prev_month",
+            key=f"dispatch_prev_month_{key_suffix}",
             use_container_width=True,
             on_click=change_dispatch_month,
             args=(-1,),
@@ -9454,7 +9454,7 @@ def show_dispatch_month_switcher(month_start):
     with col_next:
         st.button(
             "▶",
-            key="dispatch_next_month",
+            key=f"dispatch_next_month_{key_suffix}",
             use_container_width=True,
             on_click=change_dispatch_month,
             args=(1,),
@@ -9568,7 +9568,7 @@ def show_dispatch_calendar(df):
         return
 
     month_start = get_calendar_month_start(df, dispatch_columns["date"])
-    show_dispatch_month_switcher(month_start)
+    show_dispatch_month_switcher(month_start, key_suffix="top")
     rows_by_day = make_dispatch_items_by_day(df, month_start, dispatch_columns)
 
     st.caption(
@@ -9592,6 +9592,9 @@ def show_dispatch_calendar(df):
         show_two_day_dispatch_calendar(rows_by_day, month_start)
     else:
         show_month_dispatch_calendar(rows_by_day, month_start)
+
+    st.markdown("---")
+    show_dispatch_month_switcher(month_start, key_suffix="bottom")
 
 
 # =========================
@@ -10144,6 +10147,78 @@ def render_dispatch_responsive_list(display_df, customer_names=None):
     st.markdown("".join(desktop_parts + mobile_parts), unsafe_allow_html=True)
 
 
+def get_dispatch_table_month_name():
+    """配車表で表示する月をsession_stateに保持する。"""
+    selected = str(st.session_state.get("dispatch_table_month") or "").strip()
+    if selected not in DISPATCH_MONTH_SHEETS:
+        current_month_name = f"{date.today().month}月"
+        selected = current_month_name if current_month_name in DISPATCH_MONTH_SHEETS else DISPATCH_MONTH_SHEETS[0]
+        st.session_state["dispatch_table_month"] = selected
+    return selected
+
+
+def change_dispatch_table_month(delta):
+    """配車表の表示月を前月・翌月へ移動し、月別の絞り込みだけを解除する。"""
+    current = get_dispatch_table_month_name()
+    current_index = DISPATCH_MONTH_SHEETS.index(current)
+    next_index = (current_index + int(delta)) % len(DISPATCH_MONTH_SHEETS)
+    st.session_state["dispatch_table_month"] = DISPATCH_MONTH_SHEETS[next_index]
+
+    for key in list(st.session_state.keys()):
+        if key.startswith("dispatch_filter_"):
+            del st.session_state[key]
+
+
+def dispatch_table_month_title(df, selected_month):
+    """配車表の月見出しに使う年を、該当月の実データから決める。"""
+    try:
+        month_number = int(str(selected_month).replace("月", ""))
+    except ValueError:
+        month_number = date.today().month
+
+    month_rows = df[df["参照シート"] == selected_month]
+    years = []
+    for column in ("_引取日", "_着日"):
+        if column not in month_rows.columns:
+            continue
+        for value in month_rows[column]:
+            if isinstance(value, date) and value.month == month_number:
+                years.append(value.year)
+
+    year = max(set(years), key=years.count) if years else date.today().year
+    return f"{year}年{month_number}月"
+
+
+def show_dispatch_table_month_switcher(df, selected_month, key_suffix="top"):
+    """配車カレンダーと同じ形で、配車表の表示月を切り替える。"""
+    col_prev, col_month, col_next = st.columns([1, 2, 1])
+
+    with col_prev:
+        st.button(
+            "◀",
+            key=f"dispatch_table_prev_month_{key_suffix}",
+            use_container_width=True,
+            on_click=change_dispatch_table_month,
+            args=(-1,),
+        )
+
+    with col_month:
+        st.markdown(
+            '<div style="text-align:center;font-size:1.2rem;font-weight:700;padding-top:0.35rem;">'
+            f'{dispatch_table_month_title(df, selected_month)}</div>',
+            unsafe_allow_html=True,
+        )
+
+    with col_next:
+        st.button(
+            "▶",
+            key=f"dispatch_table_next_month_{key_suffix}",
+            use_container_width=True,
+            on_click=change_dispatch_table_month,
+            args=(1,),
+        )
+
+
 def show_dispatch_board():
     st.markdown("---")
     st.header("🚚 配車表")
@@ -10156,27 +10231,8 @@ def show_dispatch_board():
         st.warning("1月～12月シートに表示できるデータがありません。")
         return
 
-    current_month_name = f"{date.today().month}月"
-    default_month_index = (
-        DISPATCH_MONTH_SHEETS.index(current_month_name)
-        if current_month_name in DISPATCH_MONTH_SHEETS
-        else 0
-    )
-    selected_month = st.selectbox(
-        "表示する月",
-        DISPATCH_MONTH_SHEETS,
-        index=default_month_index,
-        key="dispatch_table_month",
-    )
-
-    previous_month = st.session_state.get("_dispatch_table_previous_month")
-    if previous_month is not None and previous_month != selected_month:
-        for key in list(st.session_state.keys()):
-            if key.startswith("dispatch_filter_"):
-                del st.session_state[key]
-        st.session_state["_dispatch_table_previous_month"] = selected_month
-        st.rerun()
-    st.session_state["_dispatch_table_previous_month"] = selected_month
+    selected_month = get_dispatch_table_month_name()
+    show_dispatch_table_month_switcher(df, selected_month, key_suffix="top")
 
     month_df = df[df["参照シート"] == selected_month].copy()
     filtered = show_dispatch_filters(month_df)
@@ -10188,6 +10244,8 @@ def show_dispatch_board():
 
     if filtered.empty:
         st.info("条件に一致する配車はありません。")
+        st.markdown("---")
+        show_dispatch_table_month_switcher(df, selected_month, key_suffix="bottom")
         return
 
     display_df = filtered.sort_values(
@@ -10214,6 +10272,9 @@ def show_dispatch_board():
         customer_names = set()
 
     render_dispatch_responsive_list(display_df, customer_names)
+
+    st.markdown("---")
+    show_dispatch_table_month_switcher(df, selected_month, key_suffix="bottom")
 
 
 # =========================
