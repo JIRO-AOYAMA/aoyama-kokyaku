@@ -6,8 +6,11 @@ import hashlib
 import html
 import json
 import math
+import mimetypes
 import posixpath
 import re
+import threading
+import time
 import urllib.parse
 import unicodedata
 import uuid
@@ -259,6 +262,391 @@ SOLUBLE_WATER_IT_POINT_NAMES = {
 }
 # 実績平均はアプリ上の参考表示だけに使い、Excelの使用量/日へは反映しない。
 SOLUBLE_WATER_IT_USAGE_WINDOWS = (3, 7, 20, 30)
+
+
+# =========================
+# OneDrive接続（写真・資料）
+# =========================
+ONEDRIVE_AUTHORITY = "https://login.microsoftonline.com/consumers"
+ONEDRIVE_AUTHORIZE_URL = ONEDRIVE_AUTHORITY + "/oauth2/v2.0/authorize"
+ONEDRIVE_TOKEN_URL = ONEDRIVE_AUTHORITY + "/oauth2/v2.0/token"
+ONEDRIVE_GRAPH_BASE = "https://graph.microsoft.com/v1.0"
+ONEDRIVE_SCOPES = "openid profile offline_access User.Read Files.ReadWrite"
+ONEDRIVE_REQUEST_TIMEOUT = 90
+ONEDRIVE_AUTH_FLOW_TTL_SECONDS = 15 * 60
+ONEDRIVE_ROOT_FOLDER = "取引先カルテ"
+ONEDRIVE_CUSTOMER_FOLDER = "顧客"
+ONEDRIVE_ATTACHMENT_PREFIX = "__onedrive_attachment__:"
+ONEDRIVE_ATTACHMENT_VERSION = 1
+ONEDRIVE_FIXED_TAGS = ("設備", "名刺", "納品場所", "商品", "トラブル")
+ONEDRIVE_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
+ONEDRIVE_PDF_EXTENSIONS = {".pdf"}
+ONEDRIVE_PAGE_SIZE = 12
+
+
+def read_onedrive_settings():
+    """Streamlit SecretsからOneDrive接続設定を読む。"""
+    try:
+        settings = st.secrets["onedrive"]
+        client_id = str(settings.get("client_id", "")).strip()
+        client_secret = str(settings.get("client_secret", "")).strip()
+        redirect_uri = str(settings.get("redirect_uri", "")).strip()
+    except Exception:
+        client_id = ""
+        client_secret = ""
+        redirect_uri = ""
+
+    missing = []
+    if not client_id:
+        missing.append("client_id")
+    if not client_secret or client_secret == "PASTE_SECRET_VALUE_HERE":
+        missing.append("client_secret")
+    if not redirect_uri:
+        missing.append("redirect_uri")
+    if missing:
+        raise RuntimeError(
+            "StreamlitのSecretsにある[onedrive]へ"
+            + "、".join(missing)
+            + "を設定してください。"
+        )
+    return client_id, client_secret, redirect_uri
+
+
+@st.cache_resource(show_spinner=False)
+def get_onedrive_pending_auth_store():
+    """外部ログイン中だけ必要な認証情報を一時保持する。"""
+    return {"lock": threading.RLock(), "flows": {}}
+
+
+def cleanup_onedrive_pending_auth_flows(store):
+    now = time.time()
+    expired = [
+        state
+        for state, entry in store["flows"].items()
+        if now - float(entry.get("created_at", 0)) > ONEDRIVE_AUTH_FLOW_TTL_SECONDS
+    ]
+    for state in expired:
+        store["flows"].pop(state, None)
+
+
+def save_onedrive_pending_auth_flow(state, payload):
+    store = get_onedrive_pending_auth_store()
+    with store["lock"]:
+        cleanup_onedrive_pending_auth_flows(store)
+        store["flows"][state] = {
+            "created_at": time.time(),
+            **payload,
+        }
+
+
+def pop_onedrive_pending_auth_flow(state):
+    store = get_onedrive_pending_auth_store()
+    with store["lock"]:
+        cleanup_onedrive_pending_auth_flows(store)
+        return store["flows"].pop(state, None)
+
+
+def get_raw_query_params():
+    try:
+        return {key: str(value) for key, value in st.query_params.items()}
+    except Exception:
+        legacy = st.experimental_get_query_params()
+        return {
+            key: str(value[0] if isinstance(value, list) and value else value)
+            for key, value in legacy.items()
+        }
+
+
+def set_query_params_after_onedrive_auth(page="home", customer=""):
+    try:
+        st.query_params.clear()
+        st.query_params["logged_in"] = "1"
+        st.query_params["page"] = str(page or "home")
+        if customer:
+            st.query_params["customer"] = str(customer)
+    except Exception:
+        params = {"logged_in": "1", "page": str(page or "home")}
+        if customer:
+            params["customer"] = str(customer)
+        st.experimental_set_query_params(**params)
+
+
+def make_pkce_verifier():
+    return uuid.uuid4().hex + uuid.uuid4().hex
+
+
+def make_pkce_challenge(verifier):
+    digest = hashlib.sha256(verifier.encode("ascii")).digest()
+    return base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
+
+
+def build_onedrive_sign_in_url(return_page="home", customer_name=""):
+    client_id, _, redirect_uri = read_onedrive_settings()
+    state = uuid.uuid4().hex
+    verifier = make_pkce_verifier()
+    save_onedrive_pending_auth_flow(
+        state,
+        {
+            "code_verifier": verifier,
+            "redirect_uri": redirect_uri,
+            "return_page": str(return_page or "home"),
+            "customer_name": str(customer_name or ""),
+        },
+    )
+    params = {
+        "client_id": client_id,
+        "response_type": "code",
+        "redirect_uri": redirect_uri,
+        "response_mode": "query",
+        "scope": ONEDRIVE_SCOPES,
+        "state": state,
+        "code_challenge": make_pkce_challenge(verifier),
+        "code_challenge_method": "S256",
+    }
+    return ONEDRIVE_AUTHORIZE_URL + "?" + urllib.parse.urlencode(params)
+
+
+def save_onedrive_token_result(result):
+    token = dict(result or {})
+    expires_in = int(token.get("expires_in") or 3600)
+    token["expires_at"] = time.time() + max(expires_in, 60)
+    st.session_state["onedrive_token_result"] = token
+
+
+def clear_onedrive_auth_state():
+    st.session_state.pop("onedrive_token_result", None)
+    for key in list(st.session_state.keys()):
+        if str(key).startswith("onedrive_thumbnail_"):
+            st.session_state.pop(key, None)
+
+
+def refresh_onedrive_access_token(token):
+    refresh_token = str((token or {}).get("refresh_token") or "").strip()
+    if not refresh_token:
+        return None
+    client_id, client_secret, redirect_uri = read_onedrive_settings()
+    response = requests.post(
+        ONEDRIVE_TOKEN_URL,
+        data={
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+            "redirect_uri": redirect_uri,
+            "scope": ONEDRIVE_SCOPES,
+        },
+        timeout=ONEDRIVE_REQUEST_TIMEOUT,
+    )
+    if response.status_code != 200:
+        return None
+    result = response.json()
+    if not result.get("refresh_token"):
+        result["refresh_token"] = refresh_token
+    save_onedrive_token_result(result)
+    return result
+
+
+def get_onedrive_access_token():
+    token = st.session_state.get("onedrive_token_result")
+    if not isinstance(token, dict):
+        return None
+    access_token = str(token.get("access_token") or "").strip()
+    expires_at = float(token.get("expires_at") or 0)
+    if access_token and expires_at > time.time() + 60:
+        return access_token
+    refreshed = refresh_onedrive_access_token(token)
+    if refreshed and refreshed.get("access_token"):
+        return str(refreshed["access_token"])
+    clear_onedrive_auth_state()
+    return None
+
+
+def process_onedrive_callback_if_present():
+    """Microsoftから戻った認証コードを、通常ログイン判定より先に処理する。"""
+    params = get_raw_query_params()
+    if not params.get("code") and not params.get("error"):
+        return
+    state = str(params.get("state") or "")
+    pending = pop_onedrive_pending_auth_flow(state) if state else None
+    return_page = str((pending or {}).get("return_page") or "home")
+    customer_name = str((pending or {}).get("customer_name") or "")
+
+    st.session_state.authenticated = True
+    st.session_state["page"] = return_page
+    st.session_state["selected_customer"] = customer_name if return_page == "detail" else None
+
+    try:
+        if params.get("error"):
+            description = params.get("error_description") or params.get("error")
+            raise RuntimeError(f"Microsoftへのサインインが完了しませんでした：{description}")
+        if not pending:
+            raise RuntimeError(
+                "認証の一時情報が見つかりません。ログイン開始から15分以内に、もう一度サインインしてください。"
+            )
+
+        client_id, client_secret, _ = read_onedrive_settings()
+        response = requests.post(
+            ONEDRIVE_TOKEN_URL,
+            data={
+                "client_id": client_id,
+                "client_secret": client_secret,
+                "grant_type": "authorization_code",
+                "code": str(params.get("code") or ""),
+                "redirect_uri": str(pending.get("redirect_uri") or ""),
+                "code_verifier": str(pending.get("code_verifier") or ""),
+                "scope": ONEDRIVE_SCOPES,
+            },
+            timeout=ONEDRIVE_REQUEST_TIMEOUT,
+        )
+        if response.status_code != 200:
+            try:
+                detail = response.json().get("error_description") or response.json().get("error")
+            except Exception:
+                detail = response.text
+            raise RuntimeError(f"OneDriveの認証情報を取得できませんでした：{detail}")
+        save_onedrive_token_result(response.json())
+        st.session_state["onedrive_auth_success"] = True
+    except Exception as exc:
+        st.session_state["onedrive_auth_error"] = str(exc)
+
+    set_query_params_after_onedrive_auth(return_page, customer_name)
+    st.rerun()
+
+
+def onedrive_graph_request(method, path, access_token, expected=(200,), **kwargs):
+    headers = dict(kwargs.pop("headers", {}) or {})
+    headers["Authorization"] = f"Bearer {access_token}"
+    response = requests.request(
+        method,
+        ONEDRIVE_GRAPH_BASE + path,
+        headers=headers,
+        timeout=ONEDRIVE_REQUEST_TIMEOUT,
+        **kwargs,
+    )
+    if response.status_code not in expected:
+        try:
+            payload = response.json()
+            message = str(payload.get("error", {}).get("message", "")).strip()
+        except Exception:
+            message = str(response.text or "").strip()
+        if response.status_code == 401:
+            clear_onedrive_auth_state()
+            message = message or "認証の有効期限が切れています。もう一度サインインしてください。"
+        raise RuntimeError(
+            f"Microsoft Graphでエラーが発生しました（{response.status_code}）"
+            + (f"：{message}" if message else "")
+        )
+    return response
+
+
+def get_onedrive_profile(access_token):
+    return onedrive_graph_request(
+        "GET",
+        "/me?$select=displayName,mail,userPrincipalName",
+        access_token,
+    ).json()
+
+
+def get_onedrive_path_item(access_token, path):
+    encoded = urllib.parse.quote(str(path).strip("/"), safe="/")
+    response = onedrive_graph_request(
+        "GET",
+        f"/me/drive/root:/{encoded}?$select=id,name,folder,webUrl",
+        access_token,
+        expected=(200, 404),
+    )
+    return None if response.status_code == 404 else response.json()
+
+
+def ensure_onedrive_folder_path(access_token, path):
+    segments = [segment for segment in str(path).replace("\\", "/").split("/") if segment]
+    if not segments:
+        raise RuntimeError("OneDriveの保存フォルダが空です。")
+    current_path = ""
+    parent_id = None
+    item = None
+    for segment in segments:
+        current_path = f"{current_path}/{segment}".strip("/")
+        item = get_onedrive_path_item(access_token, current_path)
+        if item:
+            parent_id = str(item.get("id") or "")
+            continue
+        target = "/me/drive/root/children" if not parent_id else f"/me/drive/items/{urllib.parse.quote(parent_id, safe='')}/children"
+        response = onedrive_graph_request(
+            "POST",
+            target,
+            access_token,
+            expected=(200, 201),
+            headers={"Content-Type": "application/json"},
+            json={
+                "name": segment,
+                "folder": {},
+                "@microsoft.graph.conflictBehavior": "fail",
+            },
+        )
+        item = response.json()
+        parent_id = str(item.get("id") or "")
+    return item or {}
+
+
+def upload_onedrive_file(access_token, folder_path, filename, content, content_type):
+    clean_name = re.sub(r"[\\/:*?\"<>|]", "_", str(filename or "")).strip().rstrip(".")
+    if not clean_name:
+        raise RuntimeError("ファイル名が空です。")
+    ensure_onedrive_folder_path(access_token, folder_path)
+    full_path = f"{str(folder_path).strip('/')}/{clean_name}"
+    encoded = urllib.parse.quote(full_path, safe="/")
+    response = onedrive_graph_request(
+        "PUT",
+        f"/me/drive/root:/{encoded}:/content",
+        access_token,
+        expected=(200, 201),
+        headers={"Content-Type": content_type or "application/octet-stream"},
+        data=content,
+    )
+    return response.json()
+
+
+def delete_onedrive_file(access_token, item_id):
+    onedrive_graph_request(
+        "DELETE",
+        f"/me/drive/items/{urllib.parse.quote(str(item_id), safe='')}",
+        access_token,
+        expected=(204,),
+    )
+
+
+def download_onedrive_file(access_token, item_id):
+    response = onedrive_graph_request(
+        "GET",
+        f"/me/drive/items/{urllib.parse.quote(str(item_id), safe='')}/content",
+        access_token,
+        expected=(200,),
+    )
+    return response.content
+
+
+def download_onedrive_thumbnail(access_token, item_id):
+    response = onedrive_graph_request(
+        "GET",
+        f"/me/drive/items/{urllib.parse.quote(str(item_id), safe='')}/thumbnails?$select=medium",
+        access_token,
+        expected=(200,),
+    )
+    values = list(response.json().get("value", []))
+    if not values:
+        return None
+    url = str((values[0].get("medium") or {}).get("url") or "").strip()
+    if not url:
+        return None
+    image_response = requests.get(url, timeout=ONEDRIVE_REQUEST_TIMEOUT)
+    if image_response.status_code != 200:
+        return None
+    return image_response.content
+
+
+# Microsoftから戻った時は、アプリの共通パスワード画面より先に認証を完了する。
+process_onedrive_callback_if_present()
 
 
 # =========================
@@ -2909,6 +3297,631 @@ def delete_customer_information(item_id):
     clear_customer_information_cache()
 
 
+def make_onedrive_attachment_field_name():
+    return ONEDRIVE_ATTACHMENT_PREFIX + uuid.uuid4().hex
+
+
+def is_onedrive_attachment_item(item):
+    return clean_value(item.get("field_name"), blank_text="").startswith(
+        ONEDRIVE_ATTACHMENT_PREFIX
+    )
+
+
+def normalize_attachment_tags(values):
+    if isinstance(values, str):
+        candidates = re.split(r"[,、\n]+", values)
+    elif isinstance(values, (list, tuple, set)):
+        candidates = list(values)
+    else:
+        candidates = []
+    result = []
+    seen = set()
+    for value in candidates:
+        tag = clean_value(value, blank_text="").strip().lstrip("#").strip()
+        if not tag or tag in seen:
+            continue
+        seen.add(tag)
+        result.append(tag)
+    return result
+
+
+def parse_onedrive_attachment_item(item):
+    if not is_onedrive_attachment_item(item):
+        return None
+    try:
+        payload = json.loads(str(item.get("content") or "{}"))
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    return {
+        "id": str(item.get("id") or ""),
+        "field_name": str(item.get("field_name") or ""),
+        "customer_key": clean_value(item.get("customer_key"), blank_text=""),
+        "customer_name": clean_value(item.get("customer_name"), blank_text=""),
+        "file_id": clean_value(payload.get("file_id"), blank_text=""),
+        "original_name": clean_value(payload.get("original_name"), blank_text=""),
+        "stored_name": clean_value(payload.get("stored_name"), blank_text=""),
+        "file_type": clean_value(payload.get("file_type"), blank_text=""),
+        "mime_type": clean_value(payload.get("mime_type"), blank_text=""),
+        "size": payload.get("size") or 0,
+        "onedrive_path": clean_value(payload.get("onedrive_path"), blank_text=""),
+        "web_url": clean_value(payload.get("web_url"), blank_text=""),
+        "tags": normalize_attachment_tags(payload.get("tags") or []),
+        "remarks": clean_value(payload.get("remarks"), blank_text=""),
+        "uploaded_by": clean_value(payload.get("uploaded_by"), blank_text=""),
+        "created_at": clean_value(payload.get("created_at"), blank_text="")
+        or clean_value(item.get("created_at"), blank_text=""),
+        "updated_at": clean_value(item.get("updated_at"), blank_text=""),
+        "version": payload.get("version") or ONEDRIVE_ATTACHMENT_VERSION,
+    }
+
+
+def serialize_onedrive_attachment(attachment):
+    payload = {
+        "version": ONEDRIVE_ATTACHMENT_VERSION,
+        "file_id": attachment.get("file_id", ""),
+        "original_name": attachment.get("original_name", ""),
+        "stored_name": attachment.get("stored_name", ""),
+        "file_type": attachment.get("file_type", ""),
+        "mime_type": attachment.get("mime_type", ""),
+        "size": int(attachment.get("size") or 0),
+        "onedrive_path": attachment.get("onedrive_path", ""),
+        "web_url": attachment.get("web_url", ""),
+        "tags": normalize_attachment_tags(attachment.get("tags") or []),
+        "remarks": attachment.get("remarks", ""),
+        "uploaded_by": attachment.get("uploaded_by", ""),
+        "created_at": attachment.get("created_at", ""),
+    }
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+
+
+def get_customer_onedrive_folder_key(customer_key, customer_name):
+    if customer_key:
+        raw = f"顧客ID_{customer_key}"
+    else:
+        digest = hashlib.sha256(str(customer_name).encode("utf-8")).hexdigest()[:16]
+        raw = f"顧客仮ID_{digest}"
+    safe = re.sub(r"[\\/:*?\"<>|]", "_", raw).strip().rstrip(".")
+    return safe or "顧客仮ID_未設定"
+
+
+def get_customer_attachments(customer_name, customer_key):
+    items = load_customer_information(customer_name, customer_key)
+    attachments = []
+    for item in items:
+        parsed = parse_onedrive_attachment_item(item)
+        if parsed:
+            attachments.append(parsed)
+    attachments.sort(
+        key=lambda row: str(row.get("created_at") or row.get("updated_at") or ""),
+        reverse=True,
+    )
+    return attachments
+
+
+def attachment_file_kind(filename, mime_type=""):
+    suffix = Path(str(filename or "")).suffix.lower()
+    mime = str(mime_type or "").lower()
+    if mime.startswith("image/") or suffix in ONEDRIVE_IMAGE_EXTENSIONS:
+        return "image"
+    if mime == "application/pdf" or suffix in ONEDRIVE_PDF_EXTENSIONS:
+        return "pdf"
+    return ""
+
+
+def save_customer_onedrive_attachment(
+    customer_name,
+    customer_key,
+    uploaded_name,
+    content,
+    mime_type,
+    tags,
+    remarks,
+    access_token,
+):
+    file_kind = attachment_file_kind(uploaded_name, mime_type)
+    if not file_kind:
+        raise ValueError("画像（JPG・JPEG・PNG・WEBP）またはPDFを選んでください。")
+    if not content:
+        raise ValueError("選択したファイルが空です。")
+
+    folder_key = get_customer_onedrive_folder_key(customer_key, customer_name)
+    category_folder = "写真" if file_kind == "image" else "資料"
+    folder_path = "/".join(
+        [ONEDRIVE_ROOT_FOLDER, ONEDRIVE_CUSTOMER_FOLDER, folder_key, category_folder]
+    )
+    original_name = Path(str(uploaded_name or "file")).name
+    timestamp = get_jst_now().strftime("%Y%m%d_%H%M%S")
+    stored_name = f"{timestamp}_{uuid.uuid4().hex[:8]}_{original_name}"
+    uploaded_item = upload_onedrive_file(
+        access_token,
+        folder_path,
+        stored_name,
+        content,
+        mime_type,
+    )
+    file_id = clean_value(uploaded_item.get("id"), blank_text="")
+    if not file_id:
+        raise RuntimeError("OneDriveから保存済みファイルIDを取得できませんでした。")
+
+    profile = {}
+    try:
+        profile = get_onedrive_profile(access_token)
+    except Exception:
+        profile = {}
+    uploaded_by = (
+        clean_value(profile.get("displayName"), blank_text="")
+        or clean_value(profile.get("mail"), blank_text="")
+        or clean_value(profile.get("userPrincipalName"), blank_text="")
+    )
+    attachment = {
+        "file_id": file_id,
+        "original_name": original_name,
+        "stored_name": clean_value(uploaded_item.get("name"), blank_text="") or stored_name,
+        "file_type": file_kind,
+        "mime_type": mime_type or mimetypes.guess_type(original_name)[0] or "application/octet-stream",
+        "size": int(uploaded_item.get("size") or len(content)),
+        "onedrive_path": folder_path,
+        "web_url": clean_value(uploaded_item.get("webUrl"), blank_text=""),
+        "tags": normalize_attachment_tags(tags),
+        "remarks": str(remarks or "").strip(),
+        "uploaded_by": uploaded_by,
+        "created_at": get_jst_now().isoformat(),
+    }
+    try:
+        insert_customer_information(
+            customer_name,
+            customer_key,
+            make_onedrive_attachment_field_name(),
+            serialize_onedrive_attachment(attachment),
+            int(time.time()),
+        )
+    except Exception:
+        try:
+            delete_onedrive_file(access_token, file_id)
+        except Exception:
+            pass
+        raise
+    return attachment
+
+
+def update_customer_onedrive_attachment_metadata(attachment, tags, remarks):
+    updated = dict(attachment)
+    updated["tags"] = normalize_attachment_tags(tags)
+    updated["remarks"] = str(remarks or "").strip()
+    update_customer_information(
+        attachment["id"],
+        attachment["field_name"],
+        serialize_onedrive_attachment(updated),
+    )
+    return updated
+
+
+def format_attachment_size(value):
+    try:
+        size = float(value or 0)
+    except Exception:
+        size = 0
+    units = ["B", "KB", "MB", "GB"]
+    for unit in units:
+        if size < 1024 or unit == units[-1]:
+            return f"{size:.0f} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024
+    return "0 B"
+
+
+def format_attachment_datetime(value):
+    text = clean_value(value, blank_text="")
+    if not text:
+        return ""
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        return parsed.astimezone(timezone(timedelta(hours=9))).strftime("%Y/%m/%d %H:%M")
+    except Exception:
+        return text
+
+
+def onedrive_attachment_rows_to_dataframe(rows):
+    records = []
+    for row in rows:
+        attachment = parse_onedrive_attachment_item(row)
+        if not attachment:
+            continue
+        records.append(
+            {
+                "顧客ID": attachment.get("customer_key", ""),
+                "顧客名": attachment.get("customer_name", ""),
+                "種類": "写真" if attachment.get("file_type") == "image" else "PDF",
+                "元ファイル名": attachment.get("original_name", ""),
+                "OneDrive保存名": attachment.get("stored_name", ""),
+                "OneDrive保存先": attachment.get("onedrive_path", ""),
+                "タグ": " ".join(f"#{tag}" for tag in attachment.get("tags", [])),
+                "備考": attachment.get("remarks", ""),
+                "サイズ": attachment.get("size", ""),
+                "登録者": attachment.get("uploaded_by", ""),
+                "登録日時": attachment.get("created_at", ""),
+                "OneDriveファイルID": attachment.get("file_id", ""),
+                "保存ID": attachment.get("id", ""),
+            }
+        )
+    records.sort(key=lambda record: str(record.get("登録日時") or ""), reverse=True)
+    return backup_dataframe(
+        records,
+        [
+            "顧客ID", "顧客名", "種類", "元ファイル名", "OneDrive保存名",
+            "OneDrive保存先", "タグ", "備考", "サイズ", "登録者", "登録日時",
+            "OneDriveファイルID", "保存ID",
+        ],
+    )
+
+
+def render_customer_attachments_section(customer_name, customer_key=None):
+    identity = customer_key or customer_name
+    suffix = hashlib.sha256(str(identity).encode("utf-8")).hexdigest()[:16]
+    success_key = f"onedrive_attachment_success_{suffix}"
+    edit_key = f"onedrive_attachment_edit_{suffix}"
+    delete_key = f"onedrive_attachment_delete_{suffix}"
+    limit_key = f"onedrive_attachment_limit_{suffix}"
+
+    if not has_supabase_config():
+        with st.expander("📎 写真・資料"):
+            st.warning("写真・資料の管理にはSupabase設定が必要です。")
+        return
+
+    try:
+        attachments = get_customer_attachments(customer_name, customer_key)
+    except Exception as exc:
+        with st.expander("📎 写真・資料"):
+            st.warning(f"写真・資料の一覧を読み込めませんでした：{exc}")
+        return
+
+    with st.expander(f"📎 写真・資料　{len(attachments)}件", expanded=False):
+        success_message = st.session_state.pop(success_key, None)
+        if success_message:
+            st.success(success_message)
+        auth_success = st.session_state.pop("onedrive_auth_success", None)
+        if auth_success:
+            st.success("OneDriveへ接続しました。")
+        auth_error = st.session_state.pop("onedrive_auth_error", None)
+        if auth_error:
+            st.error(auth_error)
+
+        try:
+            read_onedrive_settings()
+        except Exception as exc:
+            st.warning(str(exc))
+            st.code(
+                "[onedrive]\n"
+                'client_id = "MicrosoftのクライアントID"\n'
+                'client_secret = "Microsoftのシークレットの値"\n'
+                'redirect_uri = "https://aoyama-kokyaku.streamlit.app"'
+            )
+            return
+
+        access_token = get_onedrive_access_token()
+        if not access_token:
+            st.info("写真・PDFを追加・表示するには、最初にOneDriveへ接続してください。")
+            try:
+                st.link_button(
+                    "Microsoft PersonalでOneDriveへ接続",
+                    build_onedrive_sign_in_url("detail", customer_name),
+                    use_container_width=True,
+                )
+            except Exception as exc:
+                st.error(f"OneDriveへの接続を開始できませんでした：{exc}")
+        else:
+            try:
+                profile = get_onedrive_profile(access_token)
+                account = (
+                    clean_value(profile.get("mail"), blank_text="")
+                    or clean_value(profile.get("userPrincipalName"), blank_text="")
+                )
+                display_name = clean_value(profile.get("displayName"), blank_text="")
+                st.caption(f"OneDrive接続中：{display_name or account}" + (f"（{account}）" if display_name and account else ""))
+            except Exception:
+                pass
+
+            st.markdown("#### 追加")
+            source_mode = st.radio(
+                "追加方法",
+                ["写真を撮る", "画像・PDFを選ぶ"],
+                horizontal=True,
+                key=f"onedrive_attachment_source_{suffix}",
+            )
+            camera_file = None
+            selected_file = None
+            if source_mode == "写真を撮る":
+                camera_file = st.camera_input(
+                    "カメラで撮影",
+                    key=f"onedrive_attachment_camera_{suffix}",
+                )
+            else:
+                selected_file = st.file_uploader(
+                    "画像またはPDFを1つ選択",
+                    type=["jpg", "jpeg", "png", "webp", "pdf"],
+                    accept_multiple_files=False,
+                    key=f"onedrive_attachment_uploader_{suffix}",
+                )
+
+            fixed_tags = st.multiselect(
+                "固定タグ",
+                list(ONEDRIVE_FIXED_TAGS),
+                key=f"onedrive_attachment_fixed_tags_{suffix}",
+            )
+            free_tags = st.text_input(
+                "自由タグ",
+                placeholder="例：北海道、タンク、要確認",
+                key=f"onedrive_attachment_free_tags_{suffix}",
+            )
+            remarks = st.text_area(
+                "備考",
+                placeholder="写真や資料について残したい内容",
+                height=90,
+                key=f"onedrive_attachment_remarks_{suffix}",
+            )
+            if st.button(
+                "OneDriveへ保存",
+                type="primary",
+                use_container_width=True,
+                key=f"onedrive_attachment_upload_{suffix}",
+            ):
+                uploaded = camera_file if source_mode == "写真を撮る" else selected_file
+                if uploaded is None:
+                    st.warning("写真を撮るか、画像・PDFを選んでください。")
+                else:
+                    try:
+                        tags = list(fixed_tags) + normalize_attachment_tags(free_tags)
+                        with st.spinner("OneDriveへ保存しています…"):
+                            saved = save_customer_onedrive_attachment(
+                                customer_name,
+                                customer_key,
+                                uploaded.name,
+                                uploaded.getvalue(),
+                                uploaded.type or mimetypes.guess_type(uploaded.name)[0] or "application/octet-stream",
+                                tags,
+                                remarks,
+                                access_token,
+                            )
+                        remember_change_history_warning(
+                            record_change_history_safely(
+                                "顧客",
+                                customer_key or "",
+                                customer_name,
+                                "追加",
+                                {
+                                    "ファイル": ("", saved.get("original_name", "")),
+                                    "タグ": ("", " ".join(f"#{tag}" for tag in saved.get("tags", []))),
+                                },
+                                section="写真・資料",
+                            )
+                        )
+                        st.session_state[success_key] = "写真・資料を保存しました。"
+                        st.session_state[limit_key] = ONEDRIVE_PAGE_SIZE
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(f"保存できませんでした：{exc}")
+
+        st.markdown("---")
+        st.markdown("#### 保存済み")
+        if not attachments:
+            st.info("保存されている写真・資料はありません。")
+            return
+
+        type_filter = st.selectbox(
+            "種類",
+            ["すべて", "写真", "PDF"],
+            key=f"onedrive_attachment_type_filter_{suffix}",
+        )
+        all_tags = sorted({tag for item in attachments for tag in item.get("tags", [])})
+        tag_filter = st.multiselect(
+            "タグで絞り込み",
+            all_tags,
+            key=f"onedrive_attachment_tag_filter_{suffix}",
+        ) if all_tags else []
+
+        filtered = []
+        for attachment in attachments:
+            if type_filter == "写真" and attachment.get("file_type") != "image":
+                continue
+            if type_filter == "PDF" and attachment.get("file_type") != "pdf":
+                continue
+            if tag_filter and not set(tag_filter).issubset(set(attachment.get("tags", []))):
+                continue
+            filtered.append(attachment)
+
+        limit = int(st.session_state.get(limit_key, ONEDRIVE_PAGE_SIZE))
+        active_edit_id = st.session_state.get(edit_key)
+        active_delete_id = st.session_state.get(delete_key)
+
+        if not filtered:
+            st.info("条件に一致する写真・資料はありません。")
+
+        for attachment in filtered[:limit]:
+            item_id = attachment.get("file_id", "")
+            metadata_id = attachment.get("id", "")
+            filename = attachment.get("original_name", "名称未設定")
+            with st.container(border=True):
+                if attachment.get("file_type") == "image" and access_token and item_id:
+                    thumb_key = f"onedrive_thumbnail_{item_id}"
+                    if not isinstance(st.session_state.get(thumb_key), bytes):
+                        try:
+                            thumbnail = download_onedrive_thumbnail(access_token, item_id)
+                            if thumbnail:
+                                st.session_state[thumb_key] = thumbnail
+                        except Exception:
+                            pass
+                    if isinstance(st.session_state.get(thumb_key), bytes):
+                        st.image(st.session_state[thumb_key], use_column_width=True)
+
+                icon = "🖼" if attachment.get("file_type") == "image" else "📄"
+                st.markdown(f"**{icon} {html.escape(filename)}**", unsafe_allow_html=True)
+                st.caption(
+                    f"{format_attachment_size(attachment.get('size'))}　"
+                    f"保存：{format_attachment_datetime(attachment.get('created_at'))}"
+                )
+                if attachment.get("tags"):
+                    st.markdown(" ".join(f"`#{tag}`" for tag in attachment["tags"]))
+                if attachment.get("remarks"):
+                    st.write(attachment["remarks"])
+                if attachment.get("web_url"):
+                    st.link_button(
+                        "OneDriveで開く",
+                        attachment["web_url"],
+                        use_container_width=True,
+                    )
+
+                if active_edit_id == metadata_id:
+                    current_fixed = [tag for tag in attachment.get("tags", []) if tag in ONEDRIVE_FIXED_TAGS]
+                    current_free = [tag for tag in attachment.get("tags", []) if tag not in ONEDRIVE_FIXED_TAGS]
+                    edited_fixed = st.multiselect(
+                        "固定タグを編集",
+                        list(ONEDRIVE_FIXED_TAGS),
+                        default=current_fixed,
+                        key=f"onedrive_attachment_edit_fixed_{metadata_id}",
+                    )
+                    edited_free = st.text_input(
+                        "自由タグを編集",
+                        value="、".join(current_free),
+                        key=f"onedrive_attachment_edit_free_{metadata_id}",
+                    )
+                    edited_remarks = st.text_area(
+                        "備考を編集",
+                        value=attachment.get("remarks", ""),
+                        height=90,
+                        key=f"onedrive_attachment_edit_remarks_{metadata_id}",
+                    )
+                    save_col, cancel_col = st.columns(2)
+                    with save_col:
+                        if st.button(
+                            "保存",
+                            key=f"onedrive_attachment_edit_save_{metadata_id}",
+                            type="primary",
+                            use_container_width=True,
+                        ):
+                            try:
+                                old_tags = " ".join(f"#{tag}" for tag in attachment.get("tags", []))
+                                new_tags = list(edited_fixed) + normalize_attachment_tags(edited_free)
+                                update_customer_onedrive_attachment_metadata(
+                                    attachment,
+                                    new_tags,
+                                    edited_remarks,
+                                )
+                                changes = {}
+                                new_tags_text = " ".join(f"#{tag}" for tag in normalize_attachment_tags(new_tags))
+                                if old_tags != new_tags_text:
+                                    changes["タグ"] = (old_tags, new_tags_text)
+                                if attachment.get("remarks", "") != str(edited_remarks or "").strip():
+                                    changes["備考"] = (attachment.get("remarks", ""), str(edited_remarks or "").strip())
+                                remember_change_history_warning(
+                                    record_change_history_safely(
+                                        "顧客",
+                                        customer_key or "",
+                                        customer_name,
+                                        "変更",
+                                        changes,
+                                        section=f"写真・資料：{filename}",
+                                    )
+                                )
+                                st.session_state.pop(edit_key, None)
+                                st.session_state[success_key] = "タグ・備考を更新しました。"
+                                st.rerun()
+                            except Exception as exc:
+                                st.error(f"更新できませんでした：{exc}")
+                    with cancel_col:
+                        if st.button(
+                            "キャンセル",
+                            key=f"onedrive_attachment_edit_cancel_{metadata_id}",
+                            use_container_width=True,
+                        ):
+                            st.session_state.pop(edit_key, None)
+                            st.rerun()
+                    continue
+
+                if active_delete_id == metadata_id:
+                    st.warning(f"「{filename}」をOneDriveから削除します。")
+                    delete_col, cancel_col = st.columns(2)
+                    with delete_col:
+                        if st.button(
+                            "削除する",
+                            key=f"onedrive_attachment_delete_yes_{metadata_id}",
+                            type="primary",
+                            use_container_width=True,
+                        ):
+                            if not access_token:
+                                st.error("削除するにはOneDriveへ接続してください。")
+                            else:
+                                try:
+                                    with st.spinner("削除しています…"):
+                                        delete_onedrive_file(access_token, item_id)
+                                        delete_customer_information(metadata_id)
+                                    remember_change_history_warning(
+                                        record_change_history_safely(
+                                            "顧客",
+                                            customer_key or "",
+                                            customer_name,
+                                            "削除",
+                                            {"ファイル": (filename, "")},
+                                            section="写真・資料",
+                                        )
+                                    )
+                                    st.session_state.pop(delete_key, None)
+                                    st.session_state.pop(f"onedrive_thumbnail_{item_id}", None)
+                                    st.session_state[success_key] = "写真・資料を削除しました。"
+                                    st.rerun()
+                                except Exception as exc:
+                                    st.error(f"削除できませんでした：{exc}")
+                    with cancel_col:
+                        if st.button(
+                            "キャンセル",
+                            key=f"onedrive_attachment_delete_no_{metadata_id}",
+                            use_container_width=True,
+                        ):
+                            st.session_state.pop(delete_key, None)
+                            st.rerun()
+                    continue
+
+                action_col, delete_col = st.columns(2)
+                with action_col:
+                    if st.button(
+                        "タグ・備考を編集",
+                        key=f"onedrive_attachment_edit_button_{metadata_id}",
+                        use_container_width=True,
+                    ):
+                        st.session_state[edit_key] = metadata_id
+                        st.session_state.pop(delete_key, None)
+                        st.rerun()
+                with delete_col:
+                    if st.button(
+                        "削除",
+                        key=f"onedrive_attachment_delete_button_{metadata_id}",
+                        use_container_width=True,
+                    ):
+                        st.session_state[delete_key] = metadata_id
+                        st.session_state.pop(edit_key, None)
+                        st.rerun()
+
+        if len(filtered) > limit:
+            if st.button(
+                "さらに表示",
+                key=f"onedrive_attachment_more_{suffix}",
+                use_container_width=True,
+            ):
+                st.session_state[limit_key] = limit + ONEDRIVE_PAGE_SIZE
+                st.rerun()
+
+        if access_token:
+            st.markdown("---")
+            if st.button(
+                "この端末のOneDrive接続を解除",
+                key=f"onedrive_attachment_signout_{suffix}",
+                use_container_width=True,
+            ):
+                clear_onedrive_auth_state()
+                st.rerun()
+
+
+
 def reorder_customer_information(first_item, second_item):
     """隣接2行を1回のupsertで入れ替え、並び順をまとめて保存する。"""
     payload = []
@@ -4684,6 +5697,7 @@ def render_customer_information_card(customer_name, customer_key=None):
                 if not is_past_product_note_item(item)
                 and not is_estimate_item(item)
                 and not is_carrier_freight_item(item)
+                and not is_onedrive_attachment_item(item)
             ]
         except Exception as exc:
             st.warning(str(exc))
@@ -5822,6 +6836,7 @@ def show_customer_detail(df, customer_name):
     customer_key = get_stable_customer_key(detail)
     render_customer_information_card(customer_name, customer_key)
     render_customer_estimates_section(customer_name, customer_key)
+    render_customer_attachments_section(customer_name, customer_key)
 
     # WATER itのポイント名と顧客名が一致する場合だけ、最新値を読み取り専用で表示する。
     render_customer_water_it_card(customer_name)
@@ -12360,6 +13375,7 @@ def create_full_data_backup_zip():
     calendar_df = backup_build_calendar_export(customer_df)
     estimates_df = estimate_rows_to_dataframe(customer_information)
     carrier_freights_df = carrier_freight_rows_to_dataframe(customer_information)
+    onedrive_attachments_df = onedrive_attachment_rows_to_dataframe(customer_information)
 
     backup_add_entry(entries, f"元Excel/{main_name}", main_excel, "顧客・在庫の元Excel")
     backup_add_entry(entries, f"元Excel/{dispatch_name}", dispatch_excel, "配車表の元Excel")
@@ -12375,7 +13391,7 @@ def create_full_data_backup_zip():
         ("CSV/06_ソリュブル顧客概要.csv", soluble_summary_df, "ソリュブル顧客の概要"),
         ("CSV/07_WATER_it表示データ.csv", water_df, "アプリで表示できるWATER it情報（元CSVは含まない）"),
         ("CSV/08_WATER_it保存メタデータ.csv", backup_dataframe(water_metadata), "WATER it保存データの概要のみ"),
-        ("CSV/09_顧客情報_Supabase生データ.csv", backup_dataframe(customer_information), "顧客情報・過去商品メモ・提案見積り・運送会社運賃の生データ"),
+        ("CSV/09_顧客情報_Supabase生データ.csv", backup_dataframe(customer_information), "顧客情報・過去商品メモ・提案見積り・運送会社運賃・写真資料メタデータの生データ"),
         ("CSV/10_メモ_Supabase生データ.csv", notes_df, "通常メモ・取引先メモの生データ"),
         ("CSV/11_LINE状態.csv", line_df, "LINE接続状態"),
     ]
@@ -12417,6 +13433,11 @@ def create_full_data_backup_zip():
                 f"CSV/{next_number + 3:02d}_運送会社運賃履歴.csv",
                 carrier_freights_df,
                 "運送会社ごとの運賃履歴",
+            ),
+            (
+                f"CSV/{next_number + 4:02d}_写真資料メタデータ.csv",
+                onedrive_attachments_df,
+                "OneDriveに保存した顧客の写真・PDFの管理情報（ファイル本体はOneDrive）",
             ),
         ]
     )
@@ -12675,6 +13696,7 @@ with col_logout:
         st.session_state.selected_customer = None
         st.session_state.selected_partner_id = None
         st.session_state.selected_partner_type = None
+        clear_onedrive_auth_state()
         try:
             st.query_params.clear()
         except Exception:
