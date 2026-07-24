@@ -9155,7 +9155,7 @@ def get_calendar_month_start(df, date_column):
     )
 
 
-def change_dispatch_month(delta):
+def change_dispatch_month(delta, scroll_target=None):
     current = date(
         st.session_state["dispatch_calendar_year"],
         st.session_state["dispatch_calendar_month"],
@@ -9173,6 +9173,68 @@ def change_dispatch_month(delta):
 
     st.session_state["dispatch_calendar_year"] = year
     st.session_state["dispatch_calendar_month"] = month
+    if scroll_target in {"top", "bottom"}:
+        st.session_state["dispatch_calendar_month_scroll_target"] = scroll_target
+
+
+def render_month_navigation_anchor(anchor_id):
+    """月移動後のスクロール先として使う非表示アンカーを置く。"""
+    safe_anchor_id = re.sub(r"[^0-9A-Za-z_-]", "", str(anchor_id or ""))
+    if not safe_anchor_id:
+        return
+    st.markdown(
+        f'<div id="{safe_anchor_id}" style="height:0;scroll-margin-top:88px;"></div>',
+        unsafe_allow_html=True,
+    )
+
+
+def restore_month_navigation_scroll(scroll_target, top_anchor_id):
+    """下側の月移動後だけ、翌月は先頭・前月は末尾へ移動する。"""
+    if scroll_target not in {"top", "bottom"}:
+        return
+
+    safe_anchor_id = re.sub(r"[^0-9A-Za-z_-]", "", str(top_anchor_id or ""))
+    target_json = json.dumps(scroll_target)
+    anchor_json = json.dumps(safe_anchor_id)
+    script = f'''<script>
+    (() => {{
+      const scrollTarget = {target_json};
+      const anchorId = {anchor_json};
+      let parentWindow;
+      let parentDocument;
+      try {{
+        parentWindow = window.parent;
+        parentDocument = parentWindow.document;
+      }} catch (_) {{
+        return;
+      }}
+
+      const move = () => {{
+        if (scrollTarget === 'bottom') {{
+          const bodyHeight = parentDocument.body ? parentDocument.body.scrollHeight : 0;
+          const documentHeight = parentDocument.documentElement
+            ? parentDocument.documentElement.scrollHeight
+            : 0;
+          parentWindow.scrollTo({{
+            top: Math.max(bodyHeight, documentHeight),
+            left: 0,
+            behavior: 'auto',
+          }});
+          return;
+        }}
+
+        const anchor = parentDocument.getElementById(anchorId);
+        if (!anchor) return;
+        const top = anchor.getBoundingClientRect().top + parentWindow.scrollY - 82;
+        parentWindow.scrollTo({{top: Math.max(0, top), left: 0, behavior: 'auto'}});
+      }};
+
+      window.setTimeout(move, 60);
+      window.setTimeout(move, 240);
+      window.setTimeout(move, 650);
+    }})();
+    </script>'''
+    components.html(script, height=0, scrolling=False)
 
 
 def clean_dispatch_maker(value):
@@ -9435,6 +9497,9 @@ def build_two_day_panel_html(target_day, items):
 
 def show_dispatch_month_switcher(month_start, key_suffix="top"):
     col_prev, col_month, col_next = st.columns([1, 2, 1])
+    is_bottom = key_suffix == "bottom"
+    prev_args = (-1, "bottom") if is_bottom else (-1,)
+    next_args = (1, "top") if is_bottom else (1,)
 
     with col_prev:
         st.button(
@@ -9442,7 +9507,7 @@ def show_dispatch_month_switcher(month_start, key_suffix="top"):
             key=f"dispatch_prev_month_{key_suffix}",
             use_container_width=True,
             on_click=change_dispatch_month,
-            args=(-1,),
+            args=prev_args,
         )
 
     with col_month:
@@ -9457,7 +9522,7 @@ def show_dispatch_month_switcher(month_start, key_suffix="top"):
             key=f"dispatch_next_month_{key_suffix}",
             use_container_width=True,
             on_click=change_dispatch_month,
-            args=(1,),
+            args=next_args,
         )
 
 
@@ -9555,6 +9620,10 @@ def show_dispatch_calendar(df):
     st.markdown("---")
     st.header("🗓 配車カレンダー")
     show_back_home_button("calendar_back_home")
+    month_scroll_target = st.session_state.pop(
+        "dispatch_calendar_month_scroll_target",
+        None,
+    )
 
     inject_dispatch_calendar_css()
 
@@ -9588,6 +9657,7 @@ def show_dispatch_calendar(df):
         key="dispatch_calendar_view",
     )
 
+    render_month_navigation_anchor("dispatch_calendar_month_content_top")
     if view == "📱 2日表示":
         show_two_day_dispatch_calendar(rows_by_day, month_start)
     else:
@@ -9595,6 +9665,10 @@ def show_dispatch_calendar(df):
 
     st.markdown("---")
     show_dispatch_month_switcher(month_start, key_suffix="bottom")
+    restore_month_navigation_scroll(
+        month_scroll_target,
+        "dispatch_calendar_month_content_top",
+    )
 
 
 # =========================
@@ -10157,12 +10231,14 @@ def get_dispatch_table_month_name():
     return selected
 
 
-def change_dispatch_table_month(delta):
+def change_dispatch_table_month(delta, scroll_target=None):
     """配車表の表示月を前月・翌月へ移動し、月別の絞り込みだけを解除する。"""
     current = get_dispatch_table_month_name()
     current_index = DISPATCH_MONTH_SHEETS.index(current)
     next_index = (current_index + int(delta)) % len(DISPATCH_MONTH_SHEETS)
     st.session_state["dispatch_table_month"] = DISPATCH_MONTH_SHEETS[next_index]
+    if scroll_target in {"top", "bottom"}:
+        st.session_state["dispatch_table_month_scroll_target"] = scroll_target
 
     for key in list(st.session_state.keys()):
         if key.startswith("dispatch_filter_"):
@@ -10192,6 +10268,9 @@ def dispatch_table_month_title(df, selected_month):
 def show_dispatch_table_month_switcher(df, selected_month, key_suffix="top"):
     """配車カレンダーと同じ形で、配車表の表示月を切り替える。"""
     col_prev, col_month, col_next = st.columns([1, 2, 1])
+    is_bottom = key_suffix == "bottom"
+    prev_args = (-1, "bottom") if is_bottom else (-1,)
+    next_args = (1, "top") if is_bottom else (1,)
 
     with col_prev:
         st.button(
@@ -10199,7 +10278,7 @@ def show_dispatch_table_month_switcher(df, selected_month, key_suffix="top"):
             key=f"dispatch_table_prev_month_{key_suffix}",
             use_container_width=True,
             on_click=change_dispatch_table_month,
-            args=(-1,),
+            args=prev_args,
         )
 
     with col_month:
@@ -10215,7 +10294,7 @@ def show_dispatch_table_month_switcher(df, selected_month, key_suffix="top"):
             key=f"dispatch_table_next_month_{key_suffix}",
             use_container_width=True,
             on_click=change_dispatch_table_month,
-            args=(1,),
+            args=next_args,
         )
 
 
@@ -10223,6 +10302,10 @@ def show_dispatch_board():
     st.markdown("---")
     st.header("🚚 配車表")
     show_back_home_button("dispatch_board_back_home")
+    month_scroll_target = st.session_state.pop(
+        "dispatch_table_month_scroll_target",
+        None,
+    )
     st.caption("配車表1.xlsmの月別シートを、元のExcelに近い一覧で表示します。")
 
     with st.spinner("配車表を読み込んでいます…"):
@@ -10241,11 +10324,16 @@ def show_dispatch_board():
         f"**参照：{selected_month}シート　｜　全 {len(month_df)}件　｜　条件一致 {len(filtered)}件**"
     )
     st.caption("※ 1件は、元のExcelの月別シートにある明細1行です。")
+    render_month_navigation_anchor("dispatch_table_month_content_top")
 
     if filtered.empty:
         st.info("条件に一致する配車はありません。")
         st.markdown("---")
         show_dispatch_table_month_switcher(df, selected_month, key_suffix="bottom")
+        restore_month_navigation_scroll(
+            month_scroll_target,
+            "dispatch_table_month_content_top",
+        )
         return
 
     display_df = filtered.sort_values(
@@ -10275,6 +10363,10 @@ def show_dispatch_board():
 
     st.markdown("---")
     show_dispatch_table_month_switcher(df, selected_month, key_suffix="bottom")
+    restore_month_navigation_scroll(
+        month_scroll_target,
+        "dispatch_table_month_content_top",
+    )
 
 
 # =========================
