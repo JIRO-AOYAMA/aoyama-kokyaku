@@ -11938,7 +11938,7 @@ def show_top_home():
     with col5:
         st.markdown(render_page_link("🕘 変更確認", page="change_history"), unsafe_allow_html=True)
     with col6:
-        st.markdown(render_page_link("📄 見積り", page="estimates"), unsafe_allow_html=True)
+        st.markdown(render_page_link("📄 商品見積り履歴", page="estimates"), unsafe_allow_html=True)
 
 
 # =========================
