@@ -807,6 +807,227 @@ def download_onedrive_thumbnail(access_token, item_id):
     return image_response.content
 
 
+def render_clickable_onedrive_thumbnail(thumbnail_content, filename, trigger_label, compact_height=150):
+    """小さなサムネイル自体をタップして、既存のStreamlit表示ボタンを実行する。"""
+    thumbnail_bytes = bytes(thumbnail_content or b"")
+    safe_filename = str(filename or "画像")
+    safe_trigger_label = str(trigger_label or "")
+    tile_id = "onedrive_thumbnail_tile_" + hashlib.sha256(
+        (safe_filename + safe_trigger_label + str(len(thumbnail_bytes))).encode("utf-8")
+    ).hexdigest()[:16]
+
+    if thumbnail_bytes:
+        guessed_type = mimetypes.guess_type(safe_filename)[0] or "image/jpeg"
+        if not str(guessed_type).startswith("image/"):
+            guessed_type = "image/jpeg"
+        encoded = base64.b64encode(thumbnail_bytes).decode("ascii")
+        image_url = f"data:{guessed_type};base64,{encoded}"
+        image_markup = '<img class="od-thumb-image" alt="">'
+    else:
+        image_url = ""
+        image_markup = '<div class="od-thumb-placeholder">🖼</div>'
+
+    components.html(
+        f"""
+        <div id={json.dumps(tile_id)} class="od-thumb-tile" role="button" tabindex="0"
+             aria-label={json.dumps(safe_filename + 'を表示')} title={json.dumps(safe_filename)}>
+          {image_markup}
+          <div class="od-thumb-hint">タップして表示</div>
+        </div>
+        <style>
+          html, body {{ margin:0; padding:0; background:transparent; overflow:hidden; }}
+          .od-thumb-tile {{
+            position:relative;
+            width:100%;
+            height:{int(compact_height)}px;
+            overflow:hidden;
+            border-radius:10px;
+            background:#eef1f5;
+            cursor:pointer;
+            touch-action:manipulation;
+            box-shadow:inset 0 0 0 1px rgba(49,51,63,.12);
+          }}
+          .od-thumb-image {{
+            display:block;
+            width:100%;
+            height:100%;
+            object-fit:cover;
+            object-position:center;
+            -webkit-user-drag:none;
+            user-select:none;
+          }}
+          .od-thumb-placeholder {{
+            width:100%;
+            height:100%;
+            display:flex;
+            align-items:center;
+            justify-content:center;
+            font:42px/1 system-ui, sans-serif;
+          }}
+          .od-thumb-hint {{
+            position:absolute;
+            left:7px;
+            bottom:7px;
+            padding:3px 7px;
+            border-radius:10px;
+            color:#fff;
+            background:rgba(0,0,0,.58);
+            font:11px/1.35 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+            pointer-events:none;
+          }}
+          .od-thumb-tile:focus-visible {{ outline:3px solid #4c8bf5; outline-offset:-3px; }}
+        </style>
+        <script>
+        (() => {{
+          const triggerLabel = {json.dumps(safe_trigger_label)};
+          const tile = document.getElementById({json.dumps(tile_id)});
+          const parentDocument = window.parent.document;
+          const findTrigger = () => Array.from(parentDocument.querySelectorAll('button')).find(
+            (button) => (button.textContent || '').trim() === triggerLabel
+          );
+          const hideTrigger = () => {{
+            const trigger = findTrigger();
+            if (!trigger) return null;
+            const wrapper = trigger.closest('[data-testid="stButton"]');
+            if (wrapper) wrapper.style.display = 'none';
+            else trigger.style.display = 'none';
+            return trigger;
+          }};
+          const activate = () => {{
+            const trigger = hideTrigger();
+            if (trigger) trigger.click();
+          }};
+          hideTrigger();
+          window.setTimeout(hideTrigger, 40);
+          window.setTimeout(hideTrigger, 160);
+          tile.addEventListener('click', activate);
+          tile.addEventListener('keydown', (event) => {{
+            if (event.key === 'Enter' || event.key === ' ') {{
+              event.preventDefault();
+              activate();
+            }}
+          }});
+          const image = tile.querySelector('.od-thumb-image');
+          if (image) image.src = {json.dumps(image_url)};
+        }})();
+        </script>
+        """,
+        height=int(compact_height) + 2,
+        scrolling=False,
+    )
+
+
+def render_clickable_onedrive_pdf_tile(filename, trigger_label, compact_height=150):
+    """PDFを写真と同じ小型カードで表示し、カード全体をタップ可能にする。"""
+    safe_filename = str(filename or "PDF")
+    safe_trigger_label = str(trigger_label or "")
+    tile_id = "onedrive_pdf_tile_" + hashlib.sha256(
+        (safe_filename + safe_trigger_label).encode("utf-8")
+    ).hexdigest()[:16]
+    components.html(
+        f"""
+        <div id={json.dumps(tile_id)} class="od-pdf-tile" role="button" tabindex="0"
+             aria-label={json.dumps(safe_filename + 'を表示')} title={json.dumps(safe_filename)}>
+          <div class="od-pdf-icon">PDF</div>
+          <div class="od-pdf-name"></div>
+          <div class="od-pdf-hint">タップして表示</div>
+        </div>
+        <style>
+          html, body {{ margin:0; padding:0; background:transparent; overflow:hidden; }}
+          .od-pdf-tile {{
+            position:relative;
+            width:100%;
+            height:{int(compact_height)}px;
+            box-sizing:border-box;
+            display:flex;
+            flex-direction:column;
+            align-items:center;
+            justify-content:center;
+            gap:8px;
+            padding:14px 10px 25px;
+            overflow:hidden;
+            border-radius:10px;
+            background:#f4f5f7;
+            cursor:pointer;
+            touch-action:manipulation;
+            box-shadow:inset 0 0 0 1px rgba(49,51,63,.12);
+            font-family:system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+          }}
+          .od-pdf-icon {{
+            display:flex;
+            align-items:center;
+            justify-content:center;
+            width:58px;
+            height:70px;
+            border-radius:6px;
+            background:#fff;
+            box-shadow:0 1px 5px rgba(0,0,0,.15);
+            color:#b42318;
+            font-weight:800;
+            font-size:19px;
+          }}
+          .od-pdf-name {{
+            width:100%;
+            overflow:hidden;
+            text-overflow:ellipsis;
+            white-space:nowrap;
+            text-align:center;
+            color:#31333f;
+            font-size:12px;
+          }}
+          .od-pdf-hint {{
+            position:absolute;
+            left:7px;
+            bottom:7px;
+            padding:3px 7px;
+            border-radius:10px;
+            color:#fff;
+            background:rgba(0,0,0,.58);
+            font-size:11px;
+            line-height:1.35;
+            pointer-events:none;
+          }}
+          .od-pdf-tile:focus-visible {{ outline:3px solid #4c8bf5; outline-offset:-3px; }}
+        </style>
+        <script>
+        (() => {{
+          const triggerLabel = {json.dumps(safe_trigger_label)};
+          const tile = document.getElementById({json.dumps(tile_id)});
+          tile.querySelector('.od-pdf-name').textContent = {json.dumps(safe_filename)};
+          const parentDocument = window.parent.document;
+          const findTrigger = () => Array.from(parentDocument.querySelectorAll('button')).find(
+            (button) => (button.textContent || '').trim() === triggerLabel
+          );
+          const hideTrigger = () => {{
+            const trigger = findTrigger();
+            if (!trigger) return null;
+            const wrapper = trigger.closest('[data-testid="stButton"]');
+            if (wrapper) wrapper.style.display = 'none';
+            else trigger.style.display = 'none';
+            return trigger;
+          }};
+          const activate = () => {{
+            const trigger = hideTrigger();
+            if (trigger) trigger.click();
+          }};
+          hideTrigger();
+          window.setTimeout(hideTrigger, 40);
+          window.setTimeout(hideTrigger, 160);
+          tile.addEventListener('click', activate);
+          tile.addEventListener('keydown', (event) => {{
+            if (event.key === 'Enter' || event.key === ' ') {{
+              event.preventDefault();
+              activate();
+            }}
+          }});
+        }})();
+        </script>
+        """,
+        height=int(compact_height) + 2,
+        scrolling=False,
+    )
+
+
 def show_onedrive_image_dialog(image_content, filename):
     """ページを移動せず、ピンチ操作対応の全画面画像ビューアーを開く。"""
     image_bytes = bytes(image_content or b"")
@@ -4361,153 +4582,178 @@ def render_customer_attachments_section(customer_name, customer_key=None):
         if not filtered:
             st.info("条件に一致する写真・資料はありません。")
 
-        for attachment in filtered[:limit]:
+        visible_attachments = filtered[:limit]
+        grid_column_count = 2 if is_mobile_browser() else 3
+        grid_columns = []
+
+        for attachment_index, attachment in enumerate(visible_attachments):
+            if attachment_index % grid_column_count == 0:
+                grid_columns = st.columns(grid_column_count, gap="small")
+
             item_id = attachment.get("file_id", "")
             metadata_id = attachment.get("id", "")
             filename = attachment.get("original_name", "名称未設定")
-            with st.container(border=True):
-                if attachment.get("file_type") == "image" and access_token and item_id:
-                    thumb_key = f"onedrive_thumbnail_{item_id}"
-                    if not isinstance(st.session_state.get(thumb_key), bytes):
-                        try:
-                            thumbnail = download_onedrive_thumbnail(access_token, item_id)
-                            if thumbnail:
-                                st.session_state[thumb_key] = thumbnail
-                        except Exception:
-                            pass
-                    if isinstance(st.session_state.get(thumb_key), bytes):
-                        st.image(st.session_state[thumb_key], use_column_width=True)
+            with grid_columns[attachment_index % grid_column_count]:
+                with st.container(border=True):
+                    preview_trigger_label = f"__onedrive_attachment_preview_{metadata_id}__"
+                    preview_clicked = st.button(
+                        preview_trigger_label,
+                        key=f"onedrive_attachment_preview_button_{metadata_id}",
+                    )
 
-                icon = "🖼" if attachment.get("file_type") == "image" else "📄"
-                st.markdown(f"**{icon} {html.escape(filename)}**", unsafe_allow_html=True)
-                st.caption(
-                    f"{format_attachment_size(attachment.get('size'))}　"
-                    f"保存：{format_attachment_datetime(attachment.get('created_at'))}"
-                )
-                if attachment.get("tags"):
-                    st.markdown(" ".join(f"`#{tag}`" for tag in attachment["tags"]))
-                if attachment.get("remarks"):
-                    st.write(attachment["remarks"])
-                preview_label = (
-                    "画像を大きく表示"
-                    if attachment.get("file_type") == "image"
-                    else "PDFを表示"
-                )
-                if st.button(
-                    preview_label,
-                    key=f"onedrive_attachment_preview_button_{metadata_id}",
-                    use_container_width=True,
-                ):
-                    if not access_token or not item_id:
-                        st.error("表示するにはOneDriveへ接続してください。")
+                    if attachment.get("file_type") == "image":
+                        thumbnail_content = None
+                        if access_token and item_id:
+                            thumb_key = f"onedrive_thumbnail_{item_id}"
+                            if not isinstance(st.session_state.get(thumb_key), bytes):
+                                try:
+                                    thumbnail = download_onedrive_thumbnail(access_token, item_id)
+                                    if thumbnail:
+                                        st.session_state[thumb_key] = thumbnail
+                                except Exception:
+                                    pass
+                            if isinstance(st.session_state.get(thumb_key), bytes):
+                                thumbnail_content = st.session_state[thumb_key]
+                        render_clickable_onedrive_thumbnail(
+                            thumbnail_content,
+                            filename,
+                            preview_trigger_label,
+                            compact_height=142 if is_mobile_browser() else 150,
+                        )
                     else:
-                        try:
-                            with st.spinner("ファイルを読み込んでいます…"):
-                                content = download_onedrive_file(access_token, item_id)
-                            if attachment.get("file_type") == "image":
-                                show_onedrive_image_dialog(content, filename)
-                            else:
-                                show_onedrive_pdf_dialog(
-                                    content,
-                                    filename,
-                                    attachment.get("mime_type") or "application/pdf",
-                                    metadata_id,
-                                )
-                        except Exception as exc:
-                            st.error(f"表示できませんでした：{exc}")
+                        render_clickable_onedrive_pdf_tile(
+                            filename,
+                            preview_trigger_label,
+                            compact_height=142 if is_mobile_browser() else 150,
+                        )
 
-                if active_edit_id == metadata_id:
-                    current_fixed = [tag for tag in attachment.get("tags", []) if tag in ONEDRIVE_FIXED_TAGS]
-                    current_free = [tag for tag in attachment.get("tags", []) if tag not in ONEDRIVE_FIXED_TAGS]
-                    edited_fixed = st.multiselect(
-                        "固定タグを編集",
-                        list(ONEDRIVE_FIXED_TAGS),
-                        default=current_fixed,
-                        key=f"onedrive_attachment_edit_fixed_{metadata_id}",
-                    )
-                    edited_free = st.text_input(
-                        "自由タグを編集",
-                        value="、".join(current_free),
-                        key=f"onedrive_attachment_edit_free_{metadata_id}",
-                    )
-                    edited_remarks = st.text_area(
-                        "備考を編集",
-                        value=attachment.get("remarks", ""),
-                        height=90,
-                        key=f"onedrive_attachment_edit_remarks_{metadata_id}",
-                    )
-                    save_col, cancel_col = st.columns(2)
-                    with save_col:
-                        if st.button(
-                            "保存",
-                            key=f"onedrive_attachment_edit_save_{metadata_id}",
-                            type="primary",
-                            use_container_width=True,
-                        ):
+                    if preview_clicked:
+                        if not access_token or not item_id:
+                            st.error("表示するにはOneDriveへ接続してください。")
+                        else:
                             try:
-                                old_tags = " ".join(f"#{tag}" for tag in attachment.get("tags", []))
-                                new_tags = list(edited_fixed) + normalize_attachment_tags(edited_free)
-                                update_customer_onedrive_attachment_metadata(
-                                    attachment,
-                                    new_tags,
-                                    edited_remarks,
-                                )
-                                changes = {}
-                                new_tags_text = " ".join(f"#{tag}" for tag in normalize_attachment_tags(new_tags))
-                                if old_tags != new_tags_text:
-                                    changes["タグ"] = (old_tags, new_tags_text)
-                                if attachment.get("remarks", "") != str(edited_remarks or "").strip():
-                                    changes["備考"] = (attachment.get("remarks", ""), str(edited_remarks or "").strip())
-                                remember_change_history_warning(
-                                    record_change_history_safely(
-                                        "顧客",
-                                        customer_key or "",
-                                        customer_name,
-                                        "変更",
-                                        changes,
-                                        section=f"写真・資料：{filename}",
+                                with st.spinner("ファイルを読み込んでいます…"):
+                                    content = download_onedrive_file(access_token, item_id)
+                                if attachment.get("file_type") == "image":
+                                    show_onedrive_image_dialog(content, filename)
+                                else:
+                                    show_onedrive_pdf_dialog(
+                                        content,
+                                        filename,
+                                        attachment.get("mime_type") or "application/pdf",
+                                        metadata_id,
                                     )
-                                )
-                                st.session_state.pop(edit_key, None)
-                                st.session_state[success_key] = "タグ・備考を更新しました。"
-                                st.rerun()
                             except Exception as exc:
-                                st.error(f"更新できませんでした：{exc}")
-                    with cancel_col:
+                                st.error(f"表示できませんでした：{exc}")
+
+                    icon = "🖼" if attachment.get("file_type") == "image" else "📄"
+                    short_filename = filename if len(filename) <= 24 else filename[:21] + "…"
+                    st.markdown(
+                        f"**{icon} {html.escape(short_filename)}**",
+                        unsafe_allow_html=True,
+                    )
+                    st.caption(
+                        f"{format_attachment_size(attachment.get('size'))}　"
+                        f"{format_attachment_datetime(attachment.get('created_at'))}"
+                    )
+                    if attachment.get("tags"):
+                        st.markdown(" ".join(f"`#{tag}`" for tag in attachment["tags"]))
+                    if attachment.get("remarks"):
+                        st.caption(attachment["remarks"])
+
+                    if active_edit_id == metadata_id:
+                        current_fixed = [tag for tag in attachment.get("tags", []) if tag in ONEDRIVE_FIXED_TAGS]
+                        current_free = [tag for tag in attachment.get("tags", []) if tag not in ONEDRIVE_FIXED_TAGS]
+                        edited_fixed = st.multiselect(
+                            "固定タグを編集",
+                            list(ONEDRIVE_FIXED_TAGS),
+                            default=current_fixed,
+                            key=f"onedrive_attachment_edit_fixed_{metadata_id}",
+                        )
+                        edited_free = st.text_input(
+                            "自由タグを編集",
+                            value="、".join(current_free),
+                            key=f"onedrive_attachment_edit_free_{metadata_id}",
+                        )
+                        edited_remarks = st.text_area(
+                            "備考を編集",
+                            value=attachment.get("remarks", ""),
+                            height=90,
+                            key=f"onedrive_attachment_edit_remarks_{metadata_id}",
+                        )
+                        save_col, cancel_col = st.columns(2)
+                        with save_col:
+                            if st.button(
+                                "保存",
+                                key=f"onedrive_attachment_edit_save_{metadata_id}",
+                                type="primary",
+                                use_container_width=True,
+                            ):
+                                try:
+                                    old_tags = " ".join(f"#{tag}" for tag in attachment.get("tags", []))
+                                    new_tags = list(edited_fixed) + normalize_attachment_tags(edited_free)
+                                    update_customer_onedrive_attachment_metadata(
+                                        attachment,
+                                        new_tags,
+                                        edited_remarks,
+                                    )
+                                    changes = {}
+                                    new_tags_text = " ".join(f"#{tag}" for tag in normalize_attachment_tags(new_tags))
+                                    if old_tags != new_tags_text:
+                                        changes["タグ"] = (old_tags, new_tags_text)
+                                    if attachment.get("remarks", "") != str(edited_remarks or "").strip():
+                                        changes["備考"] = (attachment.get("remarks", ""), str(edited_remarks or "").strip())
+                                    remember_change_history_warning(
+                                        record_change_history_safely(
+                                            "顧客",
+                                            customer_key or "",
+                                            customer_name,
+                                            "変更",
+                                            changes,
+                                            section=f"写真・資料：{filename}",
+                                        )
+                                    )
+                                    st.session_state.pop(edit_key, None)
+                                    st.session_state[success_key] = "タグ・備考を更新しました。"
+                                    st.rerun()
+                                except Exception as exc:
+                                    st.error(f"更新できませんでした：{exc}")
+                        with cancel_col:
+                            if st.button(
+                                "キャンセル",
+                                key=f"onedrive_attachment_edit_cancel_{metadata_id}",
+                                use_container_width=True,
+                            ):
+                                st.session_state.pop(edit_key, None)
+                                st.rerun()
+                        continue
+
+                    action_col, delete_col = st.columns(2, gap="small")
+                    with action_col:
                         if st.button(
-                            "キャンセル",
-                            key=f"onedrive_attachment_edit_cancel_{metadata_id}",
+                            "編集",
+                            key=f"onedrive_attachment_edit_button_{metadata_id}",
+                            use_container_width=True,
+                            help="タグ・備考を編集",
+                        ):
+                            st.session_state[edit_key] = metadata_id
+                            st.rerun()
+                    with delete_col:
+                        if st.button(
+                            "削除",
+                            key=f"onedrive_attachment_delete_button_{metadata_id}",
                             use_container_width=True,
                         ):
                             st.session_state.pop(edit_key, None)
-                            st.rerun()
-                    continue
-
-                action_col, delete_col = st.columns(2)
-                with action_col:
-                    if st.button(
-                        "タグ・備考を編集",
-                        key=f"onedrive_attachment_edit_button_{metadata_id}",
-                        use_container_width=True,
-                    ):
-                        st.session_state[edit_key] = metadata_id
-                        st.rerun()
-                with delete_col:
-                    if st.button(
-                        "削除",
-                        key=f"onedrive_attachment_delete_button_{metadata_id}",
-                        use_container_width=True,
-                    ):
-                        st.session_state.pop(edit_key, None)
-                        confirm_onedrive_attachment_delete_dialog(
-                            access_token,
-                            attachment,
-                            customer_key,
-                            customer_name,
-                            success_key,
-                            open_key,
-                            restore_key,
-                        )
+                            confirm_onedrive_attachment_delete_dialog(
+                                access_token,
+                                attachment,
+                                customer_key,
+                                customer_name,
+                                success_key,
+                                open_key,
+                                restore_key,
+                            )
 
         if len(filtered) > limit:
             if st.button(
