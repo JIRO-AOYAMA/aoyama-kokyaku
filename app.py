@@ -279,6 +279,8 @@ ONEDRIVE_PRODUCTION_REDIRECT_URI = "https://aoyama-kokyaku.streamlit.app"
 ONEDRIVE_TEST_REDIRECT_HOST = "aoyama-onedrive-test.streamlit.app"
 ONEDRIVE_ROOT_FOLDER = "取引先カルテ"
 ONEDRIVE_CUSTOMER_FOLDER = "顧客"
+ONEDRIVE_SUPPLIER_FOLDER = "仕入先"
+ONEDRIVE_CARRIER_FOLDER = "運送会社"
 ONEDRIVE_ATTACHMENT_PREFIX = "__onedrive_attachment__:"
 ONEDRIVE_ATTACHMENT_VERSION = 1
 ONEDRIVE_FIXED_TAGS = ("設備", "名刺", "納品場所", "商品", "トラブル")
@@ -466,17 +468,24 @@ def get_raw_query_params():
         }
 
 
-def set_query_params_after_onedrive_auth(page="home", customer=""):
+def set_query_params_after_onedrive_auth(
+    page="home",
+    customer="",
+    partner_id="",
+    partner_type="",
+):
+    params = {"logged_in": "1", "page": str(page or "home")}
+    if customer:
+        params["customer"] = str(customer)
+    if partner_id:
+        params["partner_id"] = str(partner_id)
+    if partner_type:
+        params["partner_type"] = str(partner_type)
     try:
         st.query_params.clear()
-        st.query_params["logged_in"] = "1"
-        st.query_params["page"] = str(page or "home")
-        if customer:
-            st.query_params["customer"] = str(customer)
+        for key, value in params.items():
+            st.query_params[key] = value
     except Exception:
-        params = {"logged_in": "1", "page": str(page or "home")}
-        if customer:
-            params["customer"] = str(customer)
         st.experimental_set_query_params(**params)
 
 
@@ -489,7 +498,12 @@ def make_pkce_challenge(verifier):
     return base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
 
 
-def build_onedrive_sign_in_url(return_page="home", customer_name=""):
+def build_onedrive_sign_in_url(
+    return_page="home",
+    customer_name="",
+    partner_id="",
+    partner_type="",
+):
     client_id, _, redirect_uri = read_onedrive_settings()
     state = uuid.uuid4().hex
     verifier = make_pkce_verifier()
@@ -500,6 +514,8 @@ def build_onedrive_sign_in_url(return_page="home", customer_name=""):
             "redirect_uri": redirect_uri,
             "return_page": str(return_page or "home"),
             "customer_name": str(customer_name or ""),
+            "partner_id": str(partner_id or ""),
+            "partner_type": str(partner_type or ""),
         },
     )
     params = {
@@ -602,10 +618,15 @@ def process_onedrive_callback_if_present():
     pending = pop_onedrive_pending_auth_flow(state) if state else None
     return_page = str((pending or {}).get("return_page") or "home")
     customer_name = str((pending or {}).get("customer_name") or "")
+    partner_id = str((pending or {}).get("partner_id") or "")
+    partner_type = str((pending or {}).get("partner_type") or "")
 
     st.session_state.authenticated = True
     st.session_state["page"] = return_page
     st.session_state["selected_customer"] = customer_name if return_page == "detail" else None
+    if return_page == "partner_detail":
+        st.session_state["selected_partner_id"] = partner_id
+        st.session_state["selected_partner_type"] = partner_type
 
     try:
         if params.get("error"):
@@ -646,7 +667,12 @@ def process_onedrive_callback_if_present():
     except Exception as exc:
         st.session_state["onedrive_auth_error"] = str(exc)
 
-    set_query_params_after_onedrive_auth(return_page, customer_name)
+    set_query_params_after_onedrive_auth(
+        return_page,
+        customer_name,
+        partner_id,
+        partner_type,
+    )
     st.rerun()
 
 
@@ -1456,8 +1482,9 @@ def render_onedrive_attachment_scroll_keeper(suffix, restore=False):
 def confirm_onedrive_attachment_delete_dialog(
     access_token,
     attachment,
-    customer_key,
-    customer_name,
+    entity_type,
+    entity_id,
+    entity_name,
     success_key,
     open_key,
     restore_key,
@@ -1487,9 +1514,9 @@ def confirm_onedrive_attachment_delete_dialog(
                         delete_customer_information(metadata_id)
                     remember_change_history_warning(
                         record_change_history_safely(
-                            "顧客",
-                            customer_key or "",
-                            customer_name,
+                            attachment_entity_label(entity_type),
+                            entity_id or "",
+                            entity_name,
                             "削除",
                             {"ファイル": (filename, "")},
                             section="写真・資料",
@@ -4200,6 +4227,37 @@ def normalize_attachment_tags(values):
     return result
 
 
+def normalize_attachment_entity_type(value):
+    text = clean_value(value, blank_text="").strip().lower()
+    return text if text in {"customer", "supplier", "carrier"} else "customer"
+
+
+def attachment_entity_label(entity_type):
+    return {
+        "customer": "顧客",
+        "supplier": "仕入先",
+        "carrier": "運送会社",
+    }[normalize_attachment_entity_type(entity_type)]
+
+
+def attachment_entity_folder(entity_type):
+    return {
+        "customer": ONEDRIVE_CUSTOMER_FOLDER,
+        "supplier": ONEDRIVE_SUPPLIER_FOLDER,
+        "carrier": ONEDRIVE_CARRIER_FOLDER,
+    }[normalize_attachment_entity_type(entity_type)]
+
+
+def attachment_storage_key(entity_type, entity_id, entity_name):
+    entity_type = normalize_attachment_entity_type(entity_type)
+    entity_id = clean_value(entity_id, blank_text="").strip()
+    if entity_type == "customer":
+        return entity_id or None
+    if not entity_id:
+        entity_id = hashlib.sha256(str(entity_name).encode("utf-8")).hexdigest()[:16]
+    return f"onedrive_attachment:{entity_type}:{entity_id}"
+
+
 def parse_onedrive_attachment_item(item):
     if not is_onedrive_attachment_item(item):
         return None
@@ -4209,11 +4267,27 @@ def parse_onedrive_attachment_item(item):
         return None
     if not isinstance(payload, dict):
         return None
+
+    entity_type = normalize_attachment_entity_type(payload.get("entity_type"))
+    entity_id = clean_value(payload.get("entity_id"), blank_text="").strip()
+    entity_name = clean_value(payload.get("entity_name"), blank_text="").strip()
+    stored_customer_key = clean_value(item.get("customer_key"), blank_text="")
+    stored_customer_name = clean_value(item.get("customer_name"), blank_text="")
+
+    # v41以前の顧客データには取引先種別がないため、従来どおり顧客として扱う。
+    if not entity_id:
+        entity_id = stored_customer_key if entity_type == "customer" else ""
+    if not entity_name:
+        entity_name = stored_customer_name
+
     return {
         "id": str(item.get("id") or ""),
         "field_name": str(item.get("field_name") or ""),
-        "customer_key": clean_value(item.get("customer_key"), blank_text=""),
-        "customer_name": clean_value(item.get("customer_name"), blank_text=""),
+        "customer_key": stored_customer_key,
+        "customer_name": stored_customer_name,
+        "entity_type": entity_type,
+        "entity_id": entity_id,
+        "entity_name": entity_name,
         "file_id": clean_value(payload.get("file_id"), blank_text=""),
         "original_name": clean_value(payload.get("original_name"), blank_text=""),
         "stored_name": clean_value(payload.get("stored_name"), blank_text=""),
@@ -4235,6 +4309,11 @@ def parse_onedrive_attachment_item(item):
 def serialize_onedrive_attachment(attachment):
     payload = {
         "version": ONEDRIVE_ATTACHMENT_VERSION,
+        "entity_type": normalize_attachment_entity_type(
+            attachment.get("entity_type")
+        ),
+        "entity_id": attachment.get("entity_id", ""),
+        "entity_name": attachment.get("entity_name", ""),
         "file_id": attachment.get("file_id", ""),
         "original_name": attachment.get("original_name", ""),
         "stored_name": attachment.get("stored_name", ""),
@@ -4261,13 +4340,34 @@ def get_customer_onedrive_folder_key(customer_key, customer_name):
     return safe or "顧客仮ID_未設定"
 
 
-def get_customer_attachments(customer_name, customer_key):
-    items = load_customer_information(customer_name, customer_key)
+def get_attachment_onedrive_folder_key(entity_type, entity_id, entity_name):
+    entity_type = normalize_attachment_entity_type(entity_type)
+    if entity_type == "customer":
+        return get_customer_onedrive_folder_key(entity_id, entity_name)
+
+    label = attachment_entity_label(entity_type)
+    entity_id = clean_value(entity_id, blank_text="").strip()
+    if entity_id:
+        raw = f"{label}ID_{entity_id}"
+    else:
+        digest = hashlib.sha256(str(entity_name).encode("utf-8")).hexdigest()[:16]
+        raw = f"{label}仮ID_{digest}"
+    safe = re.sub(r"[\\/:*?\"<>|]", "_", raw).strip().rstrip(".")
+    return safe or f"{label}仮ID_未設定"
+
+
+def get_entity_attachments(entity_type, entity_name, entity_id=None):
+    entity_type = normalize_attachment_entity_type(entity_type)
+    storage_key = attachment_storage_key(entity_type, entity_id, entity_name)
+    items = load_customer_information(entity_name, storage_key)
     attachments = []
     for item in items:
         parsed = parse_onedrive_attachment_item(item)
-        if parsed:
-            attachments.append(parsed)
+        if not parsed:
+            continue
+        if normalize_attachment_entity_type(parsed.get("entity_type")) != entity_type:
+            continue
+        attachments.append(parsed)
     attachments.sort(
         key=lambda row: str(row.get("created_at") or row.get("updated_at") or ""),
         reverse=True,
@@ -4275,9 +4375,13 @@ def get_customer_attachments(customer_name, customer_key):
     return attachments
 
 
+def get_customer_attachments(customer_name, customer_key):
+    return get_entity_attachments("customer", customer_name, customer_key)
+
+
 @st.cache_data(ttl=30, show_spinner=False)
 def load_all_onedrive_attachments_from_supabase():
-    """全顧客の写真・資料メタデータだけをSupabaseから読み込む。"""
+    """全取引先の写真・資料メタデータだけをSupabaseから読み込む。"""
     if not has_supabase_config():
         return []
 
@@ -4342,7 +4446,7 @@ def attachment_tag_history_options(attachments):
 
 
 def get_attachment_tag_history_options(fallback_attachments=None):
-    """全体履歴を優先し、読み込めない場合だけ現在顧客のタグを使う。"""
+    """全体履歴を優先し、読み込めない場合だけ現在画面のタグを使う。"""
     try:
         return attachment_tag_history_options(load_all_onedrive_attachments_from_supabase())
     except Exception:
@@ -4359,9 +4463,10 @@ def attachment_file_kind(filename, mime_type=""):
     return ""
 
 
-def save_customer_onedrive_attachment(
-    customer_name,
-    customer_key,
+def save_entity_onedrive_attachment(
+    entity_type,
+    entity_name,
+    entity_id,
     uploaded_name,
     content,
     mime_type,
@@ -4369,16 +4474,28 @@ def save_customer_onedrive_attachment(
     remarks,
     access_token,
 ):
+    entity_type = normalize_attachment_entity_type(entity_type)
+    entity_name = clean_value(entity_name, blank_text="").strip()
+    entity_id = clean_value(entity_id, blank_text="").strip()
     file_kind = attachment_file_kind(uploaded_name, mime_type)
     if not file_kind:
         raise ValueError("画像（JPG・JPEG・PNG・WEBP）またはPDFを選んでください。")
     if not content:
         raise ValueError("選択したファイルが空です。")
 
-    folder_key = get_customer_onedrive_folder_key(customer_key, customer_name)
+    folder_key = get_attachment_onedrive_folder_key(
+        entity_type,
+        entity_id,
+        entity_name,
+    )
     category_folder = "写真" if file_kind == "image" else "資料"
     folder_path = "/".join(
-        [ONEDRIVE_ROOT_FOLDER, ONEDRIVE_CUSTOMER_FOLDER, folder_key, category_folder]
+        [
+            ONEDRIVE_ROOT_FOLDER,
+            attachment_entity_folder(entity_type),
+            folder_key,
+            category_folder,
+        ]
     )
     original_name = Path(str(uploaded_name or "file")).name
     timestamp = get_jst_now().strftime("%Y%m%d_%H%M%S")
@@ -4405,6 +4522,9 @@ def save_customer_onedrive_attachment(
         or clean_value(profile.get("userPrincipalName"), blank_text="")
     )
     attachment = {
+        "entity_type": entity_type,
+        "entity_id": entity_id,
+        "entity_name": entity_name,
         "file_id": file_id,
         "original_name": original_name,
         "stored_name": clean_value(uploaded_item.get("name"), blank_text="") or stored_name,
@@ -4418,10 +4538,11 @@ def save_customer_onedrive_attachment(
         "uploaded_by": uploaded_by,
         "created_at": get_jst_now().isoformat(),
     }
+    storage_key = attachment_storage_key(entity_type, entity_id, entity_name)
     try:
         insert_customer_information(
-            customer_name,
-            customer_key,
+            entity_name,
+            storage_key,
             make_onedrive_attachment_field_name(),
             serialize_onedrive_attachment(attachment),
             int(time.time()),
@@ -4433,6 +4554,29 @@ def save_customer_onedrive_attachment(
             pass
         raise
     return attachment
+
+
+def save_customer_onedrive_attachment(
+    customer_name,
+    customer_key,
+    uploaded_name,
+    content,
+    mime_type,
+    tags,
+    remarks,
+    access_token,
+):
+    return save_entity_onedrive_attachment(
+        "customer",
+        customer_name,
+        customer_key,
+        uploaded_name,
+        content,
+        mime_type,
+        tags,
+        remarks,
+        access_token,
+    )
 
 
 def update_customer_onedrive_attachment_metadata(attachment, tags, remarks):
@@ -4477,10 +4621,16 @@ def onedrive_attachment_rows_to_dataframe(rows):
         attachment = parse_onedrive_attachment_item(row)
         if not attachment:
             continue
+        entity_type = normalize_attachment_entity_type(
+            attachment.get("entity_type")
+        )
         records.append(
             {
-                "顧客ID": attachment.get("customer_key", ""),
-                "顧客名": attachment.get("customer_name", ""),
+                "顧客ID": attachment.get("entity_id", "") if entity_type == "customer" else "",
+                "顧客名": attachment.get("entity_name", "") if entity_type == "customer" else "",
+                "取引先種別": attachment_entity_label(entity_type),
+                "取引先ID": attachment.get("entity_id", ""),
+                "取引先名": attachment.get("entity_name", ""),
                 "種類": "写真" if attachment.get("file_type") == "image" else "PDF",
                 "元ファイル名": attachment.get("original_name", ""),
                 "OneDrive保存名": attachment.get("stored_name", ""),
@@ -4498,15 +4648,34 @@ def onedrive_attachment_rows_to_dataframe(rows):
     return backup_dataframe(
         records,
         [
-            "顧客ID", "顧客名", "種類", "元ファイル名", "OneDrive保存名",
-            "OneDrive保存先", "タグ", "備考", "サイズ", "登録者", "登録日時",
+            "顧客ID", "顧客名", "取引先種別", "取引先ID", "取引先名",
+            "種類", "元ファイル名", "OneDrive保存名", "OneDrive保存先",
+            "タグ", "備考", "サイズ", "登録者", "登録日時",
             "OneDriveファイルID", "保存ID",
         ],
     )
 
 
-def render_customer_attachments_section(customer_name, customer_key=None):
-    identity = customer_key or customer_name
+def build_attachment_onedrive_sign_in_url(entity_type, entity_id, entity_name):
+    entity_type = normalize_attachment_entity_type(entity_type)
+    if entity_type == "customer":
+        return build_onedrive_sign_in_url("detail", entity_name)
+    return build_onedrive_sign_in_url(
+        "partner_detail",
+        partner_id=entity_id,
+        partner_type=entity_type,
+    )
+
+
+def render_customer_attachments_section(
+    customer_name,
+    customer_key=None,
+    entity_type="customer",
+):
+    entity_type = normalize_attachment_entity_type(entity_type)
+    entity_name = clean_value(customer_name, blank_text="").strip()
+    entity_id = clean_value(customer_key, blank_text="").strip()
+    identity = f"{entity_type}:{entity_id or entity_name}"
     suffix = hashlib.sha256(str(identity).encode("utf-8")).hexdigest()[:16]
     success_key = f"onedrive_attachment_success_{suffix}"
     edit_key = f"onedrive_attachment_edit_{suffix}"
@@ -4520,7 +4689,7 @@ def render_customer_attachments_section(customer_name, customer_key=None):
         return
 
     try:
-        attachments = get_customer_attachments(customer_name, customer_key)
+        attachments = get_entity_attachments(entity_type, entity_name, entity_id)
     except Exception as exc:
         with st.expander("📎 写真・資料"):
             st.warning(f"写真・資料の一覧を読み込めませんでした：{exc}")
@@ -4592,7 +4761,7 @@ def render_customer_attachments_section(customer_name, customer_key=None):
                 try:
                     st.link_button(
                         connect_label,
-                        build_onedrive_sign_in_url("detail", customer_name),
+                        build_attachment_onedrive_sign_in_url(entity_type, entity_id, entity_name),
                         use_container_width=True,
                     )
                 except Exception as exc:
@@ -4647,9 +4816,10 @@ def render_customer_attachments_section(customer_name, customer_key=None):
                         try:
                             tags = list(selected_history_tags) + normalize_attachment_tags(new_tags_text)
                             with st.spinner("OneDriveへ保存しています…"):
-                                saved = save_customer_onedrive_attachment(
-                                    customer_name,
-                                    customer_key,
+                                saved = save_entity_onedrive_attachment(
+                                    entity_type,
+                                    entity_name,
+                                    entity_id,
                                     uploaded.name,
                                     uploaded.getvalue(),
                                     uploaded.type or mimetypes.guess_type(uploaded.name)[0] or "application/octet-stream",
@@ -4659,9 +4829,9 @@ def render_customer_attachments_section(customer_name, customer_key=None):
                                 )
                             remember_change_history_warning(
                                 record_change_history_safely(
-                                    "顧客",
-                                    customer_key or "",
-                                    customer_name,
+                                    attachment_entity_label(entity_type),
+                                    entity_id or "",
+                                    entity_name,
                                     "追加",
                                     {
                                         "ファイル": ("", saved.get("original_name", "")),
@@ -4740,9 +4910,10 @@ def render_customer_attachments_section(customer_name, customer_key=None):
                                     camera_new_tags_text
                                 )
                                 with st.spinner("OneDriveへ保存しています…"):
-                                    saved = save_customer_onedrive_attachment(
-                                        customer_name,
-                                        customer_key,
+                                    saved = save_entity_onedrive_attachment(
+                                        entity_type,
+                                        entity_name,
+                                        entity_id,
                                         camera_file.name,
                                         camera_file.getvalue(),
                                         camera_file.type
@@ -4754,9 +4925,9 @@ def render_customer_attachments_section(customer_name, customer_key=None):
                                     )
                                 remember_change_history_warning(
                                     record_change_history_safely(
-                                        "顧客",
-                                        customer_key or "",
-                                        customer_name,
+                                        attachment_entity_label(entity_type),
+                                        entity_id or "",
+                                        entity_name,
                                         "追加",
                                         {
                                             "ファイル": ("", saved.get("original_name", "")),
@@ -4944,9 +5115,9 @@ def render_customer_attachments_section(customer_name, customer_key=None):
                                             changes["備考"] = (attachment.get("remarks", ""), str(edited_remarks or "").strip())
                                         remember_change_history_warning(
                                             record_change_history_safely(
-                                                "顧客",
-                                                customer_key or "",
-                                                customer_name,
+                                                attachment_entity_label(entity_type),
+                                                entity_id or "",
+                                                entity_name,
                                                 "変更",
                                                 changes,
                                                 section=f"写真・資料：{filename}",
@@ -4987,8 +5158,9 @@ def render_customer_attachments_section(customer_name, customer_key=None):
                                 confirm_onedrive_attachment_delete_dialog(
                                     access_token,
                                     attachment,
-                                    customer_key,
-                                    customer_name,
+                                    entity_type,
+                                    entity_id,
+                                    entity_name,
                                     success_key,
                                     open_key,
                                     restore_key,
@@ -5007,9 +5179,9 @@ def render_customer_attachments_section(customer_name, customer_key=None):
 
 
 def show_attachment_search_page():
-    """全顧客の写真・資料を、タグ履歴や文字入力で横断検索する。"""
+    """顧客・仕入先・運送会社の写真・資料を横断検索する。"""
     st.header("🔎 写真・資料検索")
-    st.caption("全顧客の写真・PDFを検索します。タグ欄は文字を入力すると過去の候補が絞り込まれます。")
+    st.caption("顧客・仕入先・運送会社の写真・PDFを検索します。タグ欄は文字を入力すると過去の候補が絞り込まれます。")
 
     if not has_supabase_config():
         st.warning("写真・資料検索にはSupabase設定が必要です。")
@@ -5026,7 +5198,7 @@ def show_attachment_search_page():
         return
 
     query = st.text_input(
-        "顧客名・タグ・備考を検索",
+        "取引先名・タグ・備考を検索",
         placeholder="文字を入力",
         key="attachment_global_text_filter",
     )
@@ -5041,6 +5213,11 @@ def show_attachment_search_page():
             "最近使ったタグ："
             + "　".join(f"#{tag}" for tag in tag_options[:10])
         )
+    entity_filter = st.selectbox(
+        "取引先種別",
+        ["すべて", "顧客", "仕入先", "運送会社"],
+        key="attachment_global_entity_filter",
+    )
     type_filter = st.selectbox(
         "種類",
         ["すべて", "写真", "PDF"],
@@ -5051,6 +5228,14 @@ def show_attachment_search_page():
     query_terms = [term for term in re.split(r"[\s　]+", normalized_query) if term]
     filtered = []
     for attachment in attachments:
+        attachment_entity_type = normalize_attachment_entity_type(
+            attachment.get("entity_type")
+        )
+        if (
+            entity_filter != "すべて"
+            and attachment_entity_label(attachment_entity_type) != entity_filter
+        ):
+            continue
         if type_filter == "写真" and attachment.get("file_type") != "image":
             continue
         if type_filter == "PDF" and attachment.get("file_type") != "pdf":
@@ -5060,7 +5245,7 @@ def show_attachment_search_page():
             continue
         searchable = " ".join(
             [
-                clean_value(attachment.get("customer_name"), blank_text=""),
+                clean_value(attachment.get("entity_name"), blank_text=""),
                 " ".join(attachment_tags),
                 clean_value(attachment.get("remarks"), blank_text=""),
                 clean_value(attachment.get("original_name"), blank_text=""),
@@ -5074,6 +5259,7 @@ def show_attachment_search_page():
         {
             "query": normalized_query,
             "tags": list(selected_tags),
+            "entity": entity_filter,
             "type": type_filter,
         },
         ensure_ascii=False,
@@ -5106,7 +5292,10 @@ def show_attachment_search_page():
         item_id = attachment.get("file_id", "")
         metadata_id = attachment.get("id", "")
         filename = attachment.get("original_name", "名称未設定")
-        customer_name = attachment.get("customer_name", "顧客名未設定")
+        entity_type = normalize_attachment_entity_type(attachment.get("entity_type"))
+        entity_id = clean_value(attachment.get("entity_id"), blank_text="")
+        entity_name = clean_value(attachment.get("entity_name"), blank_text="") or "名称未設定"
+        entity_label = attachment_entity_label(entity_type)
 
         with grid_columns[attachment_index % grid_column_count]:
             with st.container(border=True):
@@ -5167,11 +5356,18 @@ def show_attachment_search_page():
                         except Exception as exc:
                             st.error(f"表示できませんでした：{exc}")
 
-                customer_url = make_app_url(page="detail", customer=customer_name)
+                if entity_type == "customer":
+                    entity_url = make_app_url(page="detail", customer=entity_name)
+                else:
+                    entity_url = make_app_url(
+                        page="partner_detail",
+                        partner_id=entity_id,
+                        partner_type=entity_type,
+                    )
                 st.markdown(
-                    f'<a href="{html.escape(customer_url, quote=True)}" target="_self" '
+                    f'<a href="{html.escape(entity_url, quote=True)}" target="_self" '
                     'style="font-weight:700;text-decoration:none;">'
-                    f'{html.escape(customer_name)}</a>',
+                    f'{html.escape(entity_label)}：{html.escape(entity_name)}</a>',
                     unsafe_allow_html=True,
                 )
                 attachment_date = format_attachment_datetime(
@@ -14042,6 +14238,11 @@ def show_trade_partner_detail(partner_type, partner_id):
         )
     else:
         render_carrier_freight_section(partner_id, company)
+    render_customer_attachments_section(
+        company,
+        partner_id,
+        entity_type=partner_type,
+    )
     show_trade_partner_notes(partner_type, partner_id, company)
 
 
