@@ -3217,14 +3217,13 @@ def format_estimate_date(value):
         return text or "未入力"
 
 
-def serialize_estimate(proposal_date, product_name, manufacturer, unit_price, price_unit, remarks):
+def serialize_estimate(proposal_date, product_name, manufacturer, unit_price, remarks):
     payload = {
         "version": ESTIMATE_VERSION,
         "proposal_date": estimate_date_text(proposal_date),
         "product_name": clean_value(product_name, blank_text="").strip(),
         "manufacturer": clean_value(manufacturer, blank_text="").strip(),
         "unit_price": clean_value(unit_price, blank_text="").strip(),
-        "price_unit": clean_value(price_unit, blank_text="").strip(),
         "remarks": clean_value(remarks, blank_text="").strip(),
     }
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
@@ -3249,7 +3248,6 @@ def parse_estimate_item(item):
         "product_name": clean_value(payload.get("product_name"), blank_text="").strip(),
         "manufacturer": clean_value(payload.get("manufacturer"), blank_text="").strip(),
         "unit_price": clean_value(payload.get("unit_price"), blank_text="").strip(),
-        "price_unit": clean_value(payload.get("price_unit"), blank_text="").strip(),
         "remarks": clean_value(payload.get("remarks"), blank_text="").strip(),
         "created_at": item.get("created_at", ""),
         "updated_at": item.get("updated_at", ""),
@@ -3329,7 +3327,6 @@ def estimate_values(item):
         "商品名": clean_value(item.get("product_name"), blank_text=""),
         "メーカー": clean_value(item.get("manufacturer"), blank_text=""),
         "単価": clean_value(item.get("unit_price"), blank_text=""),
-        "単価の単位": clean_value(item.get("price_unit"), blank_text=""),
         "備考": clean_value(item.get("remarks"), blank_text=""),
     }
 
@@ -3351,7 +3348,6 @@ def save_customer_estimate(
     product_name,
     manufacturer,
     unit_price,
-    price_unit,
     remarks,
     existing=None,
 ):
@@ -3360,7 +3356,6 @@ def save_customer_estimate(
         product_name,
         manufacturer,
         unit_price,
-        price_unit,
         remarks,
     )
     if existing:
@@ -3391,10 +3386,7 @@ def delete_customer_estimate(item):
 
 def estimate_price_label(item):
     price = clean_value(item.get("unit_price"), blank_text="").strip()
-    unit = clean_value(item.get("price_unit"), blank_text="").strip()
-    if price and unit:
-        return f"{price} {unit}"
-    return price or unit or "未入力"
+    return price or "未入力"
 
 
 def render_customer_estimates_section(customer_name, customer_key=None):
@@ -3453,11 +3445,7 @@ def render_customer_estimates_section(customer_name, customer_key=None):
                 )
                 product_name = st.text_input("商品名")
                 manufacturer = st.text_input("メーカー")
-                price_col, unit_col = st.columns(2)
-                with price_col:
-                    unit_price = st.text_input("単価", placeholder="例：85、3,500")
-                with unit_col:
-                    price_unit = st.text_input("単価の単位", placeholder="例：円/kg、円/袋")
+                unit_price = st.text_input("単価", placeholder="例：85、3,500")
                 remarks = st.text_area("備考", height=110)
                 save_col, cancel_col = st.columns(2)
                 with save_col:
@@ -3481,7 +3469,6 @@ def render_customer_estimates_section(customer_name, customer_key=None):
                         "product_name": product_name,
                         "manufacturer": manufacturer,
                         "unit_price": unit_price,
-                        "price_unit": price_unit,
                         "remarks": remarks,
                     }
                     try:
@@ -3492,7 +3479,6 @@ def render_customer_estimates_section(customer_name, customer_key=None):
                             product_name,
                             manufacturer,
                             unit_price,
-                            price_unit,
                             remarks,
                         )
                         remember_change_history_warning(
@@ -3534,15 +3520,9 @@ def render_customer_estimates_section(customer_name, customer_key=None):
                         manufacturer = st.text_input(
                             "メーカー", value=estimate.get("manufacturer", "")
                         )
-                        price_col, unit_col = st.columns(2)
-                        with price_col:
-                            unit_price = st.text_input(
-                                "単価", value=estimate.get("unit_price", "")
-                            )
-                        with unit_col:
-                            price_unit = st.text_input(
-                                "単価の単位", value=estimate.get("price_unit", "")
-                            )
+                        unit_price = st.text_input(
+                            "単価", value=estimate.get("unit_price", "")
+                        )
                         remarks = st.text_area(
                             "備考", value=estimate.get("remarks", ""), height=110
                         )
@@ -3568,7 +3548,6 @@ def render_customer_estimates_section(customer_name, customer_key=None):
                                 "product_name": product_name,
                                 "manufacturer": manufacturer,
                                 "unit_price": unit_price,
-                                "price_unit": price_unit,
                                 "remarks": remarks,
                             }
                             changes = estimate_history_changes(estimate, after)
@@ -3583,7 +3562,6 @@ def render_customer_estimates_section(customer_name, customer_key=None):
                                         product_name,
                                         manufacturer,
                                         unit_price,
-                                        price_unit,
                                         remarks,
                                         existing=estimate,
                                     )
@@ -3690,7 +3668,6 @@ def estimate_rows_to_dataframe(rows):
                 "商品名": estimate.get("product_name", ""),
                 "メーカー": estimate.get("manufacturer", ""),
                 "単価": estimate.get("unit_price", ""),
-                "単価の単位": estimate.get("price_unit", ""),
                 "備考": estimate.get("remarks", ""),
                 "保存ID": estimate.get("id", ""),
                 "作成日時": estimate.get("created_at", ""),
@@ -3708,7 +3685,7 @@ def estimate_rows_to_dataframe(rows):
         records,
         [
             "提案日", "顧客ID", "顧客名", "商品名", "メーカー",
-            "単価", "単価の単位", "備考", "保存ID", "作成日時", "更新日時",
+            "単価", "備考", "保存ID", "作成日時", "更新日時",
         ],
     )
 
