@@ -274,6 +274,8 @@ ONEDRIVE_GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 ONEDRIVE_SCOPES = "openid profile offline_access User.Read Files.ReadWrite"
 ONEDRIVE_REQUEST_TIMEOUT = 90
 ONEDRIVE_AUTH_FLOW_TTL_SECONDS = 15 * 60
+ONEDRIVE_PRODUCTION_REDIRECT_URI = "https://aoyama-kokyaku.streamlit.app"
+ONEDRIVE_TEST_REDIRECT_HOST = "aoyama-onedrive-test.streamlit.app"
 ONEDRIVE_ROOT_FOLDER = "取引先カルテ"
 ONEDRIVE_CUSTOMER_FOLDER = "顧客"
 ONEDRIVE_ATTACHMENT_PREFIX = "__onedrive_attachment__:"
@@ -296,13 +298,15 @@ def read_onedrive_settings():
         client_secret = ""
         redirect_uri = ""
 
+    # テストアプリのURLが残っていても、本番カルテへ戻るよう安全側で補正する。
+    if not redirect_uri or ONEDRIVE_TEST_REDIRECT_HOST in redirect_uri:
+        redirect_uri = ONEDRIVE_PRODUCTION_REDIRECT_URI
+
     missing = []
     if not client_id:
         missing.append("client_id")
     if not client_secret or client_secret == "PASTE_SECRET_VALUE_HERE":
         missing.append("client_secret")
-    if not redirect_uri:
-        missing.append("redirect_uri")
     if missing:
         raise RuntimeError(
             "StreamlitのSecretsにある[onedrive]へ"
@@ -312,10 +316,40 @@ def read_onedrive_settings():
     return client_id, client_secret, redirect_uri
 
 
+def read_onedrive_configured_refresh_token():
+    """通常利用時の自動接続に使う更新トークンをSecretsから読む。"""
+    try:
+        value = str(st.secrets["onedrive"].get("refresh_token", "")).strip()
+    except Exception:
+        value = ""
+    if value in {"PASTE_REFRESH_TOKEN_HERE", "Microsoftの更新トークン"}:
+        return ""
+    return value
+
+
 @st.cache_resource(show_spinner=False)
 def get_onedrive_pending_auth_store():
     """外部ログイン中だけ必要な認証情報を一時保持する。"""
     return {"lock": threading.RLock(), "flows": {}}
+
+
+@st.cache_resource(show_spinner=False)
+def get_onedrive_shared_token_store():
+    """全利用者が同じOneDriveを使えるよう、サーバー内で認証結果を共有する。"""
+    return {"lock": threading.RLock(), "token": None}
+
+
+def get_onedrive_shared_token_result():
+    store = get_onedrive_shared_token_store()
+    with store["lock"]:
+        token = store.get("token")
+        return dict(token) if isinstance(token, dict) else None
+
+
+def clear_onedrive_shared_token_result():
+    store = get_onedrive_shared_token_store()
+    with store["lock"]:
+        store["token"] = None
 
 
 def cleanup_onedrive_pending_auth_flows(store):
@@ -411,17 +445,24 @@ def save_onedrive_token_result(result):
     expires_in = int(token.get("expires_in") or 3600)
     token["expires_at"] = time.time() + max(expires_in, 60)
     st.session_state["onedrive_token_result"] = token
+    store = get_onedrive_shared_token_store()
+    with store["lock"]:
+        store["token"] = dict(token)
 
 
-def clear_onedrive_auth_state():
+def clear_onedrive_auth_state(clear_shared=False):
     st.session_state.pop("onedrive_token_result", None)
     for key in list(st.session_state.keys()):
         if str(key).startswith("onedrive_thumbnail_"):
             st.session_state.pop(key, None)
+    if clear_shared:
+        clear_onedrive_shared_token_result()
 
 
-def refresh_onedrive_access_token(token):
+def refresh_onedrive_access_token(token=None):
     refresh_token = str((token or {}).get("refresh_token") or "").strip()
+    if not refresh_token:
+        refresh_token = read_onedrive_configured_refresh_token()
     if not refresh_token:
         return None
     client_id, client_secret, redirect_uri = read_onedrive_settings()
@@ -447,17 +488,33 @@ def refresh_onedrive_access_token(token):
 
 
 def get_onedrive_access_token():
-    token = st.session_state.get("onedrive_token_result")
+    # まずサーバー共有の認証結果を使い、通常利用者にはMicrosoftログインを要求しない。
+    token = get_onedrive_shared_token_result()
     if not isinstance(token, dict):
-        return None
-    access_token = str(token.get("access_token") or "").strip()
-    expires_at = float(token.get("expires_at") or 0)
+        session_token = st.session_state.get("onedrive_token_result")
+        token = dict(session_token) if isinstance(session_token, dict) else None
+
+    access_token = str((token or {}).get("access_token") or "").strip()
+    expires_at = float((token or {}).get("expires_at") or 0)
     if access_token and expires_at > time.time() + 60:
         return access_token
-    refreshed = refresh_onedrive_access_token(token)
-    if refreshed and refreshed.get("access_token"):
-        return str(refreshed["access_token"])
-    clear_onedrive_auth_state()
+
+    # 同時アクセス時に更新処理が重ならないよう、共有ロック内で再確認する。
+    store = get_onedrive_shared_token_store()
+    with store["lock"]:
+        current = store.get("token")
+        if isinstance(current, dict):
+            current_access_token = str(current.get("access_token") or "").strip()
+            current_expires_at = float(current.get("expires_at") or 0)
+            if current_access_token and current_expires_at > time.time() + 60:
+                return current_access_token
+            token = dict(current)
+
+        refreshed = refresh_onedrive_access_token(token)
+        if refreshed and refreshed.get("access_token"):
+            return str(refreshed["access_token"])
+
+    clear_onedrive_auth_state(clear_shared=True)
     return None
 
 
@@ -504,7 +561,12 @@ def process_onedrive_callback_if_present():
             except Exception:
                 detail = response.text
             raise RuntimeError(f"OneDriveの認証情報を取得できませんでした：{detail}")
-        save_onedrive_token_result(response.json())
+        token_result = response.json()
+        save_onedrive_token_result(token_result)
+        if not read_onedrive_configured_refresh_token():
+            setup_refresh_token = str(token_result.get("refresh_token") or "").strip()
+            if setup_refresh_token:
+                st.session_state["onedrive_refresh_token_setup_value"] = setup_refresh_token
         st.session_state["onedrive_auth_success"] = True
     except Exception as exc:
         st.session_state["onedrive_auth_error"] = str(exc)
@@ -530,8 +592,8 @@ def onedrive_graph_request(method, path, access_token, expected=(200,), **kwargs
         except Exception:
             message = str(response.text or "").strip()
         if response.status_code == 401:
-            clear_onedrive_auth_state()
-            message = message or "認証の有効期限が切れています。もう一度サインインしてください。"
+            clear_onedrive_auth_state(clear_shared=True)
+            message = message or "OneDriveの認証が失効しています。管理者が再接続してください。"
         raise RuntimeError(
             f"Microsoft Graphでエラーが発生しました（{response.status_code}）"
             + (f"：{message}" if message else "")
@@ -3582,7 +3644,7 @@ def render_customer_attachments_section(customer_name, customer_key=None):
             st.success(success_message)
         auth_success = st.session_state.pop("onedrive_auth_success", None)
         if auth_success:
-            st.success("OneDriveへ接続しました。")
+            st.success("OneDriveの初回接続が完了しました。")
         auth_error = st.session_state.pop("onedrive_auth_error", None)
         if auth_error:
             st.error(auth_error)
@@ -3595,33 +3657,44 @@ def render_customer_attachments_section(customer_name, customer_key=None):
                 "[onedrive]\n"
                 'client_id = "MicrosoftのクライアントID"\n'
                 'client_secret = "Microsoftのシークレットの値"\n'
-                'redirect_uri = "https://aoyama-kokyaku.streamlit.app"'
+                'redirect_uri = "https://aoyama-kokyaku.streamlit.app"\n'
+                'refresh_token = "初回接続後に表示される値"'
             )
             return
 
+        configured_refresh_token = read_onedrive_configured_refresh_token()
+        setup_refresh_token = str(
+            st.session_state.get("onedrive_refresh_token_setup_value") or ""
+        ).strip()
+        if setup_refresh_token and not configured_refresh_token:
+            st.warning(
+                "次回から自動接続するため、下の1行を顧客カルテの"
+                "Streamlit Secretsにある[onedrive]の中へ追加してください。"
+            )
+            st.code(f'refresh_token = "{setup_refresh_token}"', language="toml")
+            st.caption("追加して保存するとアプリが再起動し、通常画面から接続ボタンが消えます。")
+
         access_token = get_onedrive_access_token()
         if not access_token:
-            st.info("写真・PDFを追加・表示するには、最初にOneDriveへ接続してください。")
+            if configured_refresh_token:
+                st.warning(
+                    "OneDriveへ自動接続できませんでした。Microsoft側で認証が失効した可能性があります。"
+                )
+                connect_label = "OneDriveを再接続（管理者用）"
+            else:
+                st.info(
+                    "最初の1回だけ管理者がOneDriveへ接続し、表示された更新トークンをSecretsへ追加してください。"
+                )
+                connect_label = "OneDrive初回設定（管理者用）"
             try:
                 st.link_button(
-                    "Microsoft PersonalでOneDriveへ接続",
+                    connect_label,
                     build_onedrive_sign_in_url("detail", customer_name),
                     use_container_width=True,
                 )
             except Exception as exc:
                 st.error(f"OneDriveへの接続を開始できませんでした：{exc}")
         else:
-            try:
-                profile = get_onedrive_profile(access_token)
-                account = (
-                    clean_value(profile.get("mail"), blank_text="")
-                    or clean_value(profile.get("userPrincipalName"), blank_text="")
-                )
-                display_name = clean_value(profile.get("displayName"), blank_text="")
-                st.caption(f"OneDrive接続中：{display_name or account}" + (f"（{account}）" if display_name and account else ""))
-            except Exception:
-                pass
-
             st.markdown("#### 追加")
             source_mode = st.radio(
                 "追加方法",
@@ -3910,14 +3983,16 @@ def render_customer_attachments_section(customer_name, customer_key=None):
                 st.session_state[limit_key] = limit + ONEDRIVE_PAGE_SIZE
                 st.rerun()
 
-        if access_token:
+        # 自動接続設定後は利用者ごとのMicrosoft接続操作を表示しない。
+        if access_token and not configured_refresh_token:
             st.markdown("---")
             if st.button(
-                "この端末のOneDrive接続を解除",
+                "初回設定中の一時接続を解除",
                 key=f"onedrive_attachment_signout_{suffix}",
                 use_container_width=True,
             ):
-                clear_onedrive_auth_state()
+                clear_onedrive_auth_state(clear_shared=True)
+                st.session_state.pop("onedrive_refresh_token_setup_value", None)
                 st.rerun()
 
 
