@@ -2994,6 +2994,46 @@ def get_past_product_note_items(customer_name, customer_key):
     return result
 
 
+@st.cache_data(ttl=30, show_spinner=False)
+def load_all_past_product_notes_from_supabase():
+    """取引先メモ画面で使う過去商品メモを、全顧客分読み込む。"""
+    if not has_supabase_config():
+        return []
+
+    rows = []
+    page_size = 1000
+    offset = 0
+    while True:
+        params = {
+            "select": "id,customer_key,customer_name,field_name,content,sort_order,created_at,updated_at",
+            "field_name": f"like.{PAST_PRODUCT_NOTE_PREFIX}*",
+            "order": "updated_at.desc,created_at.desc,id.desc",
+            "limit": str(page_size),
+            "offset": str(offset),
+        }
+        try:
+            response = requests.get(
+                get_supabase_customer_information_url(),
+                headers=get_supabase_headers(),
+                params=params,
+                timeout=30,
+            )
+        except Exception as exc:
+            raise RuntimeError("過去商品メモの読み込み中にSupabaseへ接続できませんでした。") from exc
+
+        check_customer_information_response("読み込み", response, (200,))
+        page = response.json()
+        if not isinstance(page, list):
+            raise RuntimeError("Supabaseから返った過去商品メモの形式が正しくありません。")
+
+        rows.extend(item for item in page if is_past_product_note_item(item))
+        if len(page) < page_size:
+            break
+        offset += page_size
+
+    return rows
+
+
 def save_past_product_note(customer_name, customer_key, product_name, content):
     """過去商品の商品別メモを、既存の顧客情報テーブルへ内部項目として保存する。"""
     field_name = make_past_product_note_field(product_name)
@@ -3008,19 +3048,20 @@ def save_past_product_note(customer_name, customer_key, product_name, content):
 
     if existing:
         update_customer_information(existing["id"], field_name, content)
-        return
+    else:
+        next_order = max(
+            (int(item.get("sort_order", 0)) for item in items),
+            default=0,
+        ) + 10
+        insert_customer_information(
+            customer_name,
+            customer_key,
+            field_name,
+            content,
+            next_order,
+        )
 
-    next_order = max(
-        (int(item.get("sort_order", 0)) for item in items),
-        default=0,
-    ) + 10
-    insert_customer_information(
-        customer_name,
-        customer_key,
-        field_name,
-        content,
-        next_order,
-    )
+    load_all_past_product_notes_from_supabase.clear()
 
 
 def delete_past_product_note(note_item):
@@ -3029,6 +3070,7 @@ def delete_past_product_note(note_item):
     if not item_id:
         raise RuntimeError("削除する商品メモが見つかりません。")
     delete_customer_information(item_id)
+    load_all_past_product_notes_from_supabase.clear()
 
 
 def render_past_products_section(customer_name, customer_key, detail, visible_detail):
@@ -3061,8 +3103,13 @@ def render_past_products_section(customer_name, customer_key, detail, visible_de
             f"past-product|{identity}|{product_name}".encode("utf-8")
         ).hexdigest()[:16]
         delete_confirm_key = f"past_product_delete_confirm_{state_suffix}"
+        save_success_key = f"past_product_note_save_success_{state_suffix}"
 
-        with st.expander(product_name):
+        save_succeeded = bool(st.session_state.pop(save_success_key, False))
+        with st.expander(product_name, expanded=save_succeeded):
+            if save_succeeded:
+                st.success("メモを保存しました。")
+
             memo = st.text_area(
                 "メモ",
                 value=current_content,
@@ -3086,7 +3133,7 @@ def render_past_products_section(customer_name, customer_key, detail, visible_de
                             product_name,
                             memo,
                         )
-                        st.success("商品メモを保存しました。")
+                        st.session_state[save_success_key] = True
                         st.rerun()
                     except Exception as exc:
                         st.error(f"商品メモを保存できませんでした：{exc}")
@@ -10401,13 +10448,42 @@ def show_trade_notes_page():
         elif parsed and parsed["partner_type"] == category:
             filtered.append(note)
 
+    if category == "customer":
+        try:
+            past_product_items = load_all_past_product_notes_from_supabase()
+        except Exception as exc:
+            st.warning(f"過去商品メモを読み込めませんでした：{exc}")
+            past_product_items = []
+
+        for item in past_product_items:
+            product_name = extract_past_product_name(item.get("field_name"))
+            customer_name = clean_value(item.get("customer_name"), blank_text="")
+            content = clean_value(item.get("content"), blank_text="").strip()
+            if not product_name or not customer_name or not content:
+                continue
+            filtered.append(
+                {
+                    "id": item.get("id"),
+                    "customer_name": customer_name,
+                    "body": f"過去に使用した商品：{product_name}\n{content}",
+                    "created_at": item.get("updated_at") or item.get("created_at") or "",
+                    "_past_product_note": True,
+                }
+            )
+
+    filtered.sort(
+        key=lambda note: str(note.get("created_at") or ""),
+        reverse=True,
+    )
+
     if not filtered:
         st.info("メモはまだありません。")
         return
 
     for note in filtered:
         render_trade_note_card(note, category, partner_names=partner_names)
-        render_note_delete_controls(note)
+        if not note.get("_past_product_note"):
+            render_note_delete_controls(note)
 
 
 def show_top_home():
