@@ -5321,7 +5321,6 @@ def sync_page_from_query_params():
         "carrier_home",
         "carrier_list",
         "carrier_search",
-        "carrier_condition",
         "carrier_freight_compare",
         "carrier_register",
         "partner_detail",
@@ -11345,17 +11344,10 @@ def show_trade_partner_home(partner_type):
             unsafe_allow_html=True,
         )
     else:
-        col3, col4 = st.columns(2)
-        with col3:
-            st.markdown(
-                render_page_link("🗺 運送条件検索", page="carrier_condition"),
-                unsafe_allow_html=True,
-            )
-        with col4:
-            st.markdown(
-                render_page_link("💰 運賃比較", page="carrier_freight_compare"),
-                unsafe_allow_html=True,
-            )
+        st.markdown(
+            render_page_link("💰 運賃比較", page="carrier_freight_compare"),
+            unsafe_allow_html=True,
+        )
 
 
 def show_trade_partner_directory(partner_type):
@@ -11562,6 +11554,8 @@ def render_trade_partner_row_editor(
     excluded_headers = {id_field, "取引先ID", "会社名（確認用）"}
     if sheet_name == TRADE_PARTNER_MASTER_SHEET:
         excluded_headers.update({"仕入先区分", "運送会社区分"})
+    if sheet_name == TRADE_PARTNER_CONTACT_SHEET and partner_type == "carrier":
+        excluded_headers.add("会社名")
     editable_headers = [header for header in headers if header not in excluded_headers]
     with st.expander("編集"):
         with st.form(f"edit_{key_prefix}_{record_id}"):
@@ -11619,10 +11613,13 @@ def render_trade_partner_related_section(
         with st.container(border=True):
             heading = trade_partner_text(row.get(primary_field))
             st.markdown(f"**{html.escape(heading)}**")
+            display_excluded = {id_field, "取引先ID", "会社名（確認用）", primary_field}
+            if sheet_name == TRADE_PARTNER_CONTACT_SHEET and partner_type == "carrier":
+                display_excluded.add("会社名")
             render_trade_partner_fields(
                 row,
                 headers,
-                excluded={id_field, "取引先ID", "会社名（確認用）", primary_field},
+                excluded=display_excluded,
             )
             render_trade_partner_row_editor(
                 sheet_name,
@@ -11634,12 +11631,17 @@ def render_trade_partner_related_section(
             )
 
     with st.expander(f"＋ {add_label}"):
+        add_excluded_headers = {id_field, "取引先ID", "会社名（確認用）"}
+        if sheet_name == TRADE_PARTNER_CONTACT_SHEET and partner_type == "carrier":
+            add_excluded_headers.add("会社名")
         editable_headers = [
             header for header in headers
-            if header not in {id_field, "取引先ID", "会社名（確認用）"}
+            if header not in add_excluded_headers
         ]
         with st.form(f"add_{sheet_name}_{partner_id}"):
             values = {"取引先ID": partner_id}
+            if sheet_name == TRADE_PARTNER_CONTACT_SHEET and partner_type == "carrier":
+                values["会社名"] = company_name
             for header in editable_headers:
                 values[header] = st.text_input(
                     header,
@@ -11750,15 +11752,6 @@ def show_trade_partner_detail(partner_type, partner_id):
             company,
         )
     else:
-        render_trade_partner_related_section(
-            data,
-            TRADE_PARTNER_TRANSPORT_SHEET,
-            partner_id,
-            "運送条件",
-            "運送条件を追加",
-            partner_type,
-            company,
-        )
         render_carrier_freight_section(partner_id, company)
     show_trade_partner_notes(partner_type, partner_id, company)
 
@@ -12614,7 +12607,7 @@ supplier_pages = {
     "supplier_register",
 }
 carrier_pages = {
-    "carrier_home", "carrier_list", "carrier_search", "carrier_condition",
+    "carrier_home", "carrier_list", "carrier_search",
     "carrier_freight_compare", "carrier_register",
 }
 
@@ -12659,7 +12652,6 @@ with st.sidebar:
         st.markdown("#### 運送会社メニュー")
         st.markdown(render_page_link("📋 運送会社一覧", page="carrier_list"), unsafe_allow_html=True)
         st.markdown(render_page_link("🔍 運送会社検索", page="carrier_search"), unsafe_allow_html=True)
-        st.markdown(render_page_link("🗺 運送条件検索", page="carrier_condition"), unsafe_allow_html=True)
         st.markdown(render_page_link("💰 運賃比較", page="carrier_freight_compare"), unsafe_allow_html=True)
 
     st.markdown("---")
@@ -12784,8 +12776,6 @@ try:
         show_trade_partner_directory("carrier")
     elif st.session_state["page"] == "carrier_search":
         show_trade_partner_search("carrier")
-    elif st.session_state["page"] == "carrier_condition":
-        show_carrier_condition_search()
     elif st.session_state["page"] == "carrier_freight_compare":
         show_carrier_freight_compare()
     elif st.session_state["page"] == "carrier_register":
