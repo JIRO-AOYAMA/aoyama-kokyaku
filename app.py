@@ -3931,7 +3931,7 @@ def display_change_history_value(value):
 
 
 def show_change_history_page():
-    st.header("🕘 変更確認")
+    st.header("🕘 配車変更確認")
     st.caption("アプリから正常に保存された変更を新しい順に表示します。メモ帳は対象外です。")
 
     target_label = st.selectbox(
@@ -4107,6 +4107,12 @@ def load_customer_information(customer_name, customer_key=None):
 
 def clear_customer_information_cache():
     load_customer_information.clear()
+    global_attachment_loader = globals().get("load_all_onedrive_attachments_from_supabase")
+    if global_attachment_loader is not None:
+        try:
+            global_attachment_loader.clear()
+        except Exception:
+            pass
 
 
 def insert_customer_information(customer_name, customer_key, field_name, content, sort_order):
@@ -4267,6 +4273,80 @@ def get_customer_attachments(customer_name, customer_key):
         reverse=True,
     )
     return attachments
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def load_all_onedrive_attachments_from_supabase():
+    """全顧客の写真・資料メタデータだけをSupabaseから読み込む。"""
+    if not has_supabase_config():
+        return []
+
+    rows = []
+    page_size = 1000
+    offset = 0
+    while True:
+        params = {
+            "select": "id,customer_key,customer_name,field_name,content,sort_order,created_at,updated_at",
+            "field_name": f"like.{ONEDRIVE_ATTACHMENT_PREFIX}*",
+            "order": "created_at.desc,id.desc",
+            "limit": str(page_size),
+            "offset": str(offset),
+        }
+        try:
+            response = requests.get(
+                get_supabase_customer_information_url(),
+                headers=get_supabase_headers(),
+                params=params,
+                timeout=30,
+            )
+        except Exception as exc:
+            raise RuntimeError("写真・資料の読み込み中にSupabaseへ接続できませんでした。") from exc
+
+        check_customer_information_response("読み込み", response, (200,))
+        page = response.json()
+        if not isinstance(page, list):
+            raise RuntimeError("Supabaseから返った写真・資料の形式が正しくありません。")
+        rows.extend(page)
+        if len(page) < page_size:
+            break
+        offset += page_size
+
+    attachments = []
+    for row in rows:
+        parsed = parse_onedrive_attachment_item(row)
+        if parsed:
+            attachments.append(parsed)
+    attachments.sort(
+        key=lambda item: str(item.get("created_at") or item.get("updated_at") or ""),
+        reverse=True,
+    )
+    return attachments
+
+
+def attachment_tag_history_options(attachments):
+    """使われたタグを、最近使われた順で重複なく返す。"""
+    sorted_attachments = sorted(
+        list(attachments or []),
+        key=lambda item: str(item.get("updated_at") or item.get("created_at") or ""),
+        reverse=True,
+    )
+    options = []
+    seen = set()
+    for attachment in sorted_attachments:
+        for tag in normalize_attachment_tags(attachment.get("tags") or []):
+            if tag in seen:
+                continue
+            seen.add(tag)
+            options.append(tag)
+    return options
+
+
+def get_attachment_tag_history_options(fallback_attachments=None):
+    """全体履歴を優先し、読み込めない場合だけ現在顧客のタグを使う。"""
+    try:
+        return attachment_tag_history_options(load_all_onedrive_attachments_from_supabase())
+    except Exception:
+        return attachment_tag_history_options(fallback_attachments or [])
 
 
 def attachment_file_kind(filename, mime_type=""):
@@ -4486,6 +4566,7 @@ def render_customer_attachments_section(customer_name, customer_key=None):
             st.caption("追加して保存するとアプリが再起動し、通常画面から接続ボタンが消えます。")
 
         access_token = get_onedrive_access_token()
+        tag_history_options = get_attachment_tag_history_options(attachments)
         album_tab, add_tab = st.tabs(["🖼 アルバム", "➕ 追加"])
 
         # 追加処理は従来どおり。タブの初期表示は先頭のアルバム。
@@ -4538,16 +4619,21 @@ def render_customer_attachments_section(customer_name, customer_key=None):
                     key=f"onedrive_attachment_pdf_uploader_{suffix}",
                 )
 
-                fixed_tags = st.multiselect(
-                    "固定タグ",
-                    list(ONEDRIVE_FIXED_TAGS),
-                    key=f"onedrive_attachment_fixed_tags_{suffix}",
+                selected_history_tags = st.multiselect(
+                    "タグ（入力すると過去の候補を絞り込み）",
+                    tag_history_options,
+                    key=f"onedrive_attachment_history_tags_{suffix}",
                 )
-                free_tags = st.text_input(
-                    "自由タグ",
+                new_tags_text = st.text_input(
+                    "新しいタグ（候補にない場合）",
                     placeholder="例：北海道、タンク、要確認",
-                    key=f"onedrive_attachment_free_tags_{suffix}",
+                    key=f"onedrive_attachment_new_tags_{suffix}",
                 )
+                if tag_history_options:
+                    st.caption(
+                        "最近使ったタグ："
+                        + "　".join(f"#{tag}" for tag in tag_history_options[:8])
+                    )
                 remarks = st.text_area(
                     "備考",
                     placeholder="写真や資料について残したい内容",
@@ -4565,7 +4651,7 @@ def render_customer_attachments_section(customer_name, customer_key=None):
                         st.warning("写真・画像またはPDFを選んでください。")
                     else:
                         try:
-                            tags = list(fixed_tags) + normalize_attachment_tags(free_tags)
+                            tags = list(selected_history_tags) + normalize_attachment_tags(new_tags_text)
                             with st.spinner("OneDriveへ保存しています…"):
                                 saved = save_customer_onedrive_attachment(
                                     customer_name,
@@ -4619,9 +4705,9 @@ def render_customer_attachments_section(customer_name, customer_key=None):
                 ["すべて", "写真", "PDF"],
                 key=f"onedrive_attachment_type_filter_{suffix}",
             )
-            all_tags = sorted({tag for item in attachments for tag in item.get("tags", [])})
+            all_tags = attachment_tag_history_options(attachments)
             tag_filter = st.multiselect(
-                "タグで絞り込み",
+                "タグで絞り込み（入力すると候補を絞り込み）",
                 all_tags,
                 key=f"onedrive_attachment_tag_filter_{suffix}",
             ) if all_tags else []
@@ -4721,18 +4807,22 @@ def render_customer_attachments_section(customer_name, customer_key=None):
                             st.caption(attachment["remarks"])
 
                         if active_edit_id == metadata_id:
-                            current_fixed = [tag for tag in attachment.get("tags", []) if tag in ONEDRIVE_FIXED_TAGS]
-                            current_free = [tag for tag in attachment.get("tags", []) if tag not in ONEDRIVE_FIXED_TAGS]
-                            edited_fixed = st.multiselect(
-                                "固定タグを編集",
-                                list(ONEDRIVE_FIXED_TAGS),
-                                default=current_fixed,
-                                key=f"onedrive_attachment_edit_fixed_{metadata_id}",
+                            current_tags = normalize_attachment_tags(attachment.get("tags") or [])
+                            edit_tag_options = list(tag_history_options)
+                            for current_tag in reversed(current_tags):
+                                if current_tag not in edit_tag_options:
+                                    edit_tag_options.insert(0, current_tag)
+                            edited_history_tags = st.multiselect(
+                                "タグを編集（入力すると過去の候補を絞り込み）",
+                                edit_tag_options,
+                                default=current_tags,
+                                key=f"onedrive_attachment_edit_history_{metadata_id}",
                             )
-                            edited_free = st.text_input(
-                                "自由タグを編集",
-                                value="、".join(current_free),
-                                key=f"onedrive_attachment_edit_free_{metadata_id}",
+                            edited_new_tags = st.text_input(
+                                "新しいタグを追加",
+                                value="",
+                                placeholder="候補にないタグだけ入力",
+                                key=f"onedrive_attachment_edit_new_{metadata_id}",
                             )
                             edited_remarks = st.text_area(
                                 "備考を編集",
@@ -4750,7 +4840,7 @@ def render_customer_attachments_section(customer_name, customer_key=None):
                                 ):
                                     try:
                                         old_tags = " ".join(f"#{tag}" for tag in attachment.get("tags", []))
-                                        new_tags = list(edited_fixed) + normalize_attachment_tags(edited_free)
+                                        new_tags = list(edited_history_tags) + normalize_attachment_tags(edited_new_tags)
                                         update_customer_onedrive_attachment_metadata(
                                             attachment,
                                             new_tags,
@@ -4824,6 +4914,194 @@ def render_customer_attachments_section(customer_name, customer_key=None):
                     st.rerun()
 
 
+
+
+def show_attachment_search_page():
+    """全顧客の写真・資料を、タグ履歴や文字入力で横断検索する。"""
+    st.header("🔎 写真・資料検索")
+    st.caption("全顧客の写真・PDFを検索します。タグ欄は文字を入力すると過去の候補が絞り込まれます。")
+
+    if not has_supabase_config():
+        st.warning("写真・資料検索にはSupabase設定が必要です。")
+        return
+
+    try:
+        attachments = load_all_onedrive_attachments_from_supabase()
+    except Exception as exc:
+        st.error(f"写真・資料を読み込めませんでした：{exc}")
+        return
+
+    if not attachments:
+        st.info("保存されている写真・資料はありません。")
+        return
+
+    query = st.text_input(
+        "顧客名・タグ・備考を検索",
+        placeholder="文字を入力",
+        key="attachment_global_text_filter",
+    )
+    tag_options = attachment_tag_history_options(attachments)
+    selected_tags = st.multiselect(
+        "タグ（入力すると履歴から候補を表示）",
+        tag_options,
+        key="attachment_global_tag_filter",
+    ) if tag_options else []
+    if tag_options:
+        st.caption(
+            "最近使ったタグ："
+            + "　".join(f"#{tag}" for tag in tag_options[:10])
+        )
+    type_filter = st.selectbox(
+        "種類",
+        ["すべて", "写真", "PDF"],
+        key="attachment_global_type_filter",
+    )
+
+    normalized_query = clean_value(query, blank_text="").strip().casefold()
+    query_terms = [term for term in re.split(r"[\s　]+", normalized_query) if term]
+    filtered = []
+    for attachment in attachments:
+        if type_filter == "写真" and attachment.get("file_type") != "image":
+            continue
+        if type_filter == "PDF" and attachment.get("file_type") != "pdf":
+            continue
+        attachment_tags = normalize_attachment_tags(attachment.get("tags") or [])
+        if selected_tags and not set(selected_tags).issubset(set(attachment_tags)):
+            continue
+        searchable = " ".join(
+            [
+                clean_value(attachment.get("customer_name"), blank_text=""),
+                " ".join(attachment_tags),
+                clean_value(attachment.get("remarks"), blank_text=""),
+                clean_value(attachment.get("original_name"), blank_text=""),
+            ]
+        ).casefold()
+        if query_terms and not all(term in searchable for term in query_terms):
+            continue
+        filtered.append(attachment)
+
+    signature = json.dumps(
+        {
+            "query": normalized_query,
+            "tags": list(selected_tags),
+            "type": type_filter,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    signature_key = "attachment_global_filter_signature"
+    limit_key = "attachment_global_result_limit"
+    if st.session_state.get(signature_key) != signature:
+        st.session_state[signature_key] = signature
+        st.session_state[limit_key] = ONEDRIVE_PAGE_SIZE
+
+    st.caption(f"該当：{len(filtered)}件")
+    if not filtered:
+        st.info("条件に一致する写真・資料はありません。")
+        return
+
+    access_token = get_onedrive_access_token()
+    if not access_token:
+        st.warning("画像やPDFを開くには、管理者によるOneDrive接続が必要です。")
+
+    limit = int(st.session_state.get(limit_key, ONEDRIVE_PAGE_SIZE))
+    visible_attachments = filtered[:limit]
+    grid_column_count = 2 if is_mobile_browser() else 4
+    grid_columns = []
+
+    for attachment_index, attachment in enumerate(visible_attachments):
+        if attachment_index % grid_column_count == 0:
+            grid_columns = st.columns(grid_column_count, gap="small")
+
+        item_id = attachment.get("file_id", "")
+        metadata_id = attachment.get("id", "")
+        filename = attachment.get("original_name", "名称未設定")
+        customer_name = attachment.get("customer_name", "顧客名未設定")
+
+        with grid_columns[attachment_index % grid_column_count]:
+            with st.container(border=True):
+                preview_digest = hashlib.sha256(
+                    f"global:{metadata_id}".encode("utf-8")
+                ).digest()[:8]
+                preview_bits = "".join(f"{byte:08b}" for byte in preview_digest)
+                preview_trigger_label = "⁣" + "".join(
+                    "​" if bit == "0" else "‌" for bit in preview_bits
+                )
+                preview_clicked = st.button(
+                    preview_trigger_label,
+                    key=f"onedrive_attachment_global_preview_button_{metadata_id}",
+                )
+
+                if attachment.get("file_type") == "image":
+                    thumbnail_content = None
+                    if access_token and item_id:
+                        thumb_key = f"onedrive_thumbnail_{item_id}"
+                        if not isinstance(st.session_state.get(thumb_key), bytes):
+                            try:
+                                thumbnail = download_onedrive_thumbnail(access_token, item_id)
+                                if thumbnail:
+                                    st.session_state[thumb_key] = thumbnail
+                            except Exception:
+                                pass
+                        if isinstance(st.session_state.get(thumb_key), bytes):
+                            thumbnail_content = st.session_state[thumb_key]
+                    render_clickable_onedrive_thumbnail(
+                        thumbnail_content,
+                        filename,
+                        preview_trigger_label,
+                        compact_height=132 if is_mobile_browser() else 145,
+                    )
+                else:
+                    render_clickable_onedrive_pdf_tile(
+                        filename,
+                        preview_trigger_label,
+                        compact_height=132 if is_mobile_browser() else 145,
+                    )
+
+                if preview_clicked:
+                    if not access_token or not item_id:
+                        st.error("表示するにはOneDriveへ接続してください。")
+                    else:
+                        try:
+                            with st.spinner("ファイルを読み込んでいます…"):
+                                content = download_onedrive_file(access_token, item_id)
+                            if attachment.get("file_type") == "image":
+                                show_onedrive_image_dialog(content, filename)
+                            else:
+                                show_onedrive_pdf_dialog(
+                                    content,
+                                    filename,
+                                    attachment.get("mime_type") or "application/pdf",
+                                    f"global_{metadata_id}",
+                                )
+                        except Exception as exc:
+                            st.error(f"表示できませんでした：{exc}")
+
+                customer_url = make_app_url(page="detail", customer=customer_name)
+                st.markdown(
+                    f'<a href="{html.escape(customer_url, quote=True)}" target="_self" '
+                    'style="font-weight:700;text-decoration:none;">'
+                    f'{html.escape(customer_name)}</a>',
+                    unsafe_allow_html=True,
+                )
+                attachment_date = format_attachment_datetime(
+                    attachment.get("created_at")
+                ).split(" ", 1)[0]
+                if attachment_date:
+                    st.caption(attachment_date)
+                if attachment.get("tags"):
+                    st.markdown(" ".join(f"`#{tag}`" for tag in attachment["tags"]))
+                if attachment.get("remarks"):
+                    st.caption(attachment["remarks"])
+
+    if len(filtered) > limit:
+        if st.button(
+            "さらに表示",
+            key="attachment_global_more",
+            use_container_width=True,
+        ):
+            st.session_state[limit_key] = limit + ONEDRIVE_PAGE_SIZE
+            st.rerun()
 
 
 def reorder_customer_information(first_item, second_item):
@@ -7243,6 +7521,7 @@ def sync_page_from_query_params():
         "carrier_register",
         "partner_detail",
         "change_history",
+        "attachment_search",
         "estimates",
         "data_backup",
     }
@@ -13849,8 +14128,11 @@ def show_top_home():
         st.markdown(render_page_link("📝 取引先メモ", page="trade_notes"), unsafe_allow_html=True)
     col5, col6 = st.columns(2)
     with col5:
-        st.markdown(render_page_link("🕘 変更確認", page="change_history"), unsafe_allow_html=True)
+        st.markdown(render_page_link("🔎 写真・資料検索", page="attachment_search"), unsafe_allow_html=True)
     with col6:
+        st.markdown(render_page_link("🕘 配車変更確認", page="change_history"), unsafe_allow_html=True)
+    col7, _ = st.columns(2)
+    with col7:
         st.markdown(render_page_link("📄 商品見積り履歴", page="estimates"), unsafe_allow_html=True)
 
 
@@ -14666,6 +14948,9 @@ try:
 
     elif st.session_state["page"] == "change_history":
         show_change_history_page()
+
+    elif st.session_state["page"] == "attachment_search":
+        show_attachment_search_page()
 
     elif st.session_state["page"] == "estimates":
         show_estimates_page()
