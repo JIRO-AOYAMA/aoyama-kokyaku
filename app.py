@@ -883,9 +883,19 @@ def render_clickable_onedrive_thumbnail(thumbnail_content, filename, trigger_lab
           const tile = document.getElementById({json.dumps(tile_id)});
           const parentDocument = window.parent.document;
           const normalizeText = (value) => String(value || '').replace(/\\s+/g, '');
-          const findTrigger = () => Array.from(parentDocument.querySelectorAll('button')).find(
-            (button) => normalizeText(button.textContent).includes(normalizeText(triggerLabel))
-          );
+          const findTrigger = () => {{
+            const frame = window.frameElement;
+            const frameContainer = frame && frame.closest('[data-testid="stElementContainer"]');
+            let previous = frameContainer ? frameContainer.previousElementSibling : null;
+            while (previous) {{
+              const nearbyButton = previous.querySelector && previous.querySelector('button');
+              if (nearbyButton) return nearbyButton;
+              previous = previous.previousElementSibling;
+            }}
+            return Array.from(parentDocument.querySelectorAll('button')).find(
+              (button) => normalizeText(button.textContent).includes(normalizeText(triggerLabel))
+            );
+          }};
           const hideTrigger = () => {{
             const trigger = findTrigger();
             if (!trigger) return null;
@@ -1008,9 +1018,19 @@ def render_clickable_onedrive_pdf_tile(filename, trigger_label, compact_height=1
           tile.querySelector('.od-pdf-name').textContent = {json.dumps(safe_filename)};
           const parentDocument = window.parent.document;
           const normalizeText = (value) => String(value || '').replace(/\\s+/g, '');
-          const findTrigger = () => Array.from(parentDocument.querySelectorAll('button')).find(
-            (button) => normalizeText(button.textContent).includes(normalizeText(triggerLabel))
-          );
+          const findTrigger = () => {{
+            const frame = window.frameElement;
+            const frameContainer = frame && frame.closest('[data-testid="stElementContainer"]');
+            let previous = frameContainer ? frameContainer.previousElementSibling : null;
+            while (previous) {{
+              const nearbyButton = previous.querySelector && previous.querySelector('button');
+              if (nearbyButton) return nearbyButton;
+              previous = previous.previousElementSibling;
+            }}
+            return Array.from(parentDocument.querySelectorAll('button')).find(
+              (button) => normalizeText(button.textContent).includes(normalizeText(triggerLabel))
+            );
+          }};
           const hideTrigger = () => {{
             const trigger = findTrigger();
             if (!trigger) return null;
@@ -4466,334 +4486,343 @@ def render_customer_attachments_section(customer_name, customer_key=None):
             st.caption("追加して保存するとアプリが再起動し、通常画面から接続ボタンが消えます。")
 
         access_token = get_onedrive_access_token()
-        if not access_token:
-            if configured_refresh_token:
-                st.warning(
-                    "OneDriveへ自動接続できませんでした。Microsoft側で認証が失効した可能性があります。"
-                )
-                connect_label = "OneDriveを再接続（管理者用）"
+        album_tab, add_tab = st.tabs(["🖼 アルバム", "➕ 追加"])
+
+        # 追加処理は従来どおり。タブの初期表示は先頭のアルバム。
+        with add_tab:
+            if not access_token:
+                if configured_refresh_token:
+                    st.warning(
+                        "OneDriveへ自動接続できませんでした。Microsoft側で認証が失効した可能性があります。"
+                    )
+                    connect_label = "OneDriveを再接続（管理者用）"
+                else:
+                    st.info(
+                        "最初の1回だけ管理者がOneDriveへ接続し、表示された更新トークンをSecretsへ追加してください。"
+                    )
+                    connect_label = "OneDrive初回設定（管理者用）"
+                try:
+                    st.link_button(
+                        connect_label,
+                        build_onedrive_sign_in_url("detail", customer_name),
+                        use_container_width=True,
+                    )
+                except Exception as exc:
+                    st.error(f"OneDriveへの接続を開始できませんでした：{exc}")
             else:
-                st.info(
-                    "最初の1回だけ管理者がOneDriveへ接続し、表示された更新トークンをSecretsへ追加してください。"
-                )
-                connect_label = "OneDrive初回設定（管理者用）"
-            try:
-                st.link_button(
-                    connect_label,
-                    build_onedrive_sign_in_url("detail", customer_name),
-                    use_container_width=True,
-                )
-            except Exception as exc:
-                st.error(f"OneDriveへの接続を開始できませんでした：{exc}")
-        else:
-            st.markdown("#### 追加")
-            mobile_browser = is_mobile_browser()
-            camera_file = None
-            if mobile_browser:
-                camera_label = "📷 写真を撮る"
-                camera_file = st.file_uploader(
-                    camera_label,
+                st.markdown("#### 追加")
+                mobile_browser = is_mobile_browser()
+                camera_file = None
+                if mobile_browser:
+                    camera_label = "📷 写真を撮る"
+                    camera_file = st.file_uploader(
+                        camera_label,
+                        type=["jpg", "jpeg", "png", "webp"],
+                        accept_multiple_files=False,
+                        key=f"onedrive_attachment_camera_uploader_{suffix}",
+                        help="スマホの背面カメラを起動して撮影します。",
+                    )
+                    enable_mobile_camera_capture(camera_label)
+
+                selected_image_file = st.file_uploader(
+                    "🖼 保存済み画像を選ぶ" if mobile_browser else "🖼 画像を選ぶ",
                     type=["jpg", "jpeg", "png", "webp"],
                     accept_multiple_files=False,
-                    key=f"onedrive_attachment_camera_uploader_{suffix}",
-                    help="スマホの背面カメラを起動して撮影します。",
+                    key=f"onedrive_attachment_photo_uploader_{suffix}",
                 )
-                enable_mobile_camera_capture(camera_label)
+                photo_file = camera_file if camera_file is not None else selected_image_file
+                pdf_file = st.file_uploader(
+                    "📄 PDFを選ぶ",
+                    type=["pdf"],
+                    accept_multiple_files=False,
+                    key=f"onedrive_attachment_pdf_uploader_{suffix}",
+                )
 
-            selected_image_file = st.file_uploader(
-                "🖼 保存済み画像を選ぶ" if mobile_browser else "🖼 画像を選ぶ",
-                type=["jpg", "jpeg", "png", "webp"],
-                accept_multiple_files=False,
-                key=f"onedrive_attachment_photo_uploader_{suffix}",
-            )
-            photo_file = camera_file if camera_file is not None else selected_image_file
-            pdf_file = st.file_uploader(
-                "📄 PDFを選ぶ",
-                type=["pdf"],
-                accept_multiple_files=False,
-                key=f"onedrive_attachment_pdf_uploader_{suffix}",
-            )
-
-            fixed_tags = st.multiselect(
-                "固定タグ",
-                list(ONEDRIVE_FIXED_TAGS),
-                key=f"onedrive_attachment_fixed_tags_{suffix}",
-            )
-            free_tags = st.text_input(
-                "自由タグ",
-                placeholder="例：北海道、タンク、要確認",
-                key=f"onedrive_attachment_free_tags_{suffix}",
-            )
-            remarks = st.text_area(
-                "備考",
-                placeholder="写真や資料について残したい内容",
-                height=90,
-                key=f"onedrive_attachment_remarks_{suffix}",
-            )
-            if st.button(
-                "OneDriveへ保存",
-                type="primary",
-                use_container_width=True,
-                key=f"onedrive_attachment_upload_{suffix}",
-            ):
-                uploaded = photo_file if photo_file is not None else pdf_file
-                if uploaded is None:
-                    st.warning("写真・画像またはPDFを選んでください。")
-                else:
-                    try:
-                        tags = list(fixed_tags) + normalize_attachment_tags(free_tags)
-                        with st.spinner("OneDriveへ保存しています…"):
-                            saved = save_customer_onedrive_attachment(
-                                customer_name,
-                                customer_key,
-                                uploaded.name,
-                                uploaded.getvalue(),
-                                uploaded.type or mimetypes.guess_type(uploaded.name)[0] or "application/octet-stream",
-                                tags,
-                                remarks,
-                                access_token,
-                            )
-                        remember_change_history_warning(
-                            record_change_history_safely(
-                                "顧客",
-                                customer_key or "",
-                                customer_name,
-                                "追加",
-                                {
-                                    "ファイル": ("", saved.get("original_name", "")),
-                                    "タグ": ("", " ".join(f"#{tag}" for tag in saved.get("tags", []))),
-                                },
-                                section="写真・資料",
-                            )
-                        )
-                        st.session_state[success_key] = "写真・資料を保存しました。"
-                        st.session_state[limit_key] = ONEDRIVE_PAGE_SIZE
-                        st.rerun()
-                    except Exception as exc:
-                        st.error(f"保存できませんでした：{exc}")
-
-        st.markdown("---")
-        st.markdown("#### 保存済み")
-        if not attachments:
-            st.info("保存されている写真・資料はありません。")
-            return
-
-        type_filter = st.selectbox(
-            "種類",
-            ["すべて", "写真", "PDF"],
-            key=f"onedrive_attachment_type_filter_{suffix}",
-        )
-        all_tags = sorted({tag for item in attachments for tag in item.get("tags", [])})
-        tag_filter = st.multiselect(
-            "タグで絞り込み",
-            all_tags,
-            key=f"onedrive_attachment_tag_filter_{suffix}",
-        ) if all_tags else []
-
-        filtered = []
-        for attachment in attachments:
-            if type_filter == "写真" and attachment.get("file_type") != "image":
-                continue
-            if type_filter == "PDF" and attachment.get("file_type") != "pdf":
-                continue
-            if tag_filter and not set(tag_filter).issubset(set(attachment.get("tags", []))):
-                continue
-            filtered.append(attachment)
-
-        limit = int(st.session_state.get(limit_key, ONEDRIVE_PAGE_SIZE))
-        active_edit_id = st.session_state.get(edit_key)
-
-        if not filtered:
-            st.info("条件に一致する写真・資料はありません。")
-
-        visible_attachments = filtered[:limit]
-        grid_column_count = 2 if is_mobile_browser() else 3
-        grid_columns = []
-
-        for attachment_index, attachment in enumerate(visible_attachments):
-            if attachment_index % grid_column_count == 0:
-                grid_columns = st.columns(grid_column_count, gap="small")
-
-            item_id = attachment.get("file_id", "")
-            metadata_id = attachment.get("id", "")
-            filename = attachment.get("original_name", "名称未設定")
-            with grid_columns[attachment_index % grid_column_count]:
-                with st.container(border=True):
-                    preview_trigger_label = f"__onedrive_attachment_preview_{metadata_id}__"
-                    preview_clicked = st.button(
-                        preview_trigger_label,
-                        key=f"onedrive_attachment_preview_button_{metadata_id}",
-                    )
-
-                    if attachment.get("file_type") == "image":
-                        thumbnail_content = None
-                        if access_token and item_id:
-                            thumb_key = f"onedrive_thumbnail_{item_id}"
-                            if not isinstance(st.session_state.get(thumb_key), bytes):
-                                try:
-                                    thumbnail = download_onedrive_thumbnail(access_token, item_id)
-                                    if thumbnail:
-                                        st.session_state[thumb_key] = thumbnail
-                                except Exception:
-                                    pass
-                            if isinstance(st.session_state.get(thumb_key), bytes):
-                                thumbnail_content = st.session_state[thumb_key]
-                        render_clickable_onedrive_thumbnail(
-                            thumbnail_content,
-                            filename,
-                            preview_trigger_label,
-                            compact_height=142 if is_mobile_browser() else 150,
-                        )
+                fixed_tags = st.multiselect(
+                    "固定タグ",
+                    list(ONEDRIVE_FIXED_TAGS),
+                    key=f"onedrive_attachment_fixed_tags_{suffix}",
+                )
+                free_tags = st.text_input(
+                    "自由タグ",
+                    placeholder="例：北海道、タンク、要確認",
+                    key=f"onedrive_attachment_free_tags_{suffix}",
+                )
+                remarks = st.text_area(
+                    "備考",
+                    placeholder="写真や資料について残したい内容",
+                    height=90,
+                    key=f"onedrive_attachment_remarks_{suffix}",
+                )
+                if st.button(
+                    "OneDriveへ保存",
+                    type="primary",
+                    use_container_width=True,
+                    key=f"onedrive_attachment_upload_{suffix}",
+                ):
+                    uploaded = photo_file if photo_file is not None else pdf_file
+                    if uploaded is None:
+                        st.warning("写真・画像またはPDFを選んでください。")
                     else:
-                        render_clickable_onedrive_pdf_tile(
-                            filename,
+                        try:
+                            tags = list(fixed_tags) + normalize_attachment_tags(free_tags)
+                            with st.spinner("OneDriveへ保存しています…"):
+                                saved = save_customer_onedrive_attachment(
+                                    customer_name,
+                                    customer_key,
+                                    uploaded.name,
+                                    uploaded.getvalue(),
+                                    uploaded.type or mimetypes.guess_type(uploaded.name)[0] or "application/octet-stream",
+                                    tags,
+                                    remarks,
+                                    access_token,
+                                )
+                            remember_change_history_warning(
+                                record_change_history_safely(
+                                    "顧客",
+                                    customer_key or "",
+                                    customer_name,
+                                    "追加",
+                                    {
+                                        "ファイル": ("", saved.get("original_name", "")),
+                                        "タグ": ("", " ".join(f"#{tag}" for tag in saved.get("tags", []))),
+                                    },
+                                    section="写真・資料",
+                                )
+                            )
+                            st.session_state[success_key] = "写真・資料を保存しました。"
+                            st.session_state[limit_key] = ONEDRIVE_PAGE_SIZE
+                            st.rerun()
+                        except Exception as exc:
+                            st.error(f"保存できませんでした：{exc}")
+
+            # 自動接続設定後は利用者ごとのMicrosoft接続操作を表示しない。
+            if access_token and not configured_refresh_token:
+                st.markdown("---")
+                if st.button(
+                    "初回設定中の一時接続を解除",
+                    key=f"onedrive_attachment_signout_{suffix}",
+                    use_container_width=True,
+                ):
+                    clear_onedrive_auth_state(clear_shared=True)
+                    st.session_state.pop("onedrive_refresh_token_setup_value", None)
+                    st.rerun()
+
+        with album_tab:
+            st.markdown("#### アルバム")
+            if not attachments:
+                st.info("保存されている写真・資料はありません。")
+                return
+
+            type_filter = st.selectbox(
+                "種類",
+                ["すべて", "写真", "PDF"],
+                key=f"onedrive_attachment_type_filter_{suffix}",
+            )
+            all_tags = sorted({tag for item in attachments for tag in item.get("tags", [])})
+            tag_filter = st.multiselect(
+                "タグで絞り込み",
+                all_tags,
+                key=f"onedrive_attachment_tag_filter_{suffix}",
+            ) if all_tags else []
+
+            filtered = []
+            for attachment in attachments:
+                if type_filter == "写真" and attachment.get("file_type") != "image":
+                    continue
+                if type_filter == "PDF" and attachment.get("file_type") != "pdf":
+                    continue
+                if tag_filter and not set(tag_filter).issubset(set(attachment.get("tags", []))):
+                    continue
+                filtered.append(attachment)
+
+            limit = int(st.session_state.get(limit_key, ONEDRIVE_PAGE_SIZE))
+            active_edit_id = st.session_state.get(edit_key)
+
+            if not filtered:
+                st.info("条件に一致する写真・資料はありません。")
+
+            visible_attachments = filtered[:limit]
+            grid_column_count = 2 if is_mobile_browser() else 3
+            grid_columns = []
+
+            for attachment_index, attachment in enumerate(visible_attachments):
+                if attachment_index % grid_column_count == 0:
+                    grid_columns = st.columns(grid_column_count, gap="small")
+
+                item_id = attachment.get("file_id", "")
+                metadata_id = attachment.get("id", "")
+                filename = attachment.get("original_name", "名称未設定")
+                with grid_columns[attachment_index % grid_column_count]:
+                    with st.container(border=True):
+                        preview_digest = hashlib.sha256(str(metadata_id).encode("utf-8")).digest()[:8]
+                        preview_bits = "".join(f"{byte:08b}" for byte in preview_digest)
+                        preview_trigger_label = "⁣" + "".join(
+                            "​" if bit == "0" else "‌" for bit in preview_bits
+                        )
+                        preview_clicked = st.button(
                             preview_trigger_label,
-                            compact_height=142 if is_mobile_browser() else 150,
+                            key=f"onedrive_attachment_preview_button_{metadata_id}",
                         )
 
-                    if preview_clicked:
-                        if not access_token or not item_id:
-                            st.error("表示するにはOneDriveへ接続してください。")
+                        if attachment.get("file_type") == "image":
+                            thumbnail_content = None
+                            if access_token and item_id:
+                                thumb_key = f"onedrive_thumbnail_{item_id}"
+                                if not isinstance(st.session_state.get(thumb_key), bytes):
+                                    try:
+                                        thumbnail = download_onedrive_thumbnail(access_token, item_id)
+                                        if thumbnail:
+                                            st.session_state[thumb_key] = thumbnail
+                                    except Exception:
+                                        pass
+                                if isinstance(st.session_state.get(thumb_key), bytes):
+                                    thumbnail_content = st.session_state[thumb_key]
+                            render_clickable_onedrive_thumbnail(
+                                thumbnail_content,
+                                filename,
+                                preview_trigger_label,
+                                compact_height=142 if is_mobile_browser() else 150,
+                            )
                         else:
-                            try:
-                                with st.spinner("ファイルを読み込んでいます…"):
-                                    content = download_onedrive_file(access_token, item_id)
-                                if attachment.get("file_type") == "image":
-                                    show_onedrive_image_dialog(content, filename)
-                                else:
-                                    show_onedrive_pdf_dialog(
-                                        content,
-                                        filename,
-                                        attachment.get("mime_type") or "application/pdf",
-                                        metadata_id,
-                                    )
-                            except Exception as exc:
-                                st.error(f"表示できませんでした：{exc}")
+                            render_clickable_onedrive_pdf_tile(
+                                filename,
+                                preview_trigger_label,
+                                compact_height=142 if is_mobile_browser() else 150,
+                            )
 
-                    attachment_date = format_attachment_datetime(
-                        attachment.get("created_at")
-                    ).split(" ", 1)[0]
-                    if attachment_date:
-                        st.caption(attachment_date)
-                    if attachment.get("tags"):
-                        st.markdown(" ".join(f"`#{tag}`" for tag in attachment["tags"]))
-                    if attachment.get("remarks"):
-                        st.caption(attachment["remarks"])
-
-                    if active_edit_id == metadata_id:
-                        current_fixed = [tag for tag in attachment.get("tags", []) if tag in ONEDRIVE_FIXED_TAGS]
-                        current_free = [tag for tag in attachment.get("tags", []) if tag not in ONEDRIVE_FIXED_TAGS]
-                        edited_fixed = st.multiselect(
-                            "固定タグを編集",
-                            list(ONEDRIVE_FIXED_TAGS),
-                            default=current_fixed,
-                            key=f"onedrive_attachment_edit_fixed_{metadata_id}",
-                        )
-                        edited_free = st.text_input(
-                            "自由タグを編集",
-                            value="、".join(current_free),
-                            key=f"onedrive_attachment_edit_free_{metadata_id}",
-                        )
-                        edited_remarks = st.text_area(
-                            "備考を編集",
-                            value=attachment.get("remarks", ""),
-                            height=90,
-                            key=f"onedrive_attachment_edit_remarks_{metadata_id}",
-                        )
-                        save_col, cancel_col = st.columns(2)
-                        with save_col:
-                            if st.button(
-                                "保存",
-                                key=f"onedrive_attachment_edit_save_{metadata_id}",
-                                type="primary",
-                                use_container_width=True,
-                            ):
+                        if preview_clicked:
+                            if not access_token or not item_id:
+                                st.error("表示するにはOneDriveへ接続してください。")
+                            else:
                                 try:
-                                    old_tags = " ".join(f"#{tag}" for tag in attachment.get("tags", []))
-                                    new_tags = list(edited_fixed) + normalize_attachment_tags(edited_free)
-                                    update_customer_onedrive_attachment_metadata(
-                                        attachment,
-                                        new_tags,
-                                        edited_remarks,
-                                    )
-                                    changes = {}
-                                    new_tags_text = " ".join(f"#{tag}" for tag in normalize_attachment_tags(new_tags))
-                                    if old_tags != new_tags_text:
-                                        changes["タグ"] = (old_tags, new_tags_text)
-                                    if attachment.get("remarks", "") != str(edited_remarks or "").strip():
-                                        changes["備考"] = (attachment.get("remarks", ""), str(edited_remarks or "").strip())
-                                    remember_change_history_warning(
-                                        record_change_history_safely(
-                                            "顧客",
-                                            customer_key or "",
-                                            customer_name,
-                                            "変更",
-                                            changes,
-                                            section=f"写真・資料：{filename}",
+                                    with st.spinner("ファイルを読み込んでいます…"):
+                                        content = download_onedrive_file(access_token, item_id)
+                                    if attachment.get("file_type") == "image":
+                                        show_onedrive_image_dialog(content, filename)
+                                    else:
+                                        show_onedrive_pdf_dialog(
+                                            content,
+                                            filename,
+                                            attachment.get("mime_type") or "application/pdf",
+                                            metadata_id,
                                         )
-                                    )
-                                    st.session_state.pop(edit_key, None)
-                                    st.session_state[success_key] = "タグ・備考を更新しました。"
-                                    st.rerun()
                                 except Exception as exc:
-                                    st.error(f"更新できませんでした：{exc}")
-                        with cancel_col:
+                                    st.error(f"表示できませんでした：{exc}")
+
+                        attachment_date = format_attachment_datetime(
+                            attachment.get("created_at")
+                        ).split(" ", 1)[0]
+                        if attachment_date:
+                            st.caption(attachment_date)
+                        if attachment.get("tags"):
+                            st.markdown(" ".join(f"`#{tag}`" for tag in attachment["tags"]))
+                        if attachment.get("remarks"):
+                            st.caption(attachment["remarks"])
+
+                        if active_edit_id == metadata_id:
+                            current_fixed = [tag for tag in attachment.get("tags", []) if tag in ONEDRIVE_FIXED_TAGS]
+                            current_free = [tag for tag in attachment.get("tags", []) if tag not in ONEDRIVE_FIXED_TAGS]
+                            edited_fixed = st.multiselect(
+                                "固定タグを編集",
+                                list(ONEDRIVE_FIXED_TAGS),
+                                default=current_fixed,
+                                key=f"onedrive_attachment_edit_fixed_{metadata_id}",
+                            )
+                            edited_free = st.text_input(
+                                "自由タグを編集",
+                                value="、".join(current_free),
+                                key=f"onedrive_attachment_edit_free_{metadata_id}",
+                            )
+                            edited_remarks = st.text_area(
+                                "備考を編集",
+                                value=attachment.get("remarks", ""),
+                                height=90,
+                                key=f"onedrive_attachment_edit_remarks_{metadata_id}",
+                            )
+                            save_col, cancel_col = st.columns(2)
+                            with save_col:
+                                if st.button(
+                                    "保存",
+                                    key=f"onedrive_attachment_edit_save_{metadata_id}",
+                                    type="primary",
+                                    use_container_width=True,
+                                ):
+                                    try:
+                                        old_tags = " ".join(f"#{tag}" for tag in attachment.get("tags", []))
+                                        new_tags = list(edited_fixed) + normalize_attachment_tags(edited_free)
+                                        update_customer_onedrive_attachment_metadata(
+                                            attachment,
+                                            new_tags,
+                                            edited_remarks,
+                                        )
+                                        changes = {}
+                                        new_tags_text = " ".join(f"#{tag}" for tag in normalize_attachment_tags(new_tags))
+                                        if old_tags != new_tags_text:
+                                            changes["タグ"] = (old_tags, new_tags_text)
+                                        if attachment.get("remarks", "") != str(edited_remarks or "").strip():
+                                            changes["備考"] = (attachment.get("remarks", ""), str(edited_remarks or "").strip())
+                                        remember_change_history_warning(
+                                            record_change_history_safely(
+                                                "顧客",
+                                                customer_key or "",
+                                                customer_name,
+                                                "変更",
+                                                changes,
+                                                section=f"写真・資料：{filename}",
+                                            )
+                                        )
+                                        st.session_state.pop(edit_key, None)
+                                        st.session_state[success_key] = "タグ・備考を更新しました。"
+                                        st.rerun()
+                                    except Exception as exc:
+                                        st.error(f"更新できませんでした：{exc}")
+                            with cancel_col:
+                                if st.button(
+                                    "キャンセル",
+                                    key=f"onedrive_attachment_edit_cancel_{metadata_id}",
+                                    use_container_width=True,
+                                ):
+                                    st.session_state.pop(edit_key, None)
+                                    st.rerun()
+                            continue
+
+                        action_col, delete_col = st.columns(2, gap="small")
+                        with action_col:
                             if st.button(
-                                "キャンセル",
-                                key=f"onedrive_attachment_edit_cancel_{metadata_id}",
+                                "編集",
+                                key=f"onedrive_attachment_edit_button_{metadata_id}",
+                                use_container_width=True,
+                                help="タグ・備考を編集",
+                            ):
+                                st.session_state[edit_key] = metadata_id
+                                st.rerun()
+                        with delete_col:
+                            if st.button(
+                                "削除",
+                                key=f"onedrive_attachment_delete_button_{metadata_id}",
                                 use_container_width=True,
                             ):
                                 st.session_state.pop(edit_key, None)
-                                st.rerun()
-                        continue
+                                confirm_onedrive_attachment_delete_dialog(
+                                    access_token,
+                                    attachment,
+                                    customer_key,
+                                    customer_name,
+                                    success_key,
+                                    open_key,
+                                    restore_key,
+                                )
 
-                    action_col, delete_col = st.columns(2, gap="small")
-                    with action_col:
-                        if st.button(
-                            "編集",
-                            key=f"onedrive_attachment_edit_button_{metadata_id}",
-                            use_container_width=True,
-                            help="タグ・備考を編集",
-                        ):
-                            st.session_state[edit_key] = metadata_id
-                            st.rerun()
-                    with delete_col:
-                        if st.button(
-                            "削除",
-                            key=f"onedrive_attachment_delete_button_{metadata_id}",
-                            use_container_width=True,
-                        ):
-                            st.session_state.pop(edit_key, None)
-                            confirm_onedrive_attachment_delete_dialog(
-                                access_token,
-                                attachment,
-                                customer_key,
-                                customer_name,
-                                success_key,
-                                open_key,
-                                restore_key,
-                            )
+            if len(filtered) > limit:
+                if st.button(
+                    "さらに表示",
+                    key=f"onedrive_attachment_more_{suffix}",
+                    use_container_width=True,
+                ):
+                    st.session_state[limit_key] = limit + ONEDRIVE_PAGE_SIZE
+                    st.rerun()
 
-        if len(filtered) > limit:
-            if st.button(
-                "さらに表示",
-                key=f"onedrive_attachment_more_{suffix}",
-                use_container_width=True,
-            ):
-                st.session_state[limit_key] = limit + ONEDRIVE_PAGE_SIZE
-                st.rerun()
-
-        # 自動接続設定後は利用者ごとのMicrosoft接続操作を表示しない。
-        if access_token and not configured_refresh_token:
-            st.markdown("---")
-            if st.button(
-                "初回設定中の一時接続を解除",
-                key=f"onedrive_attachment_signout_{suffix}",
-                use_container_width=True,
-            ):
-                clear_onedrive_auth_state(clear_shared=True)
-                st.session_state.pop("onedrive_refresh_token_setup_value", None)
-                st.rerun()
 
 
 
