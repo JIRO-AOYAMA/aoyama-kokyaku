@@ -6835,8 +6835,6 @@ def show_customer_detail(df, customer_name):
 
     customer_key = get_stable_customer_key(detail)
     render_customer_information_card(customer_name, customer_key)
-    render_customer_estimates_section(customer_name, customer_key)
-    render_customer_attachments_section(customer_name, customer_key)
 
     # WATER itのポイント名と顧客名が一致する場合だけ、最新値を読み取り専用で表示する。
     render_customer_water_it_card(customer_name)
@@ -6919,6 +6917,9 @@ def show_customer_detail(df, customer_name):
                 st.warning(f"ソリュブルシートに「{customer_name}」が見つかりません。")
         except Exception as exc:
             st.warning(f"ソリュブル情報を読み込めませんでした：{exc}")
+
+    render_customer_estimates_section(customer_name, customer_key)
+    render_customer_attachments_section(customer_name, customer_key)
 
     show_customer_notes(customer_name)
     render_past_products_section(customer_name, customer_key, detail, visible_detail)
