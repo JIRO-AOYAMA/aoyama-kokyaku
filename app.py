@@ -1422,6 +1422,65 @@ def show_onedrive_pdf_dialog(pdf_content, filename, mime_type, metadata_id):
 
 
 
+GLOBAL_DELETE_SCROLL_RESTORE_KEY = "restore_global_delete_scroll_position"
+
+
+def render_global_delete_scroll_keeper(restore=False):
+    """画面上の削除操作前後で、現在のスクロール位置を共通保持する。"""
+    storage_key = "aoyama_global_delete_scroll"
+    listener_key = "__aoyama_global_delete_scroll_listener"
+    restore_script = ""
+    if restore:
+        restore_script = f"""
+          const savedY = Number(parentWindow.sessionStorage.getItem({json.dumps(storage_key)}));
+          if (Number.isFinite(savedY)) {{
+            const restorePosition = () => parentWindow.scrollTo({{top: savedY, left: 0, behavior: 'auto'}});
+            parentWindow.requestAnimationFrame(() => {{
+              restorePosition();
+              parentWindow.setTimeout(restorePosition, 80);
+              parentWindow.setTimeout(restorePosition, 240);
+              parentWindow.setTimeout(restorePosition, 520);
+            }});
+            parentWindow.sessionStorage.removeItem({json.dumps(storage_key)});
+          }}
+        """
+
+    components.html(
+        f"""
+        <script>
+        (() => {{
+          const parentWindow = window.parent;
+          const parentDocument = parentWindow.document;
+          const listenerKey = {json.dumps(listener_key)};
+          const storageKey = {json.dumps(storage_key)};
+
+          if (!parentWindow[listenerKey]) {{
+            const rememberScroll = (event) => {{
+              const button = event.target && event.target.closest
+                ? event.target.closest('button')
+                : null;
+              if (!button) return;
+              const label = (button.innerText || button.textContent || '')
+                .replace(/\\s+/g, ' ')
+                .trim();
+              if (label === '削除' || label === '削除する' || label === '本当に削除') {{
+                parentWindow.sessionStorage.setItem(storageKey, String(parentWindow.scrollY || 0));
+              }}
+            }};
+            parentDocument.addEventListener('click', rememberScroll, true);
+            parentWindow[listenerKey] = true;
+          }}
+
+          {restore_script}
+        }})();
+        </script>
+        """,
+        height=1,
+        width=1,
+        scrolling=False,
+    )
+
+
 def render_onedrive_attachment_scroll_keeper(suffix, restore=False):
     """写真・資料の削除前後で、現在の画面位置をブラウザー側に保持する。"""
     safe_suffix = re.sub(r"[^0-9A-Za-z_-]", "", str(suffix or ""))
@@ -3597,37 +3656,63 @@ def render_note_card(note, show_customer=True):
     )
 
 
+NOTE_DELETE_SUCCESS_KEY = "note_delete_success_message"
+
+
+def show_note_delete_success_message():
+    message = st.session_state.pop(NOTE_DELETE_SUCCESS_KEY, None)
+    if message:
+        st.success(message)
+
+
+@st.dialog("メモを削除")
+def confirm_note_delete_dialog(note):
+    """画面位置を保ったまま、メモ削除を確認して実行する。"""
+    note_id = clean_value(note.get("id"), blank_text="")
+    body = clean_value(note.get("body"), blank_text="").strip()
+    preview = body if len(body) <= 80 else body[:77] + "…"
+
+    st.warning("このメモを削除します。")
+    if preview:
+        st.caption(preview)
+    st.caption("この操作は元に戻せません。")
+    delete_col, cancel_col = st.columns(2)
+
+    with delete_col:
+        if st.button(
+            "削除する",
+            key=f"delete_note_dialog_yes_{note_id}",
+            type="primary",
+            use_container_width=True,
+        ):
+            if delete_note_from_supabase(note_id):
+                st.session_state[NOTE_DELETE_SUCCESS_KEY] = "メモを削除しました。"
+                st.session_state[GLOBAL_DELETE_SCROLL_RESTORE_KEY] = True
+                st.rerun()
+
+    with cancel_col:
+        if st.button(
+            "キャンセル",
+            key=f"delete_note_dialog_no_{note_id}",
+            use_container_width=True,
+        ):
+            st.session_state[GLOBAL_DELETE_SCROLL_RESTORE_KEY] = True
+            st.rerun()
+
+
 def render_note_delete_controls(note):
     note_id = clean_value(note.get("id"), blank_text="")
     if not note_id:
         return
 
-    confirm_key = f"confirm_delete_note_{note_id}"
-
-    if st.session_state.get(confirm_key):
-        st.warning("このメモを削除しますか？")
-        col1, col2 = st.columns(2)
-
-        with col1:
-            if st.button("本当に削除", key=f"delete_note_confirm_{note_id}"):
-                if delete_note_from_supabase(note_id):
-                    st.session_state.pop(confirm_key, None)
-                    st.success("メモを削除しました。")
-                    st.rerun()
-
-        with col2:
-            if st.button("キャンセル", key=f"delete_note_cancel_{note_id}"):
-                st.session_state.pop(confirm_key, None)
-                st.rerun()
-    else:
-        if st.button("削除", key=f"delete_note_start_{note_id}"):
-            st.session_state[confirm_key] = True
-            st.rerun()
+    if st.button("削除", key=f"delete_note_start_{note_id}"):
+        confirm_note_delete_dialog(note)
 
 
 def show_customer_notes(customer_name):
     st.markdown("---")
     st.subheader("📝 この顧客のメモ")
+    show_note_delete_success_message()
     st.caption(f"🎤 {VOICE_INPUT_HELP}")
 
     note_key = f"customer_note_input_{customer_name}"
@@ -3672,6 +3757,7 @@ def show_notes_page(df):
 
     st.markdown("---")
     st.header("📝 メモ帳")
+    show_note_delete_success_message()
     st.caption("全顧客のメモを新しい順で表示します。")
 
     notes = load_notes_from_supabase()
@@ -5559,6 +5645,42 @@ def delete_past_product_note(note_item):
     load_all_past_product_notes_from_supabase.clear()
 
 
+@st.dialog("商品メモを削除")
+def confirm_past_product_note_delete_dialog(
+    note_item, product_name, delete_success_key, keep_open_key
+):
+    """画面位置を保ったまま、過去商品メモの削除を確認する。"""
+    item_id = clean_value(note_item.get("id"), blank_text="")
+    st.warning(f"「{product_name}」の商品メモを削除します。")
+    st.caption("この操作は元に戻せません。")
+    delete_col, cancel_col = st.columns(2)
+
+    with delete_col:
+        if st.button(
+            "削除する",
+            key=f"past_product_note_delete_dialog_yes_{item_id}",
+            type="primary",
+            use_container_width=True,
+        ):
+            try:
+                delete_past_product_note(note_item)
+                st.session_state[delete_success_key] = True
+                st.session_state[GLOBAL_DELETE_SCROLL_RESTORE_KEY] = True
+                st.rerun()
+            except Exception as exc:
+                st.error(f"商品メモを削除できませんでした：{exc}")
+
+    with cancel_col:
+        if st.button(
+            "キャンセル",
+            key=f"past_product_note_delete_dialog_no_{item_id}",
+            use_container_width=True,
+        ):
+            st.session_state[keep_open_key] = True
+            st.session_state[GLOBAL_DELETE_SCROLL_RESTORE_KEY] = True
+            st.rerun()
+
+
 def render_past_products_section(customer_name, customer_key, detail, visible_detail):
     """顧客詳細の最下部に、過去に使用した商品と商品別メモを表示する。"""
     past_products = get_past_product_names(detail, visible_detail)
@@ -5588,13 +5710,21 @@ def render_past_products_section(customer_name, customer_key, detail, visible_de
         state_suffix = hashlib.sha256(
             f"past-product|{identity}|{product_name}".encode("utf-8")
         ).hexdigest()[:16]
-        delete_confirm_key = f"past_product_delete_confirm_{state_suffix}"
         save_success_key = f"past_product_note_save_success_{state_suffix}"
+        delete_success_key = f"past_product_note_delete_success_{state_suffix}"
+        keep_open_key = f"past_product_note_keep_open_{state_suffix}"
 
         save_succeeded = bool(st.session_state.pop(save_success_key, False))
-        with st.expander(product_name, expanded=save_succeeded):
+        delete_succeeded = bool(st.session_state.pop(delete_success_key, False))
+        keep_open = bool(st.session_state.pop(keep_open_key, False))
+        with st.expander(
+            product_name,
+            expanded=save_succeeded or delete_succeeded or keep_open,
+        ):
             if save_succeeded:
                 st.success("メモを保存しました。")
+            if delete_succeeded:
+                st.success("商品メモを削除しました。")
 
             memo = st.text_area(
                 "メモ",
@@ -5625,35 +5755,17 @@ def render_past_products_section(customer_name, customer_key, detail, visible_de
                         st.error(f"商品メモを保存できませんでした：{exc}")
 
             with delete_col:
-                if note_item:
-                    if st.session_state.get(delete_confirm_key):
-                        if st.button(
-                            "削除する",
-                            key=f"past_product_note_delete_confirm_{state_suffix}",
-                            use_container_width=True,
-                        ):
-                            try:
-                                delete_past_product_note(note_item)
-                                st.session_state.pop(delete_confirm_key, None)
-                                st.success("商品メモを削除しました。")
-                                st.rerun()
-                            except Exception as exc:
-                                st.error(f"商品メモを削除できませんでした：{exc}")
-                        if st.button(
-                            "キャンセル",
-                            key=f"past_product_note_delete_cancel_{state_suffix}",
-                            use_container_width=True,
-                        ):
-                            st.session_state.pop(delete_confirm_key, None)
-                            st.rerun()
-                    else:
-                        if st.button(
-                            "削除",
-                            key=f"past_product_note_delete_{state_suffix}",
-                            use_container_width=True,
-                        ):
-                            st.session_state[delete_confirm_key] = True
-                            st.rerun()
+                if note_item and st.button(
+                    "削除",
+                    key=f"past_product_note_delete_{state_suffix}",
+                    use_container_width=True,
+                ):
+                    confirm_past_product_note_delete_dialog(
+                        note_item,
+                        product_name,
+                        delete_success_key,
+                        keep_open_key,
+                    )
 
 
 
@@ -5868,6 +5980,63 @@ def delete_customer_estimate(item):
     clear_estimate_cache()
 
 
+@st.dialog("見積りを削除")
+def confirm_customer_estimate_delete_dialog(
+    estimate,
+    customer_name,
+    customer_key,
+    success_key,
+    keep_open_key,
+    add_key,
+    edit_key,
+    delete_key,
+):
+    """画面位置を保ったまま、見積り削除を確認して実行する。"""
+    estimate_id = clean_value(estimate.get("id"), blank_text="")
+    product_name = clean_value(estimate.get("product_name"), blank_text="商品名未入力")
+    st.warning(f"「{product_name}」の見積りを削除します。")
+    st.caption("この操作は元に戻せません。")
+    delete_col, cancel_col = st.columns(2)
+
+    with delete_col:
+        if st.button(
+            "削除する",
+            key=f"estimate_delete_dialog_yes_{estimate_id}",
+            type="primary",
+            use_container_width=True,
+        ):
+            try:
+                delete_customer_estimate(estimate)
+                remember_change_history_warning(
+                    record_change_history_safely(
+                        "顧客",
+                        customer_key or "",
+                        customer_name,
+                        "削除",
+                        estimate_history_changes(estimate, {}),
+                        section="提案・見積り",
+                    )
+                )
+                st.session_state.pop(add_key, None)
+                st.session_state.pop(edit_key, None)
+                st.session_state.pop(delete_key, None)
+                st.session_state[success_key] = "見積りを削除しました。"
+                st.session_state[GLOBAL_DELETE_SCROLL_RESTORE_KEY] = True
+                st.rerun()
+            except Exception as exc:
+                st.error(f"見積りを削除できませんでした：{exc}")
+
+    with cancel_col:
+        if st.button(
+            "キャンセル",
+            key=f"estimate_delete_dialog_no_{estimate_id}",
+            use_container_width=True,
+        ):
+            st.session_state[keep_open_key] = True
+            st.session_state[GLOBAL_DELETE_SCROLL_RESTORE_KEY] = True
+            st.rerun()
+
+
 def estimate_price_label(item):
     price = clean_value(item.get("unit_price"), blank_text="").strip()
     return price or "未入力"
@@ -5883,6 +6052,7 @@ def render_customer_estimates_section(customer_name, customer_key=None):
     edit_key = f"estimate_edit_{state_suffix}"
     delete_key = f"estimate_delete_{state_suffix}"
     success_key = f"estimate_success_{state_suffix}"
+    keep_open_key = f"estimate_keep_open_{state_suffix}"
 
     try:
         estimates = get_customer_estimates(customer_name, customer_key)
@@ -5893,11 +6063,12 @@ def render_customer_estimates_section(customer_name, customer_key=None):
         load_error = ""
 
     success_message = st.session_state.pop(success_key, None)
+    keep_open = bool(st.session_state.pop(keep_open_key, False))
     expanded = bool(
         success_message
+        or keep_open
         or st.session_state.get(add_key)
         or st.session_state.get(edit_key)
-        or st.session_state.get(delete_key)
     )
 
     with st.expander(f"📄 提案・見積り　{len(estimates)}件", expanded=expanded):
@@ -5986,7 +6157,6 @@ def render_customer_estimates_section(customer_name, customer_key=None):
             return
 
         active_edit_id = st.session_state.get(edit_key)
-        active_delete_id = st.session_state.get(delete_key)
 
         for estimate in estimates:
             estimate_id = estimate["id"]
@@ -6093,49 +6263,24 @@ def render_customer_estimates_section(customer_name, customer_key=None):
                         st.session_state.pop(delete_key, None)
                         st.rerun()
                 with delete_col:
-                    if active_delete_id == estimate_id:
-                        st.warning("この見積りを削除しますか？")
-                        confirm_col, cancel_col = st.columns(2)
-                        with confirm_col:
-                            if st.button(
-                                "削除する",
-                                key=f"estimate_delete_confirm_{estimate_id}",
-                                use_container_width=True,
-                            ):
-                                try:
-                                    delete_customer_estimate(estimate)
-                                    remember_change_history_warning(
-                                        record_change_history_safely(
-                                            "顧客",
-                                            customer_key or "",
-                                            customer_name,
-                                            "削除",
-                                            estimate_history_changes(estimate, {}),
-                                            section="提案・見積り",
-                                        )
-                                    )
-                                    st.session_state.pop(delete_key, None)
-                                    st.session_state[success_key] = "見積りを削除しました。"
-                                    st.rerun()
-                                except Exception as exc:
-                                    st.error(f"見積りを削除できませんでした：{exc}")
-                        with cancel_col:
-                            if st.button(
-                                "キャンセル",
-                                key=f"estimate_delete_cancel_{estimate_id}",
-                                use_container_width=True,
-                            ):
-                                st.session_state.pop(delete_key, None)
-                                st.rerun()
-                    elif st.button(
+                    if st.button(
                         "削除",
                         key=f"estimate_delete_button_{estimate_id}",
                         use_container_width=True,
                     ):
-                        st.session_state[delete_key] = estimate_id
                         st.session_state.pop(add_key, None)
                         st.session_state.pop(edit_key, None)
-                        st.rerun()
+                        st.session_state.pop(delete_key, None)
+                        confirm_customer_estimate_delete_dialog(
+                            estimate,
+                            customer_name,
+                            customer_key,
+                            success_key,
+                            keep_open_key,
+                            add_key,
+                            edit_key,
+                            delete_key,
+                        )
 
 
 def estimate_rows_to_dataframe(rows):
@@ -6550,6 +6695,62 @@ def delete_carrier_freight(item):
     clear_carrier_freight_cache()
 
 
+@st.dialog("運賃記録を削除")
+def confirm_carrier_freight_delete_dialog(
+    freight,
+    carrier_id,
+    company_name,
+    success_key,
+    keep_open_key,
+    edit_key,
+    delete_key,
+):
+    """画面位置を保ったまま、運賃記録の削除を確認して実行する。"""
+    freight_id = clean_value(freight.get("id"), blank_text="")
+    pickup = clean_value(freight.get("pickup_location"), blank_text="未設定")
+    destination = clean_value(freight.get("delivery_destination"), blank_text="未設定")
+    st.warning(f"「{pickup} → {destination}」の運賃記録を削除します。")
+    st.caption("この操作は元に戻せません。")
+    delete_col, cancel_col = st.columns(2)
+
+    with delete_col:
+        if st.button(
+            "削除する",
+            key=f"carrier_freight_delete_dialog_yes_{freight_id}",
+            type="primary",
+            use_container_width=True,
+        ):
+            try:
+                delete_carrier_freight(freight)
+                remember_change_history_warning(
+                    record_change_history_safely(
+                        "運送会社",
+                        carrier_id,
+                        company_name,
+                        "削除",
+                        carrier_freight_history_changes(freight, {}),
+                        section="運賃",
+                    )
+                )
+                st.session_state.pop(edit_key, None)
+                st.session_state.pop(delete_key, None)
+                st.session_state[success_key] = "運賃を削除しました。"
+                st.session_state[GLOBAL_DELETE_SCROLL_RESTORE_KEY] = True
+                st.rerun()
+            except Exception as exc:
+                st.error(f"運賃を削除できませんでした：{exc}")
+
+    with cancel_col:
+        if st.button(
+            "キャンセル",
+            key=f"carrier_freight_delete_dialog_no_{freight_id}",
+            use_container_width=True,
+        ):
+            st.session_state[keep_open_key] = True
+            st.session_state[GLOBAL_DELETE_SCROLL_RESTORE_KEY] = True
+            st.rerun()
+
+
 def carrier_freight_decimal_display(value, maximum_decimals=2):
     text = clean_value(value, blank_text="").strip()
     if not text:
@@ -6691,6 +6892,7 @@ def render_carrier_freight_section(carrier_id, company_name):
     edit_key = f"carrier_freight_edit_{state_suffix}"
     delete_key = f"carrier_freight_delete_{state_suffix}"
     success_key = f"carrier_freight_success_{state_suffix}"
+    keep_open_key = f"carrier_freight_keep_open_{state_suffix}"
 
     try:
         freights = get_carrier_freights(carrier_id)
@@ -6701,11 +6903,12 @@ def render_carrier_freight_section(carrier_id, company_name):
         load_error = ""
 
     success_message = st.session_state.pop(success_key, None)
+    keep_open = bool(st.session_state.pop(keep_open_key, False))
     expanded = bool(
         success_message
+        or keep_open
         or st.session_state.get(add_key)
         or st.session_state.get(edit_key)
-        or st.session_state.get(delete_key)
     )
 
     st.markdown("---")
@@ -6772,7 +6975,6 @@ def render_carrier_freight_section(carrier_id, company_name):
 
         st.markdown("#### 運賃履歴")
         active_edit_id = st.session_state.get(edit_key)
-        active_delete_id = st.session_state.get(delete_key)
 
         for freight in freights:
             freight_id = freight["id"]
@@ -6826,45 +7028,22 @@ def render_carrier_freight_section(carrier_id, company_name):
                         st.session_state.pop(delete_key, None)
                         st.rerun()
                 with delete_col:
-                    if active_delete_id == freight_id:
-                        st.warning("この運賃記録を削除しますか？")
-                        if st.button(
-                            "削除する",
-                            key=f"carrier_freight_delete_confirm_{freight_id}",
-                            use_container_width=True,
-                        ):
-                            try:
-                                delete_carrier_freight(freight)
-                                remember_change_history_warning(
-                                    record_change_history_safely(
-                                        "運送会社",
-                                        carrier_id,
-                                        company_name,
-                                        "削除",
-                                        carrier_freight_history_changes(freight, {}),
-                                        section="運賃",
-                                    )
-                                )
-                                st.session_state.pop(delete_key, None)
-                                st.session_state[success_key] = "運賃を削除しました。"
-                                st.rerun()
-                            except Exception as exc:
-                                st.error(f"運賃を削除できませんでした：{exc}")
-                        if st.button(
-                            "キャンセル",
-                            key=f"carrier_freight_delete_cancel_{freight_id}",
-                            use_container_width=True,
-                        ):
-                            st.session_state.pop(delete_key, None)
-                            st.rerun()
-                    elif st.button(
+                    if st.button(
                         "削除",
                         key=f"carrier_freight_delete_button_{freight_id}",
                         use_container_width=True,
                     ):
-                        st.session_state[delete_key] = freight_id
                         st.session_state.pop(edit_key, None)
-                        st.rerun()
+                        st.session_state.pop(delete_key, None)
+                        confirm_carrier_freight_delete_dialog(
+                            freight,
+                            carrier_id,
+                            company_name,
+                            success_key,
+                            keep_open_key,
+                            edit_key,
+                            delete_key,
+                        )
 
 
 def carrier_freight_numeric_value(item, field_name):
@@ -7071,6 +7250,60 @@ def carrier_freight_rows_to_dataframe(rows):
     )
 
 
+@st.dialog("顧客情報を削除")
+def confirm_customer_information_delete_dialog(
+    item,
+    customer_name,
+    customer_key,
+    success_key,
+    editing_item_key,
+    deleting_item_key,
+):
+    """画面位置を保ったまま、顧客情報項目の削除を確認して実行する。"""
+    item_id = clean_value(item.get("id"), blank_text="")
+    field_name = clean_value(item.get("field_name"), blank_text="項目名未設定")
+    content = clean_value(item.get("content"), blank_text="")
+    st.warning(f"「{field_name}」を削除します。")
+    st.caption("この操作は元に戻せません。")
+    delete_col, cancel_col = st.columns(2)
+
+    with delete_col:
+        if st.button(
+            "削除する",
+            key=f"customer_information_delete_dialog_yes_{item_id}",
+            type="primary",
+            use_container_width=True,
+        ):
+            try:
+                delete_customer_information(item_id)
+                remember_change_history_warning(
+                    record_change_history_safely(
+                        "顧客",
+                        customer_key or "",
+                        customer_name,
+                        "削除",
+                        {field_name: (content, "")},
+                        section="顧客情報",
+                    )
+                )
+                st.session_state.pop(editing_item_key, None)
+                st.session_state.pop(deleting_item_key, None)
+                st.session_state[success_key] = "項目を削除しました。"
+                st.session_state[GLOBAL_DELETE_SCROLL_RESTORE_KEY] = True
+                st.rerun()
+            except RuntimeError as exc:
+                st.error(str(exc))
+
+    with cancel_col:
+        if st.button(
+            "キャンセル",
+            key=f"customer_information_delete_dialog_no_{item_id}",
+            use_container_width=True,
+        ):
+            st.session_state[GLOBAL_DELETE_SCROLL_RESTORE_KEY] = True
+            st.rerun()
+
+
 def render_customer_information_form(customer_name, customer_key, items, state_suffix):
     add_key = f"customer_information_add_{state_suffix}"
     if not st.session_state.get(add_key):
@@ -7181,7 +7414,6 @@ def render_customer_information_card(customer_name, customer_key=None):
 
         edit_mode = bool(st.session_state.get(edit_mode_key))
         active_edit_id = st.session_state.get(editing_item_key)
-        active_delete_id = st.session_state.get(deleting_item_key)
 
         for index, item in enumerate(items):
             item_id = str(item.get("id", ""))
@@ -7237,42 +7469,6 @@ def render_customer_information_card(customer_name, customer_key=None):
                             st.rerun()
                         except RuntimeError as exc:
                             st.error(str(exc))
-                continue
-
-            if edit_mode and active_delete_id == item_id:
-                st.warning(f"「{field_name}」を削除しますか？")
-                delete_col, cancel_col = st.columns(2)
-                with delete_col:
-                    if st.button(
-                        "削除する",
-                        key=f"customer_information_delete_confirm_{item_id}",
-                        use_container_width=True,
-                    ):
-                        try:
-                            delete_customer_information(item_id)
-                            remember_change_history_warning(
-                                record_change_history_safely(
-                                    "顧客",
-                                    customer_key or "",
-                                    customer_name,
-                                    "削除",
-                                    {field_name: (content, "")},
-                                    section="顧客情報",
-                                )
-                            )
-                            st.session_state.pop(deleting_item_key, None)
-                            st.session_state[success_key] = "項目を削除しました。"
-                            st.rerun()
-                        except RuntimeError as exc:
-                            st.error(str(exc))
-                with cancel_col:
-                    if st.button(
-                        "キャンセル",
-                        key=f"customer_information_delete_cancel_{item_id}",
-                        use_container_width=True,
-                    ):
-                        st.session_state.pop(deleting_item_key, None)
-                        st.rerun()
                 continue
 
             if edit_mode:
@@ -7348,9 +7544,16 @@ def render_customer_information_card(customer_name, customer_key=None):
                         st.rerun()
                 with delete_col:
                     if st.button("削除", key=f"customer_information_delete_{item_id}"):
-                        st.session_state[deleting_item_key] = item_id
                         st.session_state.pop(editing_item_key, None)
-                        st.rerun()
+                        st.session_state.pop(deleting_item_key, None)
+                        confirm_customer_information_delete_dialog(
+                            item,
+                            customer_name,
+                            customer_key,
+                            success_key,
+                            editing_item_key,
+                            deleting_item_key,
+                        )
             else:
                 safe_name = html.escape(field_name)
                 safe_content = html.escape(content).replace("\n", "<br>")
@@ -14158,6 +14361,7 @@ def render_trade_partner_related_section(
 def show_trade_partner_notes(partner_type, partner_id, company_name):
     st.markdown("---")
     st.subheader(f"📝 この{trade_partner_type_label(partner_type)}のメモ")
+    show_note_delete_success_message()
     note_key = make_trade_partner_note_key(partner_type, partner_id, company_name)
     input_key = f"trade_partner_note_{partner_type}_{partner_id}"
     clear_key = f"clear_{input_key}"
@@ -14331,6 +14535,7 @@ def render_trade_note_card(note, category, partner_names=None):
 def show_trade_notes_page():
     show_top_home_link()
     st.header("📝 取引先メモ")
+    show_note_delete_success_message()
     notes = load_notes_from_supabase()
     try:
         partner_data = load_trade_partner_data()
@@ -15185,6 +15390,10 @@ history_warning = st.session_state.pop("change_history_warning", None)
 if history_warning:
     st.warning(history_warning)
 
+global_delete_restore_requested = bool(
+    st.session_state.pop(GLOBAL_DELETE_SCROLL_RESTORE_KEY, False)
+)
+
 # 各機能ページから、区分メニューを経由せずトップへ直接戻れるようにする。
 # 顧客・仕入先・運送会社の各ホームと取引先メモは、従来から同じリンクを
 # 表示しているため、二重表示にならないようここでは除外する。
@@ -15297,6 +15506,8 @@ except Exception as e:
     st.write("原因確認のため、エラー内容を表示しています。")
     st.exception(e)
     st.stop()
+
+render_global_delete_scroll_keeper(restore=global_delete_restore_requested)
 
 st.caption(
     "※ 顧客情報は配車予定 次郎.xlsm、仕入先・運送会社は取引先カルテ.xlsxを読み込んで表示しています。"
