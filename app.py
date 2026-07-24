@@ -24,6 +24,7 @@ from xml.etree import ElementTree as ET
 import pandas as pd
 import requests
 import streamlit as st
+import streamlit.components.v1 as components
 from openpyxl import load_workbook
 from openpyxl.styles import PatternFill
 
@@ -686,6 +687,31 @@ def download_onedrive_file(access_token, item_id):
         expected=(200,),
     )
     return response.content
+
+
+def render_onedrive_pdf_inline(pdf_content, filename):
+    """OneDriveへ移動せず、現在の顧客カルテ内にPDFを表示する。"""
+    encoded = base64.b64encode(bytes(pdf_content or b"")).decode("ascii")
+    safe_filename = html.escape(str(filename or "PDF"))
+    components.html(
+        f"""
+        <div style="width:100%; margin:0; padding:0;">
+          <object
+            data="data:application/pdf;base64,{encoded}"
+            type="application/pdf"
+            width="100%"
+            height="720"
+            aria-label="{safe_filename}"
+          >
+            <div style="padding:16px; font-family:sans-serif; line-height:1.6;">
+              この端末ではPDFを画面内に表示できません。下の保存ボタンから確認してください。
+            </div>
+          </object>
+        </div>
+        """,
+        height=740,
+        scrolling=True,
+    )
 
 
 def download_onedrive_thumbnail(access_token, item_id):
@@ -3625,6 +3651,8 @@ def render_customer_attachments_section(customer_name, customer_key=None):
     edit_key = f"onedrive_attachment_edit_{suffix}"
     delete_key = f"onedrive_attachment_delete_{suffix}"
     limit_key = f"onedrive_attachment_limit_{suffix}"
+    preview_key = f"onedrive_attachment_preview_{suffix}"
+    preview_data_key = f"onedrive_attachment_preview_data_{suffix}"
 
     if not has_supabase_config():
         with st.expander("📎 写真・資料"):
@@ -3806,6 +3834,7 @@ def render_customer_attachments_section(customer_name, customer_key=None):
         limit = int(st.session_state.get(limit_key, ONEDRIVE_PAGE_SIZE))
         active_edit_id = st.session_state.get(edit_key)
         active_delete_id = st.session_state.get(delete_key)
+        active_preview_id = st.session_state.get(preview_key)
 
         if not filtered:
             st.info("条件に一致する写真・資料はありません。")
@@ -3837,12 +3866,64 @@ def render_customer_attachments_section(customer_name, customer_key=None):
                     st.markdown(" ".join(f"`#{tag}`" for tag in attachment["tags"]))
                 if attachment.get("remarks"):
                     st.write(attachment["remarks"])
-                if attachment.get("web_url"):
-                    st.link_button(
-                        "OneDriveで開く",
-                        attachment["web_url"],
-                        use_container_width=True,
-                    )
+                preview_label = (
+                    "画像を閉じる"
+                    if attachment.get("file_type") == "image" and active_preview_id == metadata_id
+                    else "画像を大きく表示"
+                    if attachment.get("file_type") == "image"
+                    else "PDFを閉じる"
+                    if active_preview_id == metadata_id
+                    else "PDFを表示"
+                )
+                if st.button(
+                    preview_label,
+                    key=f"onedrive_attachment_preview_button_{metadata_id}",
+                    use_container_width=True,
+                ):
+                    if active_preview_id == metadata_id:
+                        st.session_state.pop(preview_key, None)
+                        st.session_state.pop(preview_data_key, None)
+                    else:
+                        st.session_state[preview_key] = metadata_id
+                        st.session_state.pop(preview_data_key, None)
+                    st.rerun()
+
+                if active_preview_id == metadata_id:
+                    if not access_token or not item_id:
+                        st.error("表示するにはOneDriveへ接続してください。")
+                    else:
+                        preview_data = st.session_state.get(preview_data_key)
+                        if not (
+                            isinstance(preview_data, dict)
+                            and preview_data.get("metadata_id") == metadata_id
+                            and isinstance(preview_data.get("content"), bytes)
+                        ):
+                            try:
+                                with st.spinner("ファイルを読み込んでいます…"):
+                                    content = download_onedrive_file(access_token, item_id)
+                                preview_data = {
+                                    "metadata_id": metadata_id,
+                                    "content": content,
+                                }
+                                st.session_state[preview_data_key] = preview_data
+                            except Exception as exc:
+                                preview_data = None
+                                st.error(f"表示できませんでした：{exc}")
+
+                        if isinstance(preview_data, dict):
+                            content = preview_data.get("content", b"")
+                            if attachment.get("file_type") == "image":
+                                st.image(content, caption=filename, use_column_width=True)
+                            else:
+                                render_onedrive_pdf_inline(content, filename)
+                                st.download_button(
+                                    "PDFを端末に保存",
+                                    data=content,
+                                    file_name=filename,
+                                    mime=attachment.get("mime_type") or "application/pdf",
+                                    use_container_width=True,
+                                    key=f"onedrive_attachment_pdf_download_{metadata_id}",
+                                )
 
                 if active_edit_id == metadata_id:
                     current_fixed = [tag for tag in attachment.get("tags", []) if tag in ONEDRIVE_FIXED_TAGS]
@@ -3940,6 +4021,9 @@ def render_customer_attachments_section(customer_name, customer_key=None):
                                     )
                                     st.session_state.pop(delete_key, None)
                                     st.session_state.pop(f"onedrive_thumbnail_{item_id}", None)
+                                    if st.session_state.get(preview_key) == metadata_id:
+                                        st.session_state.pop(preview_key, None)
+                                        st.session_state.pop(preview_data_key, None)
                                     st.session_state[success_key] = "写真・資料を削除しました。"
                                     st.rerun()
                                 except Exception as exc:
