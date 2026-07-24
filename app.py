@@ -287,6 +287,18 @@ ONEDRIVE_PDF_EXTENSIONS = {".pdf"}
 ONEDRIVE_PAGE_SIZE = 12
 
 
+def is_mobile_browser():
+    """現在のアクセスがスマホ・タブレット系ブラウザーかを判定する。"""
+    try:
+        user_agent = str(st.context.headers.get("User-Agent", "")).lower()
+    except Exception:
+        user_agent = ""
+    return any(
+        marker in user_agent
+        for marker in ("android", "iphone", "ipad", "ipod", "mobile")
+    )
+
+
 def read_onedrive_settings():
     """Streamlit SecretsからOneDrive接続設定を読む。"""
     try:
@@ -3742,20 +3754,24 @@ def render_customer_attachments_section(customer_name, customer_key=None):
                 st.error(f"OneDriveへの接続を開始できませんでした：{exc}")
         else:
             st.markdown("#### 追加")
-            camera_file = None
-            selected_file = None
-            with st.popover("📷 写真を撮る", use_container_width=True):
-                camera_file = st.camera_input(
-                    "カメラで撮影",
-                    key=f"onedrive_attachment_camera_{suffix}",
-                )
-            with st.popover("🖼 画像・PDFを選ぶ", use_container_width=True):
-                selected_file = st.file_uploader(
-                    "画像またはPDFを1つ選択",
-                    type=["jpg", "jpeg", "png", "webp", "pdf"],
-                    accept_multiple_files=False,
-                    key=f"onedrive_attachment_uploader_{suffix}",
-                )
+            mobile_browser = is_mobile_browser()
+            photo_file = st.file_uploader(
+                "📷 写真を撮る／画像を選ぶ" if mobile_browser else "🖼 画像を選ぶ",
+                type=["jpg", "jpeg", "png", "webp"],
+                accept_multiple_files=False,
+                key=f"onedrive_attachment_photo_uploader_{suffix}",
+                help=(
+                    "端末の標準画面からカメラ撮影または保存済み画像を選べます。"
+                    if mobile_browser
+                    else None
+                ),
+            )
+            pdf_file = st.file_uploader(
+                "📄 PDFを選ぶ",
+                type=["pdf"],
+                accept_multiple_files=False,
+                key=f"onedrive_attachment_pdf_uploader_{suffix}",
+            )
 
             fixed_tags = st.multiselect(
                 "固定タグ",
@@ -3779,9 +3795,9 @@ def render_customer_attachments_section(customer_name, customer_key=None):
                 use_container_width=True,
                 key=f"onedrive_attachment_upload_{suffix}",
             ):
-                uploaded = camera_file if camera_file is not None else selected_file
+                uploaded = photo_file if photo_file is not None else pdf_file
                 if uploaded is None:
-                    st.warning("写真を撮るか、画像・PDFを選んでください。")
+                    st.warning("写真・画像またはPDFを選んでください。")
                 else:
                     try:
                         tags = list(fixed_tags) + normalize_attachment_tags(free_tags)
