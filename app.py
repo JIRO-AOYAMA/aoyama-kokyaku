@@ -882,15 +882,22 @@ def render_clickable_onedrive_thumbnail(thumbnail_content, filename, trigger_lab
           const triggerLabel = {json.dumps(safe_trigger_label)};
           const tile = document.getElementById({json.dumps(tile_id)});
           const parentDocument = window.parent.document;
+          const normalizeText = (value) => String(value || '').replace(/\\s+/g, '');
           const findTrigger = () => Array.from(parentDocument.querySelectorAll('button')).find(
-            (button) => (button.textContent || '').trim() === triggerLabel
+            (button) => normalizeText(button.textContent).includes(normalizeText(triggerLabel))
           );
           const hideTrigger = () => {{
             const trigger = findTrigger();
             if (!trigger) return null;
             const wrapper = trigger.closest('[data-testid="stButton"]');
-            if (wrapper) wrapper.style.display = 'none';
-            else trigger.style.display = 'none';
+            if (wrapper) {{
+              wrapper.style.setProperty('display', 'none', 'important');
+              wrapper.style.setProperty('height', '0', 'important');
+              wrapper.style.setProperty('margin', '0', 'important');
+              wrapper.style.setProperty('padding', '0', 'important');
+            }} else {{
+              trigger.style.setProperty('display', 'none', 'important');
+            }}
             return trigger;
           }};
           const activate = () => {{
@@ -898,8 +905,13 @@ def render_clickable_onedrive_thumbnail(thumbnail_content, filename, trigger_lab
             if (trigger) trigger.click();
           }};
           hideTrigger();
+          window.setTimeout(hideTrigger, 0);
           window.setTimeout(hideTrigger, 40);
           window.setTimeout(hideTrigger, 160);
+          window.setTimeout(hideTrigger, 500);
+          const triggerObserver = new MutationObserver(hideTrigger);
+          triggerObserver.observe(parentDocument.body, {{childList:true, subtree:true}});
+          window.setTimeout(() => triggerObserver.disconnect(), 3000);
           tile.addEventListener('click', activate);
           tile.addEventListener('keydown', (event) => {{
             if (event.key === 'Enter' || event.key === ' ') {{
@@ -995,15 +1007,22 @@ def render_clickable_onedrive_pdf_tile(filename, trigger_label, compact_height=1
           const tile = document.getElementById({json.dumps(tile_id)});
           tile.querySelector('.od-pdf-name').textContent = {json.dumps(safe_filename)};
           const parentDocument = window.parent.document;
+          const normalizeText = (value) => String(value || '').replace(/\\s+/g, '');
           const findTrigger = () => Array.from(parentDocument.querySelectorAll('button')).find(
-            (button) => (button.textContent || '').trim() === triggerLabel
+            (button) => normalizeText(button.textContent).includes(normalizeText(triggerLabel))
           );
           const hideTrigger = () => {{
             const trigger = findTrigger();
             if (!trigger) return null;
             const wrapper = trigger.closest('[data-testid="stButton"]');
-            if (wrapper) wrapper.style.display = 'none';
-            else trigger.style.display = 'none';
+            if (wrapper) {{
+              wrapper.style.setProperty('display', 'none', 'important');
+              wrapper.style.setProperty('height', '0', 'important');
+              wrapper.style.setProperty('margin', '0', 'important');
+              wrapper.style.setProperty('padding', '0', 'important');
+            }} else {{
+              trigger.style.setProperty('display', 'none', 'important');
+            }}
             return trigger;
           }};
           const activate = () => {{
@@ -1011,8 +1030,13 @@ def render_clickable_onedrive_pdf_tile(filename, trigger_label, compact_height=1
             if (trigger) trigger.click();
           }};
           hideTrigger();
+          window.setTimeout(hideTrigger, 0);
           window.setTimeout(hideTrigger, 40);
           window.setTimeout(hideTrigger, 160);
+          window.setTimeout(hideTrigger, 500);
+          const triggerObserver = new MutationObserver(hideTrigger);
+          triggerObserver.observe(parentDocument.body, {{childList:true, subtree:true}});
+          window.setTimeout(() => triggerObserver.disconnect(), 3000);
           tile.addEventListener('click', activate);
           tile.addEventListener('keydown', (event) => {{
             if (event.key === 'Enter' || event.key === ' ') {{
@@ -4646,16 +4670,11 @@ def render_customer_attachments_section(customer_name, customer_key=None):
                             except Exception as exc:
                                 st.error(f"表示できませんでした：{exc}")
 
-                    icon = "🖼" if attachment.get("file_type") == "image" else "📄"
-                    short_filename = filename if len(filename) <= 24 else filename[:21] + "…"
-                    st.markdown(
-                        f"**{icon} {html.escape(short_filename)}**",
-                        unsafe_allow_html=True,
-                    )
-                    st.caption(
-                        f"{format_attachment_size(attachment.get('size'))}　"
-                        f"{format_attachment_datetime(attachment.get('created_at'))}"
-                    )
+                    attachment_date = format_attachment_datetime(
+                        attachment.get("created_at")
+                    ).split(" ", 1)[0]
+                    if attachment_date:
+                        st.caption(attachment_date)
                     if attachment.get("tags"):
                         st.markdown(" ".join(f"`#{tag}`" for tag in attachment["tags"]))
                     if attachment.get("remarks"):
