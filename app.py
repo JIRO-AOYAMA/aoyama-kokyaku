@@ -4567,9 +4567,16 @@ def render_customer_attachments_section(customer_name, customer_key=None):
 
         access_token = get_onedrive_access_token()
         tag_history_options = get_attachment_tag_history_options(attachments)
-        album_tab, add_tab = st.tabs(["🖼 アルバム", "➕ 追加"])
+        mobile_browser = is_mobile_browser()
+        if mobile_browser:
+            album_tab, add_tab, camera_tab = st.tabs(
+                ["🖼 アルバム", "➕ 追加", "📷 写真撮影"]
+            )
+        else:
+            album_tab, add_tab = st.tabs(["🖼 アルバム", "➕ 追加"])
+            camera_tab = None
 
-        # 追加処理は従来どおり。タブの初期表示は先頭のアルバム。
+        # 追加タブは保存済み画像とPDF専用。タブの初期表示は先頭のアルバム。
         with add_tab:
             if not access_token:
                 if configured_refresh_token:
@@ -4592,26 +4599,13 @@ def render_customer_attachments_section(customer_name, customer_key=None):
                     st.error(f"OneDriveへの接続を開始できませんでした：{exc}")
             else:
                 st.markdown("#### 追加")
-                mobile_browser = is_mobile_browser()
-                camera_file = None
-                if mobile_browser:
-                    camera_label = "📷 写真を撮る"
-                    camera_file = st.file_uploader(
-                        camera_label,
-                        type=["jpg", "jpeg", "png", "webp"],
-                        accept_multiple_files=False,
-                        key=f"onedrive_attachment_camera_uploader_{suffix}",
-                        help="スマホの背面カメラを起動して撮影します。",
-                    )
-                    enable_mobile_camera_capture(camera_label)
-
                 selected_image_file = st.file_uploader(
                     "🖼 保存済み画像を選ぶ" if mobile_browser else "🖼 画像を選ぶ",
                     type=["jpg", "jpeg", "png", "webp"],
                     accept_multiple_files=False,
                     key=f"onedrive_attachment_photo_uploader_{suffix}",
                 )
-                photo_file = camera_file if camera_file is not None else selected_image_file
+                photo_file = selected_image_file
                 pdf_file = st.file_uploader(
                     "📄 PDFを選ぶ",
                     type=["pdf"],
@@ -4648,7 +4642,7 @@ def render_customer_attachments_section(customer_name, customer_key=None):
                 ):
                     uploaded = photo_file if photo_file is not None else pdf_file
                     if uploaded is None:
-                        st.warning("写真・画像またはPDFを選んでください。")
+                        st.warning("画像またはPDFを選んでください。")
                     else:
                         try:
                             tags = list(selected_history_tags) + normalize_attachment_tags(new_tags_text)
@@ -4693,6 +4687,94 @@ def render_customer_attachments_section(customer_name, customer_key=None):
                     clear_onedrive_auth_state(clear_shared=True)
                     st.session_state.pop("onedrive_refresh_token_setup_value", None)
                     st.rerun()
+
+        # スマホだけ、写真撮影を追加タブから分離する。
+        if camera_tab is not None:
+            with camera_tab:
+                if not access_token:
+                    st.info("先に「＋追加」タブでOneDriveへ接続してください。")
+                else:
+                    st.markdown("#### 写真撮影")
+                    camera_label = "📷 写真を撮る"
+                    camera_file = st.file_uploader(
+                        camera_label,
+                        type=["jpg", "jpeg", "png", "webp"],
+                        accept_multiple_files=False,
+                        key=f"onedrive_attachment_camera_uploader_{suffix}",
+                        help="スマホの背面カメラを起動して撮影します。",
+                    )
+                    enable_mobile_camera_capture(camera_label)
+
+                    camera_history_tags = st.multiselect(
+                        "タグ（入力すると過去の候補を絞り込み）",
+                        tag_history_options,
+                        key=f"onedrive_attachment_camera_history_tags_{suffix}",
+                    )
+                    camera_new_tags_text = st.text_input(
+                        "新しいタグ（候補にない場合）",
+                        placeholder="例：北海道、タンク、要確認",
+                        key=f"onedrive_attachment_camera_new_tags_{suffix}",
+                    )
+                    if tag_history_options:
+                        st.caption(
+                            "最近使ったタグ："
+                            + "　".join(f"#{tag}" for tag in tag_history_options[:8])
+                        )
+                    camera_remarks = st.text_area(
+                        "備考",
+                        placeholder="写真について残したい内容",
+                        height=90,
+                        key=f"onedrive_attachment_camera_remarks_{suffix}",
+                    )
+                    if st.button(
+                        "OneDriveへ保存",
+                        type="primary",
+                        use_container_width=True,
+                        key=f"onedrive_attachment_camera_upload_{suffix}",
+                    ):
+                        if camera_file is None:
+                            st.warning("写真を撮ってください。")
+                        else:
+                            try:
+                                tags = list(camera_history_tags) + normalize_attachment_tags(
+                                    camera_new_tags_text
+                                )
+                                with st.spinner("OneDriveへ保存しています…"):
+                                    saved = save_customer_onedrive_attachment(
+                                        customer_name,
+                                        customer_key,
+                                        camera_file.name,
+                                        camera_file.getvalue(),
+                                        camera_file.type
+                                        or mimetypes.guess_type(camera_file.name)[0]
+                                        or "application/octet-stream",
+                                        tags,
+                                        camera_remarks,
+                                        access_token,
+                                    )
+                                remember_change_history_warning(
+                                    record_change_history_safely(
+                                        "顧客",
+                                        customer_key or "",
+                                        customer_name,
+                                        "追加",
+                                        {
+                                            "ファイル": ("", saved.get("original_name", "")),
+                                            "タグ": (
+                                                "",
+                                                " ".join(
+                                                    f"#{tag}" for tag in saved.get("tags", [])
+                                                ),
+                                            ),
+                                        },
+                                        section="写真・資料",
+                                    )
+                                )
+                                st.session_state[success_key] = "写真・資料を保存しました。"
+                                st.session_state[limit_key] = ONEDRIVE_PAGE_SIZE
+                                st.rerun()
+                            except Exception as exc:
+                                st.error(f"保存できませんでした：{exc}")
 
         with album_tab:
             st.markdown("#### アルバム")
