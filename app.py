@@ -9886,16 +9886,7 @@ def show_trade_partner_directory(partner_type):
         st.info(f"登録されている{label}はありません。")
         return
     st.caption(f"{len(rows)}件")
-    if partner_type == "supplier":
-        render_trade_partner_directory_cards(rows, partner_type)
-        return
-    for row in rows:
-        company = trade_partner_text(row.get("会社名"))
-        region = trade_partner_text(row.get("地域"))
-        with st.container(border=True):
-            st.markdown(trade_partner_detail_link(row, partner_type), unsafe_allow_html=True)
-            if region:
-                st.write(f"地域：{region}")
+    render_trade_partner_directory_cards(rows, partner_type)
 
 
 def show_trade_partner_search(partner_type):
@@ -9931,15 +9922,7 @@ def show_trade_partner_search(partner_type):
         st.warning("一致する会社が見つかりません。")
         return
     st.caption(f"{len(matches)}件")
-    if partner_type == "supplier":
-        render_trade_partner_directory_cards(matches, partner_type)
-        return
-    for row in matches:
-        with st.container(border=True):
-            st.markdown(trade_partner_detail_link(row, partner_type), unsafe_allow_html=True)
-            region = trade_partner_text(row.get("地域"))
-            if region:
-                st.write(f"地域：{region}")
+    render_trade_partner_directory_cards(matches, partner_type)
 
 
 def show_supplier_product_search():
