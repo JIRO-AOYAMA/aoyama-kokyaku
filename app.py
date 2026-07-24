@@ -13,6 +13,7 @@ import unicodedata
 import uuid
 import zipfile
 from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from io import BytesIO
 from pathlib import Path
 from xml.etree import ElementTree as ET
@@ -150,6 +151,8 @@ VOICE_INPUT_HELP = "スマホではキーボードのマイクを押して音声
 PAST_PRODUCT_NOTE_PREFIX = "__past_product_note__:"
 ESTIMATE_PREFIX = "__estimate__:"
 ESTIMATE_VERSION = 1
+CARRIER_FREIGHT_PREFIX = "__carrier_freight__:"
+CARRIER_FREIGHT_VERSION = 1
 CHANGE_HISTORY_CUSTOMER = "__CHANGE_HISTORY__"
 CHANGE_HISTORY_VERSION = 1
 CHANGE_HISTORY_PAGE_SIZE = 30
@@ -3740,6 +3743,853 @@ def show_estimates_page():
                 st.write(estimate["remarks"])
 
 
+# =========================
+# 運送会社の運賃登録・比較（Supabase保存）
+# =========================
+def make_carrier_freight_field_name():
+    """顧客情報テーブル内で、運送会社の運賃を通常項目と分ける内部項目名を作る。"""
+    return f"{CARRIER_FREIGHT_PREFIX}{uuid.uuid4()}"
+
+
+def carrier_freight_storage_key(carrier_id):
+    return f"carrier_freight:{clean_value(carrier_id, blank_text='').strip()}"
+
+
+def is_carrier_freight_item(item):
+    """顧客情報テーブル上の運送会社運賃専用レコードか判定する。"""
+    return clean_value(item.get("field_name"), blank_text="").startswith(CARRIER_FREIGHT_PREFIX)
+
+
+def carrier_freight_date_text(value):
+    """運賃の適用日をYYYY-MM-DDへそろえる。"""
+    if isinstance(value, datetime):
+        return value.date().isoformat()
+    if isinstance(value, date):
+        return value.isoformat()
+    text = clean_value(value, blank_text="").strip()
+    match = re.match(r"^(\d{4})[-/](\d{1,2})[-/](\d{1,2})", text)
+    if not match:
+        return text
+    year, month, day = (int(part) for part in match.groups())
+    try:
+        return date(year, month, day).isoformat()
+    except ValueError:
+        return text
+
+
+def carrier_freight_date_input_value(value):
+    text = carrier_freight_date_text(value)
+    try:
+        return date.fromisoformat(text)
+    except (TypeError, ValueError):
+        return get_jst_now().date()
+
+
+def format_carrier_freight_date(value):
+    text = carrier_freight_date_text(value)
+    try:
+        return date.fromisoformat(text).strftime("%Y/%m/%d")
+    except (TypeError, ValueError):
+        return text or "未入力"
+
+
+def parse_carrier_freight_number(value, label):
+    """任意入力の正数をDecimalへ変換する。空欄はNone。"""
+    text = unicodedata.normalize("NFKC", clean_value(value, blank_text="")).strip()
+    if not text:
+        return None
+    text = text.replace(",", "").replace("，", "").replace(" ", "")
+    if not re.fullmatch(r"\d+(?:\.\d+)?", text):
+        raise ValueError(f"{label}は数字で入力してください。")
+    try:
+        number = Decimal(text)
+    except InvalidOperation as exc:
+        raise ValueError(f"{label}は数字で入力してください。") from exc
+    if number <= 0:
+        raise ValueError(f"{label}は0より大きい数字で入力してください。")
+    return number
+
+
+def carrier_freight_decimal_text(value):
+    if value is None:
+        return ""
+    text = format(value, "f")
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    return "0" if text in {"", "-0"} else text
+
+
+def normalize_carrier_freight_amounts(truck_freight, quantity_kg, kg_rate):
+    """確定した計算ルールに従い、運賃・数量・kg単価を整合させる。"""
+    truck = parse_carrier_freight_number(truck_freight, "1車運賃")
+    quantity = parse_carrier_freight_number(quantity_kg, "数量")
+    rate = parse_carrier_freight_number(kg_rate, "kg単価")
+    calculation_source = ""
+
+    if quantity is not None and truck is not None:
+        # 3項目すべて入力された場合も、1車運賃と数量を正としてkg単価を計算する。
+        rate = (truck / quantity).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        calculation_source = "kg単価を自動計算"
+    elif quantity is not None and rate is not None:
+        truck = (quantity * rate).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+        calculation_source = "1車運賃を自動計算"
+
+    if truck is None and rate is None:
+        raise ValueError("1車運賃またはkg単価のどちらかを入力してください。")
+
+    return {
+        "truck_freight": carrier_freight_decimal_text(truck),
+        "quantity_kg": carrier_freight_decimal_text(quantity),
+        "kg_rate": carrier_freight_decimal_text(rate),
+        "calculation_source": calculation_source,
+    }
+
+
+def carrier_freight_route_key(value):
+    """比較時の表記揺れを減らすため、全半角と空白をそろえる。"""
+    text = unicodedata.normalize("NFKC", clean_value(value, blank_text="")).strip().lower()
+    return re.sub(r"\s+", "", text)
+
+
+def serialize_carrier_freight(record):
+    payload = {
+        "version": CARRIER_FREIGHT_VERSION,
+        "carrier_id": clean_value(record.get("carrier_id"), blank_text="").strip(),
+        "carrier_name": clean_value(record.get("carrier_name"), blank_text="").strip(),
+        "effective_date": carrier_freight_date_text(record.get("effective_date")),
+        "pickup_location": clean_value(record.get("pickup_location"), blank_text="").strip(),
+        "delivery_destination": clean_value(record.get("delivery_destination"), blank_text="").strip(),
+        "truck_freight": clean_value(record.get("truck_freight"), blank_text="").strip(),
+        "quantity_kg": clean_value(record.get("quantity_kg"), blank_text="").strip(),
+        "kg_rate": clean_value(record.get("kg_rate"), blank_text="").strip(),
+        "calculation_source": clean_value(record.get("calculation_source"), blank_text="").strip(),
+        "remarks": clean_value(record.get("remarks"), blank_text="").strip(),
+    }
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+
+
+def parse_carrier_freight_item(item):
+    """Supabase内部レコードを画面表示用の運賃辞書へ変換する。"""
+    if not is_carrier_freight_item(item):
+        return None
+    try:
+        payload = json.loads(str(item.get("content") or "{}"))
+    except Exception:
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+
+    carrier_id = clean_value(payload.get("carrier_id"), blank_text="").strip()
+    if not carrier_id:
+        storage_key = clean_value(item.get("customer_key"), blank_text="")
+        prefix = "carrier_freight:"
+        if storage_key.startswith(prefix):
+            carrier_id = storage_key[len(prefix):].strip()
+
+    return {
+        "id": clean_value(item.get("id"), blank_text=""),
+        "field_name": clean_value(item.get("field_name"), blank_text=""),
+        "carrier_id": carrier_id,
+        "carrier_name": clean_value(
+            payload.get("carrier_name") or item.get("customer_name"),
+            blank_text="",
+        ).strip(),
+        "effective_date": carrier_freight_date_text(payload.get("effective_date")),
+        "pickup_location": clean_value(payload.get("pickup_location"), blank_text="").strip(),
+        "delivery_destination": clean_value(payload.get("delivery_destination"), blank_text="").strip(),
+        "truck_freight": clean_value(payload.get("truck_freight"), blank_text="").strip(),
+        "quantity_kg": clean_value(payload.get("quantity_kg"), blank_text="").strip(),
+        "kg_rate": clean_value(payload.get("kg_rate"), blank_text="").strip(),
+        "calculation_source": clean_value(payload.get("calculation_source"), blank_text="").strip(),
+        "remarks": clean_value(payload.get("remarks"), blank_text="").strip(),
+        "created_at": item.get("created_at", ""),
+        "updated_at": item.get("updated_at", ""),
+        "sort_order": item.get("sort_order", 0),
+    }
+
+
+def carrier_freight_sort_key(item):
+    return (
+        carrier_freight_date_text(item.get("effective_date")),
+        str(item.get("updated_at") or item.get("created_at") or ""),
+        str(item.get("id") or ""),
+    )
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def load_carrier_freight_rows_from_supabase(carrier_id=""):
+    """運送会社運賃をSupabaseからページ単位で読み込む。"""
+    if not has_supabase_config():
+        return []
+
+    rows = []
+    page_size = 1000
+    offset = 0
+    while True:
+        params = {
+            "select": "id,customer_key,customer_name,field_name,content,sort_order,created_at,updated_at",
+            "field_name": f"like.{CARRIER_FREIGHT_PREFIX}*",
+            "order": "created_at.desc,id.desc",
+            "limit": str(page_size),
+            "offset": str(offset),
+        }
+        if carrier_id:
+            params["customer_key"] = f"eq.{carrier_freight_storage_key(carrier_id)}"
+        try:
+            response = requests.get(
+                get_supabase_customer_information_url(),
+                headers=get_supabase_headers(),
+                params=params,
+                timeout=30,
+            )
+        except Exception as exc:
+            raise RuntimeError("運賃の読み込み中にSupabaseへ接続できませんでした。") from exc
+
+        check_customer_information_response("読み込み", response, (200,))
+        page = response.json()
+        if not isinstance(page, list):
+            raise RuntimeError("Supabaseから返った運賃の形式が正しくありません。")
+
+        rows.extend(item for item in page if is_carrier_freight_item(item))
+        if len(page) < page_size:
+            break
+        offset += page_size
+
+    return rows
+
+
+def get_carrier_freights(carrier_id):
+    freights = []
+    for item in load_carrier_freight_rows_from_supabase(carrier_id):
+        parsed = parse_carrier_freight_item(item)
+        if parsed:
+            freights.append(parsed)
+    freights.sort(key=carrier_freight_sort_key, reverse=True)
+    return freights
+
+
+def get_all_carrier_freights():
+    freights = []
+    for item in load_carrier_freight_rows_from_supabase(""):
+        parsed = parse_carrier_freight_item(item)
+        if parsed:
+            freights.append(parsed)
+    freights.sort(key=carrier_freight_sort_key, reverse=True)
+    return freights
+
+
+def clear_carrier_freight_cache():
+    try:
+        load_carrier_freight_rows_from_supabase.clear()
+    except Exception:
+        pass
+
+
+def carrier_freight_values(item):
+    return {
+        "適用日": carrier_freight_date_text(item.get("effective_date")),
+        "引取場所": clean_value(item.get("pickup_location"), blank_text=""),
+        "納品先": clean_value(item.get("delivery_destination"), blank_text=""),
+        "1車運賃": clean_value(item.get("truck_freight"), blank_text=""),
+        "数量kg": clean_value(item.get("quantity_kg"), blank_text=""),
+        "kg単価": clean_value(item.get("kg_rate"), blank_text=""),
+        "備考": clean_value(item.get("remarks"), blank_text=""),
+    }
+
+
+def carrier_freight_history_changes(before, after):
+    before_values = carrier_freight_values(before or {})
+    after_values = carrier_freight_values(after or {})
+    return {
+        field_name: (before_values.get(field_name, ""), after_values.get(field_name, ""))
+        for field_name in after_values
+        if before_values.get(field_name, "") != after_values.get(field_name, "")
+    }
+
+
+def build_carrier_freight_record(
+    carrier_id,
+    carrier_name,
+    effective_date,
+    pickup_location,
+    delivery_destination,
+    truck_freight,
+    quantity_kg,
+    kg_rate,
+    remarks,
+):
+    pickup = clean_value(pickup_location, blank_text="").strip()
+    destination = clean_value(delivery_destination, blank_text="").strip()
+    if not pickup:
+        raise ValueError("引取場所を入力してください。")
+    if not destination:
+        raise ValueError("納品先を入力してください。")
+
+    amounts = normalize_carrier_freight_amounts(truck_freight, quantity_kg, kg_rate)
+    return {
+        "carrier_id": clean_value(carrier_id, blank_text="").strip(),
+        "carrier_name": clean_value(carrier_name, blank_text="").strip(),
+        "effective_date": carrier_freight_date_text(effective_date),
+        "pickup_location": pickup,
+        "delivery_destination": destination,
+        "truck_freight": amounts["truck_freight"],
+        "quantity_kg": amounts["quantity_kg"],
+        "kg_rate": amounts["kg_rate"],
+        "calculation_source": amounts["calculation_source"],
+        "remarks": clean_value(remarks, blank_text="").strip(),
+    }
+
+
+def save_carrier_freight(record, existing=None):
+    content = serialize_carrier_freight(record)
+    carrier_id = record["carrier_id"]
+    if existing:
+        update_customer_information(existing["id"], existing["field_name"], content)
+    else:
+        rows = load_carrier_freight_rows_from_supabase(carrier_id)
+        next_order = max(
+            (int(row.get("sort_order", 0)) for row in rows),
+            default=0,
+        ) + 10
+        insert_customer_information(
+            record["carrier_name"],
+            carrier_freight_storage_key(carrier_id),
+            make_carrier_freight_field_name(),
+            content,
+            next_order,
+        )
+    clear_carrier_freight_cache()
+
+
+def delete_carrier_freight(item):
+    item_id = clean_value(item.get("id"), blank_text="")
+    if not item_id:
+        raise RuntimeError("削除する運賃が見つかりません。")
+    delete_customer_information(item_id)
+    clear_carrier_freight_cache()
+
+
+def carrier_freight_decimal_display(value, maximum_decimals=2):
+    text = clean_value(value, blank_text="").strip()
+    if not text:
+        return ""
+    try:
+        number = Decimal(text)
+    except InvalidOperation:
+        return text
+    if maximum_decimals == 0:
+        return f"{number:,.0f}"
+    formatted = f"{number:,.{maximum_decimals}f}"
+    return formatted.rstrip("0").rstrip(".")
+
+
+def carrier_freight_truck_label(item):
+    value = carrier_freight_decimal_display(item.get("truck_freight"), 0)
+    return f"{value}円" if value else "未入力"
+
+
+def carrier_freight_quantity_label(item):
+    value = carrier_freight_decimal_display(item.get("quantity_kg"), 2)
+    return f"{value}kg" if value else "未入力"
+
+
+def carrier_freight_rate_label(item):
+    value = carrier_freight_decimal_display(item.get("kg_rate"), 4)
+    return f"{value}円/kg" if value else "未入力"
+
+
+def carrier_freight_success_message(action, record):
+    message = f"運賃を{action}しました。"
+    calculation = clean_value(record.get("calculation_source"), blank_text="")
+    if calculation:
+        message += f" {calculation}しました。"
+    return message
+
+
+def render_carrier_freight_display(item):
+    route = (
+        f"{clean_value(item.get('pickup_location'), blank_text='未入力')}"
+        f" → {clean_value(item.get('delivery_destination'), blank_text='未入力')}"
+    )
+    st.markdown(f"**{html.escape(route)}**")
+    st.caption(f"適用日：{format_carrier_freight_date(item.get('effective_date'))}")
+    truck_col, quantity_col, rate_col = st.columns(3)
+    with truck_col:
+        st.caption("1車運賃")
+        st.write(carrier_freight_truck_label(item))
+    with quantity_col:
+        st.caption("数量")
+        st.write(carrier_freight_quantity_label(item))
+    with rate_col:
+        st.caption("kg単価")
+        st.write(carrier_freight_rate_label(item))
+    if item.get("remarks"):
+        st.caption("備考")
+        st.write(item["remarks"])
+
+
+def render_carrier_freight_form(form_key, existing=None):
+    existing = existing or {}
+    with st.form(form_key):
+        effective_date = st.date_input(
+            "適用日",
+            value=carrier_freight_date_input_value(existing.get("effective_date")),
+            key=f"{form_key}_effective_date",
+        )
+        pickup_location = st.text_input(
+            "引取場所",
+            value=existing.get("pickup_location", ""),
+            placeholder="例：○○工場",
+            key=f"{form_key}_pickup_location",
+        )
+        delivery_destination = st.text_input(
+            "納品先",
+            value=existing.get("delivery_destination", ""),
+            placeholder="例：△△牧場",
+            key=f"{form_key}_delivery_destination",
+        )
+        truck_col, quantity_col, rate_col = st.columns(3)
+        with truck_col:
+            truck_freight = st.text_input(
+                "1車運賃（円）",
+                value=existing.get("truck_freight", ""),
+                placeholder="例：200000",
+                key=f"{form_key}_truck_freight",
+            )
+        with quantity_col:
+            quantity_kg = st.text_input(
+                "数量（kg）",
+                value=existing.get("quantity_kg", ""),
+                placeholder="例：20000",
+                key=f"{form_key}_quantity_kg",
+            )
+        with rate_col:
+            kg_rate = st.text_input(
+                "kg単価（円）",
+                value=existing.get("kg_rate", ""),
+                placeholder="例：10",
+                key=f"{form_key}_kg_rate",
+            )
+        st.caption(
+            "数量と1車運賃がある場合はkg単価を自動計算します。"
+            "数量とkg単価があり1車運賃が空欄の場合は、1車運賃を自動計算します。"
+        )
+        remarks = st.text_area(
+            "備考",
+            value=existing.get("remarks", ""),
+            height=100,
+            placeholder="例：高速代込み、冬季料金 など",
+            key=f"{form_key}_remarks",
+        )
+        save_col, cancel_col = st.columns(2)
+        with save_col:
+            submitted = st.form_submit_button(
+                "自動計算して保存",
+                type="primary",
+                use_container_width=True,
+            )
+        with cancel_col:
+            cancelled = st.form_submit_button("キャンセル", use_container_width=True)
+    return submitted, cancelled, {
+        "effective_date": effective_date,
+        "pickup_location": pickup_location,
+        "delivery_destination": delivery_destination,
+        "truck_freight": truck_freight,
+        "quantity_kg": quantity_kg,
+        "kg_rate": kg_rate,
+        "remarks": remarks,
+    }
+
+
+def render_carrier_freight_section(carrier_id, company_name):
+    """運送会社詳細に、折りたたみ式の運賃登録・履歴を表示する。"""
+    state_suffix = hashlib.sha256(
+        f"carrier-freight|{carrier_id}".encode("utf-8")
+    ).hexdigest()[:16]
+    add_key = f"carrier_freight_add_{state_suffix}"
+    edit_key = f"carrier_freight_edit_{state_suffix}"
+    delete_key = f"carrier_freight_delete_{state_suffix}"
+    success_key = f"carrier_freight_success_{state_suffix}"
+
+    try:
+        freights = get_carrier_freights(carrier_id)
+    except Exception as exc:
+        freights = []
+        load_error = str(exc)
+    else:
+        load_error = ""
+
+    success_message = st.session_state.pop(success_key, None)
+    expanded = bool(
+        success_message
+        or st.session_state.get(add_key)
+        or st.session_state.get(edit_key)
+        or st.session_state.get(delete_key)
+    )
+
+    st.markdown("---")
+    with st.expander(f"💰 運賃登録・履歴　{len(freights)}件", expanded=expanded):
+        if success_message:
+            st.success(success_message)
+        if load_error:
+            st.warning(load_error)
+            return
+        if not has_supabase_config():
+            st.warning("運賃登録を使うにはSupabase設定が必要です。")
+            return
+
+        st.caption(
+            "新しい運賃は既存記録を上書きせず追加し、過去分を履歴として残します。"
+            "既存記録の編集・削除は入力ミスの訂正用です。"
+        )
+
+        if not st.session_state.get(add_key):
+            if st.button(
+                "＋ 運賃を追加",
+                key=f"carrier_freight_add_button_{state_suffix}",
+                use_container_width=True,
+            ):
+                st.session_state[add_key] = True
+                st.session_state.pop(edit_key, None)
+                st.session_state.pop(delete_key, None)
+                st.rerun()
+        else:
+            st.markdown("#### 新しい運賃")
+            submitted, cancelled, values = render_carrier_freight_form(
+                f"carrier_freight_add_form_{state_suffix}"
+            )
+            if cancelled:
+                st.session_state.pop(add_key, None)
+                st.rerun()
+            if submitted:
+                try:
+                    record = build_carrier_freight_record(
+                        carrier_id,
+                        company_name,
+                        **values,
+                    )
+                    save_carrier_freight(record)
+                    remember_change_history_warning(
+                        record_change_history_safely(
+                            "運送会社",
+                            carrier_id,
+                            company_name,
+                            "追加",
+                            carrier_freight_history_changes({}, record),
+                            section="運賃",
+                        )
+                    )
+                    st.session_state.pop(add_key, None)
+                    st.session_state[success_key] = carrier_freight_success_message("追加", record)
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"運賃を保存できませんでした：{exc}")
+
+        if not freights:
+            st.info("登録されている運賃はありません。")
+            return
+
+        st.markdown("#### 運賃履歴")
+        active_edit_id = st.session_state.get(edit_key)
+        active_delete_id = st.session_state.get(delete_key)
+
+        for freight in freights:
+            freight_id = freight["id"]
+            with st.container(border=True):
+                if active_edit_id == freight_id:
+                    st.markdown("**入力ミスを訂正**")
+                    submitted, cancelled, values = render_carrier_freight_form(
+                        f"carrier_freight_edit_form_{freight_id}",
+                        existing=freight,
+                    )
+                    if cancelled:
+                        st.session_state.pop(edit_key, None)
+                        st.rerun()
+                    if submitted:
+                        try:
+                            record = build_carrier_freight_record(
+                                carrier_id,
+                                company_name,
+                                **values,
+                            )
+                            changes = carrier_freight_history_changes(freight, record)
+                            if changes:
+                                save_carrier_freight(record, existing=freight)
+                                remember_change_history_warning(
+                                    record_change_history_safely(
+                                        "運送会社",
+                                        carrier_id,
+                                        company_name,
+                                        "変更",
+                                        changes,
+                                        section="運賃",
+                                    )
+                                )
+                            st.session_state.pop(edit_key, None)
+                            st.session_state[success_key] = carrier_freight_success_message("保存", record)
+                            st.rerun()
+                        except Exception as exc:
+                            st.error(f"運賃を保存できませんでした：{exc}")
+                    continue
+
+                render_carrier_freight_display(freight)
+                edit_col, delete_col = st.columns(2)
+                with edit_col:
+                    if st.button(
+                        "編集",
+                        key=f"carrier_freight_edit_button_{freight_id}",
+                        use_container_width=True,
+                    ):
+                        st.session_state[edit_key] = freight_id
+                        st.session_state.pop(add_key, None)
+                        st.session_state.pop(delete_key, None)
+                        st.rerun()
+                with delete_col:
+                    if active_delete_id == freight_id:
+                        st.warning("この運賃記録を削除しますか？")
+                        if st.button(
+                            "削除する",
+                            key=f"carrier_freight_delete_confirm_{freight_id}",
+                            use_container_width=True,
+                        ):
+                            try:
+                                delete_carrier_freight(freight)
+                                remember_change_history_warning(
+                                    record_change_history_safely(
+                                        "運送会社",
+                                        carrier_id,
+                                        company_name,
+                                        "削除",
+                                        carrier_freight_history_changes(freight, {}),
+                                        section="運賃",
+                                    )
+                                )
+                                st.session_state.pop(delete_key, None)
+                                st.session_state[success_key] = "運賃を削除しました。"
+                                st.rerun()
+                            except Exception as exc:
+                                st.error(f"運賃を削除できませんでした：{exc}")
+                        if st.button(
+                            "キャンセル",
+                            key=f"carrier_freight_delete_cancel_{freight_id}",
+                            use_container_width=True,
+                        ):
+                            st.session_state.pop(delete_key, None)
+                            st.rerun()
+                    elif st.button(
+                        "削除",
+                        key=f"carrier_freight_delete_button_{freight_id}",
+                        use_container_width=True,
+                    ):
+                        st.session_state[delete_key] = freight_id
+                        st.session_state.pop(edit_key, None)
+                        st.rerun()
+
+
+def carrier_freight_numeric_value(item, field_name):
+    text = clean_value(item.get(field_name), blank_text="").strip()
+    if not text:
+        return None
+    try:
+        return Decimal(text)
+    except InvalidOperation:
+        return None
+
+
+def render_carrier_freight_ranking(title, records, field_name, current_names):
+    available = [
+        record for record in records
+        if carrier_freight_numeric_value(record, field_name) is not None
+    ]
+    available.sort(key=lambda record: carrier_freight_numeric_value(record, field_name))
+
+    st.subheader(title)
+    if not available:
+        st.info("比較できる運賃はありません。")
+        return
+
+    for index, record in enumerate(available):
+        with st.container(border=True):
+            carrier_id = record.get("carrier_id", "")
+            company_name = (
+                current_names.get(carrier_id)
+                or record.get("carrier_name")
+                or "運送会社名未設定"
+            )
+            company_link = render_page_link(
+                company_name,
+                page="partner_detail",
+                partner_id=carrier_id,
+                partner_type="carrier",
+                class_name="dispatch-month-link",
+            )
+            if index == 0:
+                st.markdown(f"**最安**　{company_link}", unsafe_allow_html=True)
+            else:
+                st.markdown(company_link, unsafe_allow_html=True)
+
+            if field_name == "truck_freight":
+                st.markdown(f"### {carrier_freight_truck_label(record)}")
+            else:
+                st.markdown(f"### {carrier_freight_rate_label(record)}")
+
+            st.caption(f"適用日：{format_carrier_freight_date(record.get('effective_date'))}")
+            detail_col1, detail_col2 = st.columns(2)
+            with detail_col1:
+                st.caption("1車運賃")
+                st.write(carrier_freight_truck_label(record))
+            with detail_col2:
+                st.caption("数量・kg単価")
+                st.write(
+                    f"{carrier_freight_quantity_label(record)} ／ "
+                    f"{carrier_freight_rate_label(record)}"
+                )
+            if record.get("remarks"):
+                st.caption("備考")
+                st.write(record["remarks"])
+
+
+def show_carrier_freight_compare():
+    """同じ引取場所・納品先の最新運賃を運送会社別に比較する。"""
+    show_trade_partner_home_link("carrier")
+    st.header("💰 運賃比較")
+    st.caption(
+        "同じ引取場所と納品先について、各運送会社の適用日が最も新しい記録を比較します。"
+    )
+
+    if not has_supabase_config():
+        st.warning("運賃比較を使うにはSupabase設定が必要です。")
+        return
+
+    try:
+        freights = get_all_carrier_freights()
+    except Exception as exc:
+        st.error(str(exc))
+        return
+
+    if not freights:
+        st.info("比較できる運賃はまだ登録されていません。")
+        return
+
+    # 新しい記録の表記を候補名として優先する。
+    pickup_names = {}
+    for record in freights:
+        pickup_key = carrier_freight_route_key(record.get("pickup_location"))
+        if pickup_key:
+            pickup_names.setdefault(pickup_key, record.get("pickup_location", ""))
+
+    pickup_keys = sorted(pickup_names, key=lambda key: pickup_names[key])
+    selected_pickup_key = st.selectbox(
+        "引取場所",
+        pickup_keys,
+        format_func=lambda key: pickup_names.get(key, key),
+        key="carrier_freight_compare_pickup",
+    )
+
+    destination_names = {}
+    for record in freights:
+        if carrier_freight_route_key(record.get("pickup_location")) != selected_pickup_key:
+            continue
+        destination_key = carrier_freight_route_key(record.get("delivery_destination"))
+        if destination_key:
+            destination_names.setdefault(
+                destination_key,
+                record.get("delivery_destination", ""),
+            )
+
+    destination_keys = sorted(destination_names, key=lambda key: destination_names[key])
+    selected_destination_key = st.selectbox(
+        "納品先",
+        destination_keys,
+        format_func=lambda key: destination_names.get(key, key),
+        key="carrier_freight_compare_destination",
+    )
+
+    route_records = [
+        record for record in freights
+        if carrier_freight_route_key(record.get("pickup_location")) == selected_pickup_key
+        and carrier_freight_route_key(record.get("delivery_destination")) == selected_destination_key
+    ]
+    route_records.sort(key=carrier_freight_sort_key, reverse=True)
+
+    latest_by_carrier = {}
+    for record in route_records:
+        carrier_id = clean_value(record.get("carrier_id"), blank_text="")
+        if carrier_id and carrier_id not in latest_by_carrier:
+            latest_by_carrier[carrier_id] = record
+    latest_records = list(latest_by_carrier.values())
+
+    try:
+        partner_data = load_trade_partner_data()
+        current_names = {
+            trade_partner_text(row.get("取引先ID")): trade_partner_text(row.get("会社名"))
+            for row in get_trade_partner_master_rows(partner_data, "carrier")
+        }
+    except Exception:
+        current_names = {}
+
+    st.markdown("---")
+    st.markdown(
+        f"**{html.escape(pickup_names[selected_pickup_key])}"
+        f" → {html.escape(destination_names[selected_destination_key])}**"
+    )
+    st.caption(f"比較対象：{len(latest_records)}社（各社の最新記録）")
+
+    render_carrier_freight_ranking(
+        "1車運賃が安い順",
+        latest_records,
+        "truck_freight",
+        current_names,
+    )
+    st.markdown("---")
+    render_carrier_freight_ranking(
+        "kg単価が安い順",
+        latest_records,
+        "kg_rate",
+        current_names,
+    )
+
+
+def carrier_freight_rows_to_dataframe(rows):
+    records = []
+    for row in rows or []:
+        freight = parse_carrier_freight_item(row)
+        if not freight:
+            continue
+        records.append(
+            {
+                "運送会社ID": freight.get("carrier_id", ""),
+                "運送会社": freight.get("carrier_name", ""),
+                "適用日": freight.get("effective_date", ""),
+                "引取場所": freight.get("pickup_location", ""),
+                "納品先": freight.get("delivery_destination", ""),
+                "1車運賃": freight.get("truck_freight", ""),
+                "数量kg": freight.get("quantity_kg", ""),
+                "kg単価": freight.get("kg_rate", ""),
+                "計算方法": freight.get("calculation_source", ""),
+                "備考": freight.get("remarks", ""),
+                "保存ID": freight.get("id", ""),
+                "作成日時": freight.get("created_at", ""),
+                "更新日時": freight.get("updated_at", ""),
+            }
+        )
+    records.sort(
+        key=lambda record: (
+            carrier_freight_date_text(record.get("適用日")),
+            str(record.get("更新日時") or record.get("作成日時") or ""),
+        ),
+        reverse=True,
+    )
+    return backup_dataframe(
+        records,
+        [
+            "運送会社ID", "運送会社", "適用日", "引取場所", "納品先",
+            "1車運賃", "数量kg", "kg単価", "計算方法", "備考",
+            "保存ID", "作成日時", "更新日時",
+        ],
+    )
+
+
 def render_customer_information_form(customer_name, customer_key, items, state_suffix):
     add_key = f"customer_information_add_{state_suffix}"
     if not st.session_state.get(add_key):
@@ -3831,7 +4681,9 @@ def render_customer_information_card(customer_name, customer_key=None):
             items = load_customer_information(customer_name, customer_key)
             items = [
                 item for item in items
-                if not is_past_product_note_item(item) and not is_estimate_item(item)
+                if not is_past_product_note_item(item)
+                and not is_estimate_item(item)
+                and not is_carrier_freight_item(item)
             ]
         except Exception as exc:
             st.warning(str(exc))
@@ -4470,6 +5322,7 @@ def sync_page_from_query_params():
         "carrier_list",
         "carrier_search",
         "carrier_condition",
+        "carrier_freight_compare",
         "carrier_register",
         "partner_detail",
         "change_history",
@@ -10492,10 +11345,17 @@ def show_trade_partner_home(partner_type):
             unsafe_allow_html=True,
         )
     else:
-        st.markdown(
-            render_page_link("🗺 運送条件検索", page="carrier_condition"),
-            unsafe_allow_html=True,
-        )
+        col3, col4 = st.columns(2)
+        with col3:
+            st.markdown(
+                render_page_link("🗺 運送条件検索", page="carrier_condition"),
+                unsafe_allow_html=True,
+            )
+        with col4:
+            st.markdown(
+                render_page_link("💰 運賃比較", page="carrier_freight_compare"),
+                unsafe_allow_html=True,
+            )
 
 
 def show_trade_partner_directory(partner_type):
@@ -10899,6 +11759,7 @@ def show_trade_partner_detail(partner_type, partner_id):
             partner_type,
             company,
         )
+        render_carrier_freight_section(partner_id, company)
     show_trade_partner_notes(partner_type, partner_id, company)
 
 
@@ -11505,6 +12366,7 @@ def create_full_data_backup_zip():
     product_usage_df = backup_build_product_usage(customer_df)
     calendar_df = backup_build_calendar_export(customer_df)
     estimates_df = estimate_rows_to_dataframe(customer_information)
+    carrier_freights_df = carrier_freight_rows_to_dataframe(customer_information)
 
     backup_add_entry(entries, f"元Excel/{main_name}", main_excel, "顧客・在庫の元Excel")
     backup_add_entry(entries, f"元Excel/{dispatch_name}", dispatch_excel, "配車表の元Excel")
@@ -11520,7 +12382,7 @@ def create_full_data_backup_zip():
         ("CSV/06_ソリュブル顧客概要.csv", soluble_summary_df, "ソリュブル顧客の概要"),
         ("CSV/07_WATER_it表示データ.csv", water_df, "アプリで表示できるWATER it情報（元CSVは含まない）"),
         ("CSV/08_WATER_it保存メタデータ.csv", backup_dataframe(water_metadata), "WATER it保存データの概要のみ"),
-        ("CSV/09_顧客情報_Supabase生データ.csv", backup_dataframe(customer_information), "顧客情報・過去商品メモ・提案見積りの生データ"),
+        ("CSV/09_顧客情報_Supabase生データ.csv", backup_dataframe(customer_information), "顧客情報・過去商品メモ・提案見積り・運送会社運賃の生データ"),
         ("CSV/10_メモ_Supabase生データ.csv", notes_df, "通常メモ・取引先メモの生データ"),
         ("CSV/11_LINE状態.csv", line_df, "LINE接続状態"),
     ]
@@ -11557,6 +12419,11 @@ def create_full_data_backup_zip():
                 f"CSV/{next_number + 2:02d}_提案見積り.csv",
                 estimates_df,
                 "顧客ごとの提案・見積り一覧",
+            ),
+            (
+                f"CSV/{next_number + 3:02d}_運送会社運賃履歴.csv",
+                carrier_freights_df,
+                "運送会社ごとの運賃履歴",
             ),
         ]
     )
@@ -11748,7 +12615,7 @@ supplier_pages = {
 }
 carrier_pages = {
     "carrier_home", "carrier_list", "carrier_search", "carrier_condition",
-    "carrier_register",
+    "carrier_freight_compare", "carrier_register",
 }
 
 with st.sidebar:
@@ -11793,6 +12660,7 @@ with st.sidebar:
         st.markdown(render_page_link("📋 運送会社一覧", page="carrier_list"), unsafe_allow_html=True)
         st.markdown(render_page_link("🔍 運送会社検索", page="carrier_search"), unsafe_allow_html=True)
         st.markdown(render_page_link("🗺 運送条件検索", page="carrier_condition"), unsafe_allow_html=True)
+        st.markdown(render_page_link("💰 運賃比較", page="carrier_freight_compare"), unsafe_allow_html=True)
 
     st.markdown("---")
     st.markdown(
@@ -11918,6 +12786,8 @@ try:
         show_trade_partner_search("carrier")
     elif st.session_state["page"] == "carrier_condition":
         show_carrier_condition_search()
+    elif st.session_state["page"] == "carrier_freight_compare":
+        show_carrier_freight_compare()
     elif st.session_state["page"] == "carrier_register":
         show_trade_partner_register("carrier")
 
