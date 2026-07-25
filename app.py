@@ -9188,18 +9188,31 @@ def render_month_navigation_anchor(anchor_id):
     )
 
 
-def restore_month_navigation_scroll(scroll_target, top_anchor_id):
-    """下側の月移動後だけ、翌月は先頭・前月は末尾へ移動する。"""
+def restore_month_navigation_scroll(
+    scroll_target,
+    top_target_selector,
+    bottom_target_selector,
+    fallback_anchor_id=None,
+):
+    """下側の月移動後に、実際の先頭行または最終行を画面へ位置合わせする。"""
     if scroll_target not in {"top", "bottom"}:
         return
 
-    safe_anchor_id = re.sub(r"[^0-9A-Za-z_-]", "", str(top_anchor_id or ""))
+    safe_fallback_anchor_id = re.sub(
+        r"[^0-9A-Za-z_-]",
+        "",
+        str(fallback_anchor_id or ""),
+    )
     target_json = json.dumps(scroll_target)
-    anchor_json = json.dumps(safe_anchor_id)
+    top_selector_json = json.dumps(str(top_target_selector or ""))
+    bottom_selector_json = json.dumps(str(bottom_target_selector or ""))
+    fallback_anchor_json = json.dumps(safe_fallback_anchor_id)
     script = f'''<script>
     (() => {{
       const scrollTarget = {target_json};
-      const anchorId = {anchor_json};
+      const topSelector = {top_selector_json};
+      const bottomSelector = {bottom_selector_json};
+      const fallbackAnchorId = {fallback_anchor_json};
       let parentWindow;
       let parentDocument;
       try {{
@@ -9209,29 +9222,85 @@ def restore_month_navigation_scroll(scroll_target, top_anchor_id):
         return;
       }}
 
-      const move = () => {{
-        if (scrollTarget === 'bottom') {{
-          const bodyHeight = parentDocument.body ? parentDocument.body.scrollHeight : 0;
-          const documentHeight = parentDocument.documentElement
-            ? parentDocument.documentElement.scrollHeight
-            : 0;
-          parentWindow.scrollTo({{
-            top: Math.max(bodyHeight, documentHeight),
-            left: 0,
-            behavior: 'auto',
-          }});
-          return;
-        }}
+      let cancelled = false;
+      const cancelAutomaticMove = () => {{ cancelled = true; }};
+      ['wheel', 'touchstart', 'pointerdown', 'keydown'].forEach((eventName) => {{
+        parentWindow.addEventListener(eventName, cancelAutomaticMove, {{once: true, passive: true}});
+      }});
 
-        const anchor = parentDocument.getElementById(anchorId);
-        if (!anchor) return;
-        const top = anchor.getBoundingClientRect().top + parentWindow.scrollY - 82;
-        parentWindow.scrollTo({{top: Math.max(0, top), left: 0, behavior: 'auto'}});
+      const visibleTarget = (selector) => {{
+        if (!selector) return null;
+        const candidates = Array.from(parentDocument.querySelectorAll(selector));
+        for (const candidate of candidates) {{
+          const style = parentWindow.getComputedStyle(candidate);
+          if (
+            style.display !== 'none' &&
+            style.visibility !== 'hidden' &&
+            candidate.getClientRects().length > 0
+          ) {{
+            return candidate;
+          }}
+        }}
+        return null;
       }};
 
-      window.setTimeout(move, 60);
-      window.setTimeout(move, 240);
-      window.setTimeout(move, 650);
+      const verticalScrollParent = (element) => {{
+        let current = element ? element.parentElement : null;
+        while (current && current !== parentDocument.body && current !== parentDocument.documentElement) {{
+          const style = parentWindow.getComputedStyle(current);
+          const overflowY = style.overflowY;
+          if (
+            (overflowY === 'auto' || overflowY === 'scroll') &&
+            current.scrollHeight > current.clientHeight + 2
+          ) {{
+            return current;
+          }}
+          current = current.parentElement;
+        }}
+        return null;
+      }};
+
+      const move = () => {{
+        if (cancelled) return;
+
+        const selector = scrollTarget === 'top' ? topSelector : bottomSelector;
+        let target = visibleTarget(selector);
+        if (!target && fallbackAnchorId) {{
+          target = parentDocument.getElementById(fallbackAnchorId);
+        }}
+        if (!target) return;
+
+        const innerScroller = verticalScrollParent(target);
+        if (innerScroller) {{
+          if (scrollTarget === 'top') {{
+            innerScroller.scrollTop = 0;
+          }} else {{
+            innerScroller.scrollTop = Math.max(
+              0,
+              target.offsetTop + target.offsetHeight - innerScroller.clientHeight,
+            );
+          }}
+        }}
+
+        parentWindow.requestAnimationFrame(() => {{
+          if (cancelled) return;
+          const rect = target.getBoundingClientRect();
+          const topOffset = 82;
+          const bottomOffset = 12;
+          const destination = scrollTarget === 'top'
+            ? parentWindow.scrollY + rect.top - topOffset
+            : parentWindow.scrollY + rect.bottom - parentWindow.innerHeight + bottomOffset;
+          parentWindow.scrollTo({{
+            top: Math.max(0, destination),
+            left: parentWindow.scrollX || 0,
+            behavior: 'auto',
+          }});
+        }});
+      }};
+
+      [60, 220, 520, 950, 1500, 2300, 3200].forEach((delay) => {{
+        window.setTimeout(move, delay);
+      }});
     }})();
     </script>'''
     components.html(script, height=0, scrolling=False)
@@ -9538,9 +9607,14 @@ def show_two_day_dispatch_calendar(rows_by_day, month_start):
 
         left_panel = build_two_day_panel_html(day1, rows_by_day.get(day1, []))
         right_panel = build_two_day_panel_html(day2, rows_by_day.get(day2, [])) if day2 else '<div></div>'
+        row_classes = ["dispatch-two-day-row"]
+        if day_num == 1:
+            row_classes.append("dispatch-calendar-scroll-top")
+        if day_num + 1 >= last_day:
+            row_classes.append("dispatch-calendar-scroll-bottom")
 
         st.markdown(
-            f'<div class="dispatch-two-day-row">{left_panel}{right_panel}</div>',
+            f'<div class="{" ".join(row_classes)}">{left_panel}{right_panel}</div>',
             unsafe_allow_html=True,
         )
 
@@ -9591,7 +9665,8 @@ def show_month_dispatch_calendar(rows_by_day, month_start):
     )
 
     body_rows = []
-    for _, row in month_df.iterrows():
+    last_row_index = len(month_df) - 1
+    for row_index, (_, row) in enumerate(month_df.iterrows()):
         row_cells = []
         for column in month_df.columns:
             value = row[column]
@@ -9603,7 +9678,13 @@ def show_month_dispatch_calendar(rows_by_day, month_start):
                 cell_value = str(value)
             row_cells.append(f"<td>{cell_value}</td>")
         cells = "".join(row_cells)
-        body_rows.append(f"<tr>{cells}</tr>")
+        row_classes = []
+        if row_index == 0:
+            row_classes.append("dispatch-calendar-scroll-top")
+        if row_index == last_row_index:
+            row_classes.append("dispatch-calendar-scroll-bottom")
+        class_attribute = f' class="{" ".join(row_classes)}"' if row_classes else ""
+        body_rows.append(f"<tr{class_attribute}>{cells}</tr>")
 
     table_html = f"""
     <div class="dispatch-month-scroll">
@@ -9667,7 +9748,9 @@ def show_dispatch_calendar(df):
     show_dispatch_month_switcher(month_start, key_suffix="bottom")
     restore_month_navigation_scroll(
         month_scroll_target,
-        "dispatch_calendar_month_content_top",
+        ".dispatch-calendar-scroll-top",
+        ".dispatch-calendar-scroll-bottom",
+        fallback_anchor_id="dispatch_calendar_month_content_top",
     )
 
 
@@ -10173,8 +10256,15 @@ def render_dispatch_responsive_list(display_df, customer_names=None):
     ]
     desktop_parts.extend(f"<th>{html.escape(column)}</th>" for column in columns)
     desktop_parts.append("</tr></thead><tbody>")
-    for _, row in display_df.iterrows():
-        desktop_parts.append("<tr>")
+    last_display_row_index = len(display_df) - 1
+    for row_index, (_, row) in enumerate(display_df.iterrows()):
+        row_classes = []
+        if row_index == 0:
+            row_classes.append("dispatch-table-scroll-top")
+        if row_index == last_display_row_index:
+            row_classes.append("dispatch-table-scroll-bottom")
+        class_attribute = f' class="{" ".join(row_classes)}"' if row_classes else ""
+        desktop_parts.append(f"<tr{class_attribute}>")
         for column in columns:
             css_class = "date-cell" if column in ["引取日", "着日"] else "quantity-cell" if column == "数量" else ""
             cell_value = (
@@ -10187,6 +10277,7 @@ def render_dispatch_responsive_list(display_df, customer_names=None):
     desktop_parts.append("</tbody></table></div>")
 
     mobile_parts = ['<div class="dispatch-mobile-view">']
+    mobile_row_index = 0
     for pickup_date, day_rows in display_df.groupby("引取日", sort=False, dropna=False):
         pickup_label = safe_value(pickup_date)
         mobile_parts.append('<section class="dispatch-day-group">')
@@ -10194,9 +10285,14 @@ def render_dispatch_responsive_list(display_df, customer_names=None):
             f'<div class="dispatch-day-heading">{pickup_label}　引取 {len(day_rows)}件</div>'
         )
         for _, row in day_rows.iterrows():
+            card_classes = ["dispatch-mobile-card"]
+            if mobile_row_index == 0:
+                card_classes.append("dispatch-table-scroll-top")
+            if mobile_row_index == last_display_row_index:
+                card_classes.append("dispatch-table-scroll-bottom")
             mobile_parts.extend(
                 [
-                    '<article class="dispatch-mobile-card">',
+                    f'<article class="{" ".join(card_classes)}">',
                     '<div class="dispatch-date-line">',
                     f'<div class="dispatch-date-box dispatch-pickup-date"><span class="dispatch-date-label">引取日</span><span class="dispatch-date-value">{safe_value(row.get("引取日"))}</span></div>',
                     '<div class="dispatch-date-arrow">→</div>',
@@ -10215,6 +10311,7 @@ def render_dispatch_responsive_list(display_df, customer_names=None):
                     '</article>',
                 ]
             )
+            mobile_row_index += 1
         mobile_parts.append("</section>")
     mobile_parts.append("</div>")
 
@@ -10332,7 +10429,9 @@ def show_dispatch_board():
         show_dispatch_table_month_switcher(df, selected_month, key_suffix="bottom")
         restore_month_navigation_scroll(
             month_scroll_target,
-            "dispatch_table_month_content_top",
+            ".dispatch-table-scroll-top",
+            ".dispatch-table-scroll-bottom",
+            fallback_anchor_id="dispatch_table_month_content_top",
         )
         return
 
@@ -10365,7 +10464,9 @@ def show_dispatch_board():
     show_dispatch_table_month_switcher(df, selected_month, key_suffix="bottom")
     restore_month_navigation_scroll(
         month_scroll_target,
-        "dispatch_table_month_content_top",
+        ".dispatch-table-scroll-top",
+        ".dispatch-table-scroll-bottom",
+        fallback_anchor_id="dispatch_table_month_content_top",
     )
 
 
