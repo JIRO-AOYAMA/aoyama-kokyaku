@@ -10,6 +10,7 @@ import math
 import mimetypes
 import posixpath
 import re
+import secrets
 import threading
 import time
 import urllib.parse
@@ -188,6 +189,18 @@ SUPABASE_CUSTOMER_INFO_TABLE = st.secrets.get(
     "SUPABASE_CUSTOMER_INFO_TABLE",
     "customer_information",
 )
+SUPABASE_LOGIN_BROWSERS_TABLE = st.secrets.get(
+    "SUPABASE_LOGIN_BROWSERS_TABLE",
+    "app_login_browsers",
+)
+SUPABASE_LOGIN_EVENTS_TABLE = st.secrets.get(
+    "SUPABASE_LOGIN_EVENTS_TABLE",
+    "app_login_events",
+)
+LOGIN_BROWSER_COOKIE_KEY = "login_browser_id"
+LOGIN_BROWSER_TOKEN_BYTES = 32
+LOGIN_AUDIT_REQUEST_TIMEOUT = 15
+LOGIN_HISTORY_PAGE_SIZE = 100
 LINE_STATUS_NOTE_PREFIX = "line_status_"
 LINE_STATUS_BODY = "__LINE_CONNECTED__"
 VOICE_INPUT_HELP = "スマホではキーボードのマイクを押して音声入力できます。"
@@ -791,6 +804,390 @@ def enforce_login_expiry():
     set_query_params_safely({"page": "home", "expired": "1"})
     st.rerun()
 
+
+
+def get_login_audit_admin_key():
+    """ログイン履歴専用に、ブラウザへ公開しないSupabase管理キーだけを返す。"""
+    return str(SUPABASE_SECRET_KEY or SUPABASE_SERVICE_ROLE_KEY or "").strip()
+
+
+def has_login_audit_config():
+    return bool(str(SUPABASE_URL or "").strip() and get_login_audit_admin_key())
+
+
+def validate_login_audit_table_name(value, default_name):
+    table_name = str(value or default_name).strip()
+    if not table_name.replace("_", "").isalnum():
+        raise RuntimeError("ログイン履歴用Supabaseテーブル名が正しくありません。")
+    return table_name
+
+
+def get_login_audit_table_url(table_name):
+    base_url = str(SUPABASE_URL or "").strip().rstrip("/")
+    safe_table = urllib.parse.quote(str(table_name), safe="")
+    return f"{base_url}/rest/v1/{safe_table}"
+
+
+def get_login_browsers_table_name():
+    return validate_login_audit_table_name(
+        SUPABASE_LOGIN_BROWSERS_TABLE,
+        "app_login_browsers",
+    )
+
+
+def get_login_events_table_name():
+    return validate_login_audit_table_name(
+        SUPABASE_LOGIN_EVENTS_TABLE,
+        "app_login_events",
+    )
+
+
+def get_login_browsers_url():
+    return get_login_audit_table_url(get_login_browsers_table_name())
+
+
+def get_login_events_url():
+    return get_login_audit_table_url(get_login_events_table_name())
+
+
+def get_login_audit_headers(prefer=None):
+    key = get_login_audit_admin_key()
+    headers = {
+        "apikey": key,
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+    }
+    if key and not key.startswith(("sb_secret_", "sb_publishable_")):
+        headers["Authorization"] = f"Bearer {key}"
+    if prefer:
+        headers["Prefer"] = prefer
+    return headers
+
+
+def get_request_user_agent():
+    try:
+        return str(st.context.headers.get("User-Agent", "") or "").strip()
+    except Exception:
+        return ""
+
+
+def get_request_ip_address():
+    """IPは履歴表示の参考情報としてだけ保存し、本人判定には使わない。"""
+    try:
+        value = str(st.context.ip_address or "").strip()
+        if value:
+            return value[:200]
+    except Exception:
+        pass
+    try:
+        forwarded = str(st.context.headers.get("X-Forwarded-For", "") or "").strip()
+        if forwarded:
+            return forwarded.split(",", 1)[0].strip()[:200]
+    except Exception:
+        pass
+    return ""
+
+
+def parse_login_client_info(user_agent):
+    ua = str(user_agent or "")
+    lower = ua.lower()
+
+    if "samsungbrowser/" in lower:
+        browser_name = "Samsung Internet"
+    elif "edg/" in lower or "edgios/" in lower or "edga/" in lower:
+        browser_name = "Microsoft Edge"
+    elif "crios/" in lower or "chrome/" in lower:
+        browser_name = "Google Chrome"
+    elif "firefox/" in lower or "fxios/" in lower:
+        browser_name = "Firefox"
+    elif "safari/" in lower and "chrome/" not in lower and "crios/" not in lower:
+        browser_name = "Safari"
+    else:
+        browser_name = "不明なブラウザ"
+
+    if "android" in lower:
+        os_name = "Android"
+    elif "iphone" in lower or "ipod" in lower:
+        os_name = "iOS"
+    elif "ipad" in lower:
+        os_name = "iPadOS"
+    elif "windows nt" in lower:
+        os_name = "Windows"
+    elif "mac os x" in lower or "macintosh" in lower:
+        os_name = "macOS"
+    elif "linux" in lower:
+        os_name = "Linux"
+    else:
+        os_name = "不明なOS"
+
+    if "ipad" in lower or "tablet" in lower:
+        device_type = "タブレット"
+    elif any(marker in lower for marker in ("android", "iphone", "ipod", "mobile")):
+        device_type = "スマホ"
+    else:
+        device_type = "パソコン"
+
+    return {
+        "browser_name": browser_name,
+        "os_name": os_name,
+        "device_type": device_type,
+    }
+
+
+def get_login_browser_token(create_if_missing=True):
+    try:
+        token = str(LOGIN_COOKIES.get(LOGIN_BROWSER_COOKIE_KEY, "") or "").strip()
+    except Exception:
+        token = ""
+
+    if token and re.fullmatch(r"[A-Za-z0-9_-]{40,200}", token):
+        return token
+
+    if not create_if_missing:
+        return ""
+
+    token = secrets.token_urlsafe(LOGIN_BROWSER_TOKEN_BYTES)
+    LOGIN_COOKIES[LOGIN_BROWSER_COOKIE_KEY] = token
+    LOGIN_COOKIES.save()
+    return token
+
+
+def hash_login_audit_value(value, purpose):
+    secret_key = str(LOGIN_TOKEN_SECRET or "").encode("utf-8")
+    if not secret_key:
+        raise RuntimeError("LOGIN_TOKEN_SECRET が設定されていません。")
+    message = f"{purpose}:{str(value or '')}".encode("utf-8")
+    return hmac.new(secret_key, message, hashlib.sha256).hexdigest()
+
+
+def get_current_browser_token_hash(create_if_missing=True):
+    token = get_login_browser_token(create_if_missing=create_if_missing)
+    if not token:
+        return ""
+    return hash_login_audit_value(token, "browser")
+
+
+def get_microsoft_subject_hash(claims):
+    subject = str(dict(claims or {}).get("sub") or "").strip()
+    if not subject:
+        return ""
+    return hash_login_audit_value(subject, "microsoft-sub")
+
+
+def get_microsoft_account_label(claims):
+    data = dict(claims or {})
+    return str(data.get("name") or "Microsoftアカウント").strip()[:200]
+
+
+def utc_now_iso():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def fetch_login_browser_by_hash(browser_token_hash):
+    if not has_login_audit_config() or not browser_token_hash:
+        return None
+    response = requests.get(
+        get_login_browsers_url(),
+        headers=get_login_audit_headers(),
+        params={
+            "select": "id,browser_token_hash,first_seen_at,last_seen_at,is_active,is_acknowledged",
+            "browser_token_hash": f"eq.{browser_token_hash}",
+            "limit": "1",
+        },
+        timeout=LOGIN_AUDIT_REQUEST_TIMEOUT,
+    )
+    if response.status_code != 200:
+        raise RuntimeError(f"ログインブラウザ確認に失敗しました（{response.status_code}）。")
+    rows = response.json() or []
+    return rows[0] if rows else None
+
+
+def save_login_browser_seen(browser_token_hash, user_agent, ip_address):
+    """現在のブラウザを記録し、初見だった場合はTrueを返す。"""
+    existing = fetch_login_browser_by_hash(browser_token_hash)
+    info = parse_login_client_info(user_agent)
+    now_iso = utc_now_iso()
+    common_payload = {
+        "last_seen_at": now_iso,
+        "last_ip_address": str(ip_address or "")[:200],
+        "last_user_agent": str(user_agent or "")[:1000],
+        "browser_name": info["browser_name"],
+        "os_name": info["os_name"],
+        "device_type": info["device_type"],
+        "updated_at": now_iso,
+    }
+
+    if existing:
+        response = requests.patch(
+            get_login_browsers_url(),
+            headers=get_login_audit_headers(prefer="return=minimal"),
+            params={"id": f"eq.{existing['id']}"},
+            json=common_payload,
+            timeout=LOGIN_AUDIT_REQUEST_TIMEOUT,
+        )
+        if response.status_code not in (200, 204):
+            raise RuntimeError(f"ログインブラウザ更新に失敗しました（{response.status_code}）。")
+        return False
+
+    payload = {
+        "browser_token_hash": browser_token_hash,
+        "first_seen_at": now_iso,
+        "first_ip_address": str(ip_address or "")[:200],
+        "first_user_agent": str(user_agent or "")[:1000],
+        "is_active": True,
+        "is_acknowledged": False,
+        "created_at": now_iso,
+        **common_payload,
+    }
+    response = requests.post(
+        get_login_browsers_url(),
+        headers=get_login_audit_headers(prefer="return=minimal"),
+        json=payload,
+        timeout=LOGIN_AUDIT_REQUEST_TIMEOUT,
+    )
+    if response.status_code == 409:
+        # 同時実行で別処理が先に登録した場合は既存扱いにする。
+        return False
+    if response.status_code not in (200, 201):
+        raise RuntimeError(f"ログインブラウザ登録に失敗しました（{response.status_code}）。")
+    return True
+
+
+def record_login_audit_event(
+    event_key,
+    event_type,
+    claims,
+    browser_token_hash,
+    is_new_browser=False,
+    severity="info",
+    details=None,
+):
+    if not has_login_audit_config():
+        return False
+    user_agent = get_request_user_agent()
+    ip_address = get_request_ip_address()
+    info = parse_login_client_info(user_agent)
+    payload = {
+        "event_key": str(event_key)[:300],
+        "event_type": str(event_type)[:80],
+        "occurred_at": utc_now_iso(),
+        "browser_token_hash": str(browser_token_hash or "")[:128] or None,
+        "microsoft_subject_hash": get_microsoft_subject_hash(claims) or None,
+        "account_label": get_microsoft_account_label(claims),
+        "is_new_browser": bool(is_new_browser),
+        "severity": str(severity or "info")[:30],
+        "ip_address": str(ip_address or "")[:200],
+        "user_agent": str(user_agent or "")[:1000],
+        "browser_name": info["browser_name"],
+        "os_name": info["os_name"],
+        "device_type": info["device_type"],
+        "details": dict(details or {}),
+    }
+    response = requests.post(
+        get_login_events_url(),
+        headers=get_login_audit_headers(
+            prefer="resolution=ignore-duplicates,return=minimal"
+        ),
+        params={"on_conflict": "event_key"},
+        json=payload,
+        timeout=LOGIN_AUDIT_REQUEST_TIMEOUT,
+    )
+    if response.status_code not in (200, 201, 204, 409):
+        raise RuntimeError(f"ログイン履歴保存に失敗しました（{response.status_code}）。")
+    return True
+
+
+def ensure_login_audit_for_current_session(claims, login_payload):
+    """ログイン成功を重複なく記録する。履歴障害でアプリ本体は止めない。"""
+    if not has_login_audit_config():
+        return "ログイン履歴用Supabase設定がありません。"
+
+    event_id = str(dict(login_payload or {}).get("jti") or "").strip()
+    if not event_id:
+        return "ログイン履歴用のセッション識別子を確認できません。"
+
+    session_key = f"login_audit_recorded_{event_id}"
+    if st.session_state.get(session_key):
+        return ""
+
+    try:
+        browser_hash = get_current_browser_token_hash(create_if_missing=True)
+        user_agent = get_request_user_agent()
+        ip_address = get_request_ip_address()
+        is_new_browser = save_login_browser_seen(browser_hash, user_agent, ip_address)
+        record_login_audit_event(
+            event_key=f"login_success:{event_id}",
+            event_type="login_success",
+            claims=claims,
+            browser_token_hash=browser_hash,
+            is_new_browser=is_new_browser,
+            severity="warning" if is_new_browser else "info",
+            details={"authentication": "microsoft_oidc"},
+        )
+        st.session_state[session_key] = True
+        clear_login_audit_caches()
+        if is_new_browser:
+            st.session_state["new_browser_login_notice"] = True
+        return ""
+    except Exception as exc:
+        return str(exc)
+
+
+def record_denied_microsoft_login(claims, reason):
+    """許可外アカウントの到達を記録する。失敗しても拒否処理自体は継続する。"""
+    if not has_login_audit_config():
+        return
+    try:
+        browser_hash = get_current_browser_token_hash(create_if_missing=True)
+        subject_hash = get_microsoft_subject_hash(claims)
+        issued_at = str(dict(claims or {}).get("iat") or "")
+        key_material = f"{subject_hash}:{issued_at}:{browser_hash}:{reason}"
+        event_digest = hashlib.sha256(key_material.encode("utf-8")).hexdigest()
+        record_login_audit_event(
+            event_key=f"account_denied:{event_digest}",
+            event_type="account_denied",
+            claims=claims,
+            browser_token_hash=browser_hash,
+            is_new_browser=False,
+            severity="danger",
+            details={"reason": str(reason or "account_not_allowed")[:100]},
+        )
+        clear_login_audit_caches()
+    except Exception:
+        pass
+
+
+def record_logout_event(claims, login_payload):
+    if not has_login_audit_config():
+        return
+    try:
+        event_id = str(dict(login_payload or {}).get("jti") or "").strip()
+        if not event_id:
+            return
+        browser_hash = get_current_browser_token_hash(create_if_missing=False)
+        record_login_audit_event(
+            event_key=f"logout:{event_id}",
+            event_type="logout",
+            claims=claims,
+            browser_token_hash=browser_hash,
+            severity="info",
+        )
+        clear_login_audit_caches()
+    except Exception:
+        pass
+
+
+def clear_login_audit_caches():
+    for cached_function_name in (
+        "load_login_browsers_from_supabase",
+        "load_login_events_from_supabase",
+    ):
+        cached_function = globals().get(cached_function_name)
+        if cached_function is not None and hasattr(cached_function, "clear"):
+            try:
+                cached_function.clear()
+            except Exception:
+                pass
 
 def set_query_params_after_onedrive_auth(
     login_token,
@@ -1944,7 +2341,7 @@ remove_obsolete_login_query_params()
 
 
 # =========================
-# Microsoftログイン認証（v51テスト版）
+# Microsoftログイン認証（v52：履歴・新規ブラウザ通知）
 # =========================
 if "authenticated" not in st.session_state:
     st.session_state.authenticated = False
@@ -2009,6 +2406,7 @@ if not MICROSOFT_ALLOWED_SUB:
     st.stop()
 
 if not hmac.compare_digest(microsoft_sub, MICROSOFT_ALLOWED_SUB):
+    record_denied_microsoft_login(microsoft_claims, "account_not_allowed")
     clear_application_login_state(revoke_current=False)
     st.title("⛔ ログインできません")
     st.error("このMicrosoftアカウントは、取引先カルテの許可アカウントではありません。")
@@ -2054,6 +2452,13 @@ if not active_login_payload:
     st.session_state["microsoft_force_logout"] = True
     set_query_params_safely({"page": "home", "auth_invalid": "1"})
     st.rerun()
+
+login_audit_warning = ensure_login_audit_for_current_session(
+    microsoft_claims,
+    active_login_payload,
+)
+if login_audit_warning:
+    st.session_state["login_audit_warning"] = login_audit_warning
 
 enforce_login_expiry()
 
@@ -8405,6 +8810,7 @@ def sync_page_from_query_params():
         "attachment_search",
         "estimates",
         "data_backup",
+        "login_history",
     }
 
     raw_page = str(get_query_value("page", "")).strip()
@@ -15256,6 +15662,210 @@ def show_trade_notes_page():
             render_note_delete_controls(note)
 
 
+
+@st.cache_data(ttl=15, show_spinner=False)
+def load_login_browsers_from_supabase():
+    if not has_login_audit_config():
+        return []
+    response = requests.get(
+        get_login_browsers_url(),
+        headers=get_login_audit_headers(),
+        params={
+            "select": (
+                "id,browser_token_hash,first_seen_at,last_seen_at,first_ip_address,"
+                "last_ip_address,browser_name,os_name,device_type,is_active,"
+                "is_acknowledged,acknowledged_at"
+            ),
+            "order": "last_seen_at.desc",
+            "limit": "100",
+        },
+        timeout=LOGIN_AUDIT_REQUEST_TIMEOUT,
+    )
+    if response.status_code != 200:
+        raise RuntimeError(f"ログインブラウザ一覧を取得できませんでした（{response.status_code}）。")
+    return response.json() or []
+
+
+@st.cache_data(ttl=15, show_spinner=False)
+def load_login_events_from_supabase(limit=LOGIN_HISTORY_PAGE_SIZE):
+    if not has_login_audit_config():
+        return []
+    safe_limit = max(1, min(int(limit), 300))
+    response = requests.get(
+        get_login_events_url(),
+        headers=get_login_audit_headers(),
+        params={
+            "select": (
+                "id,event_type,occurred_at,account_label,is_new_browser,severity,"
+                "ip_address,browser_name,os_name,device_type,details"
+            ),
+            "order": "occurred_at.desc",
+            "limit": str(safe_limit),
+        },
+        timeout=LOGIN_AUDIT_REQUEST_TIMEOUT,
+    )
+    if response.status_code != 200:
+        raise RuntimeError(f"ログイン履歴を取得できませんでした（{response.status_code}）。")
+    return response.json() or []
+
+
+def get_unacknowledged_login_browser_count():
+    try:
+        return sum(
+            1
+            for item in load_login_browsers_from_supabase()
+            if bool(item.get("is_active", True)) and not bool(item.get("is_acknowledged"))
+        )
+    except Exception:
+        return 0
+
+
+def acknowledge_login_browser(browser_id):
+    response = requests.patch(
+        get_login_browsers_url(),
+        headers=get_login_audit_headers(prefer="return=minimal"),
+        params={"id": f"eq.{browser_id}"},
+        json={
+            "is_acknowledged": True,
+            "acknowledged_at": utc_now_iso(),
+            "updated_at": utc_now_iso(),
+        },
+        timeout=LOGIN_AUDIT_REQUEST_TIMEOUT,
+    )
+    if response.status_code not in (200, 204):
+        raise RuntimeError(f"確認済みに変更できませんでした（{response.status_code}）。")
+    clear_login_audit_caches()
+
+
+def acknowledge_all_login_browsers():
+    response = requests.patch(
+        get_login_browsers_url(),
+        headers=get_login_audit_headers(prefer="return=minimal"),
+        params={"is_acknowledged": "eq.false"},
+        json={
+            "is_acknowledged": True,
+            "acknowledged_at": utc_now_iso(),
+            "updated_at": utc_now_iso(),
+        },
+        timeout=LOGIN_AUDIT_REQUEST_TIMEOUT,
+    )
+    if response.status_code not in (200, 204):
+        raise RuntimeError(f"一括確認済みに変更できませんでした（{response.status_code}）。")
+    clear_login_audit_caches()
+
+
+def format_login_event_name(event_type):
+    labels = {
+        "login_success": "ログイン成功",
+        "account_denied": "許可外アカウントを拒否",
+        "logout": "ログアウト",
+    }
+    return labels.get(str(event_type or ""), str(event_type or "不明な操作"))
+
+
+def format_login_client_summary(item):
+    browser = str(item.get("browser_name") or "不明なブラウザ")
+    os_name = str(item.get("os_name") or "不明なOS")
+    device = str(item.get("device_type") or "不明な端末")
+    return f"{device}・{os_name}・{browser}"
+
+
+def show_login_history_page():
+    show_top_home_link()
+    st.header("🔐 ログイン履歴")
+    st.caption("Microsoft認証後に取引先カルテへ到達したログインを記録します。IPアドレスは参考表示で、本人判定には使いません。")
+
+    if not has_login_audit_config():
+        st.error("ログイン履歴にはSupabaseの管理用Secret KeyまたはService Role Keyが必要です。")
+        return
+
+    try:
+        browsers = load_login_browsers_from_supabase()
+        events = load_login_events_from_supabase()
+    except Exception as exc:
+        st.error(f"ログイン履歴を読み込めませんでした：{exc}")
+        st.info("先に app_login_browsers と app_login_events のSQLをSupabaseで実行してください。")
+        return
+
+    unacknowledged = [
+        item
+        for item in browsers
+        if bool(item.get("is_active", True)) and not bool(item.get("is_acknowledged"))
+    ]
+    if unacknowledged:
+        st.warning(f"未確認の新しいブラウザが {len(unacknowledged)} 件あります。")
+        if st.button("すべて確認済みにする", type="primary", use_container_width=True):
+            try:
+                acknowledge_all_login_browsers()
+                st.success("すべて確認済みにしました。")
+                st.rerun()
+            except Exception as exc:
+                st.error(f"更新できませんでした：{exc}")
+    else:
+        st.success("未確認の新しいブラウザはありません。")
+
+    current_browser_hash = get_current_browser_token_hash(create_if_missing=False)
+
+    st.markdown("### ブラウザ一覧")
+    if not browsers:
+        st.info("ブラウザ履歴はまだありません。")
+    for item in browsers:
+        browser_id = item.get("id")
+        is_current = bool(
+            current_browser_hash
+            and hmac.compare_digest(
+                str(item.get("browser_token_hash") or ""),
+                current_browser_hash,
+            )
+        )
+        is_acknowledged = bool(item.get("is_acknowledged"))
+        title = format_login_client_summary(item)
+        if is_current:
+            title += "（現在のブラウザ）"
+        with st.container(border=True):
+            st.markdown(f"**{html.escape(title)}**")
+            st.write(f"初回：{format_note_datetime(item.get('first_seen_at'))}")
+            st.write(f"最終アクセス：{format_note_datetime(item.get('last_seen_at'))}")
+            st.write(f"最終IP：{html.escape(str(item.get('last_ip_address') or '取得できません'))}")
+            if is_acknowledged:
+                st.caption("確認済み")
+            elif st.button(
+                "このブラウザを確認済みにする",
+                key=f"ack_login_browser_{browser_id}",
+                use_container_width=True,
+            ):
+                try:
+                    acknowledge_login_browser(browser_id)
+                    st.success("確認済みにしました。")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"更新できませんでした：{exc}")
+
+    st.markdown("### 最新のログイン履歴")
+    if not events:
+        st.info("ログイン履歴はまだありません。")
+        return
+
+    for event in events:
+        event_name = format_login_event_name(event.get("event_type"))
+        occurred_at = format_note_datetime(event.get("occurred_at"))
+        client_summary = format_login_client_summary(event)
+        new_label = "・新しいブラウザ" if event.get("is_new_browser") else ""
+        with st.container(border=True):
+            if event.get("event_type") == "account_denied":
+                st.error(f"{event_name}{new_label}")
+            elif event.get("is_new_browser"):
+                st.warning(f"{event_name}{new_label}")
+            else:
+                st.markdown(f"**{event_name}**")
+            st.write(f"日時：{occurred_at}")
+            st.write(f"端末：{html.escape(client_summary)}")
+            st.write(f"IP：{html.escape(str(event.get('ip_address') or '取得できません'))}")
+            account_label = str(event.get("account_label") or "").strip()
+            if account_label:
+                st.caption(f"Microsoftアカウント表示名：{account_label}")
+
+
 def show_top_home():
     st.subheader("取引先を選択")
     col1, col2 = st.columns(2)
@@ -15273,9 +15883,15 @@ def show_top_home():
         st.markdown(render_page_link("🔎 写真・資料検索", page="attachment_search"), unsafe_allow_html=True)
     with col6:
         st.markdown(render_page_link("🕘 配車変更確認", page="change_history"), unsafe_allow_html=True)
-    col7, _ = st.columns(2)
+    col7, col8 = st.columns(2)
     with col7:
         st.markdown(render_page_link("📄 商品見積り履歴", page="estimates"), unsafe_allow_html=True)
+    with col8:
+        alert_count = get_unacknowledged_login_browser_count()
+        label = "🔐 ログイン履歴"
+        if alert_count:
+            label += f"（未確認 {alert_count}）"
+        st.markdown(render_page_link(label, page="login_history"), unsafe_allow_html=True)
 
 
 # =========================
@@ -16005,6 +16621,14 @@ with st.sidebar:
         st.markdown(render_page_link("💰 運賃比較", page="carrier_freight_compare"), unsafe_allow_html=True)
 
     st.markdown("---")
+    sidebar_login_alert_count = get_unacknowledged_login_browser_count()
+    sidebar_login_label = "🔐 ログイン履歴"
+    if sidebar_login_alert_count:
+        sidebar_login_label += f"（未確認 {sidebar_login_alert_count}）"
+    st.markdown(
+        render_page_link(sidebar_login_label, page="login_history"),
+        unsafe_allow_html=True,
+    )
     st.markdown(
         render_page_link("📦 全データバックアップ", page="data_backup"),
         unsafe_allow_html=True,
@@ -16020,6 +16644,7 @@ with col_title:
 with col_logout:
     st.write("")
     if st.button("ログアウト"):
+        record_logout_event(microsoft_claims, active_login_payload)
         clear_application_login_state(revoke_current=True)
         st.session_state.page = "home"
         st.session_state.selected_customer = None
@@ -16029,6 +16654,26 @@ with col_logout:
         set_query_params_safely({"page": "home", "logout": "1"})
         st.logout()
         st.stop()
+
+login_audit_warning = st.session_state.pop("login_audit_warning", None)
+if login_audit_warning:
+    st.warning(
+        "ログイン自体は成功しましたが、ログイン履歴を保存できませんでした。"
+        f" 詳細：{login_audit_warning}"
+    )
+
+new_browser_notice = bool(st.session_state.pop("new_browser_login_notice", False))
+login_security_alert_count = get_unacknowledged_login_browser_count()
+if new_browser_notice:
+    st.warning("このブラウザからの初回ログインを記録しました。ログイン履歴で確認してください。")
+if login_security_alert_count:
+    st.markdown(
+        render_page_link(
+            f"🔐 未確認の新しいブラウザが {login_security_alert_count} 件あります",
+            page="login_history",
+        ),
+        unsafe_allow_html=True,
+    )
 
 history_warning = st.session_state.pop("change_history_warning", None)
 if history_warning:
@@ -16046,6 +16691,7 @@ pages_with_existing_top_link = {
     "supplier_home",
     "carrier_home",
     "trade_notes",
+    "login_history",
 }
 if current_page != "home" and current_page not in pages_with_existing_top_link:
     show_top_home_link()
@@ -16101,6 +16747,9 @@ try:
 
     elif st.session_state["page"] == "data_backup":
         show_full_data_backup_page()
+
+    elif st.session_state["page"] == "login_history":
+        show_login_history_page()
 
     elif st.session_state["page"] == "detail":
         selected = st.session_state.get("selected_customer")
