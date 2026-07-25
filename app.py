@@ -14070,7 +14070,7 @@ def save_trade_partner_workbook(mutator):
         metadata = get_dropbox_file_metadata(target_path, access_token)
     verify_dropbox_file_metadata(metadata, saved_content, previous_revision=revision)
     trim_trade_partner_backups(access_token, keep=30)
-    st.cache_data.clear()
+    load_trade_partner_data.clear()
     return result
 
 def trade_partner_input_value(header, value):
