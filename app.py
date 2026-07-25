@@ -145,8 +145,20 @@ SHEET1_CUSTOMER_COLUMN = 2   # B列：顧客名
 SHEET1_HIRAGANA_COLUMN = 9   # I列：ひらがな
 SHEET1_ADDRESS_COLUMN = 10   # J列：住所
 SHEET1_MAP_COLUMN = 11       # K列：マップ位置
+# v50までの共通パスワード設定はSecretsに残っていてもよいが、v51では認証に使用しない。
 APP_PASSWORD = st.secrets.get("APP_PASSWORD", "")
 LOGIN_TOKEN_SECRET = str(st.secrets.get("LOGIN_TOKEN_SECRET", "") or "").strip()
+try:
+    APP_AUTH_SETTINGS = st.secrets.get("app_auth", {})
+except Exception:
+    APP_AUTH_SETTINGS = {}
+MICROSOFT_ALLOWED_SUB = str(
+    APP_AUTH_SETTINGS.get("allowed_sub", "")
+    or st.secrets.get("MICROSOFT_ALLOWED_SUB", "")
+    or ""
+).strip()
+MICROSOFT_ISSUER_PREFIX = "https://login.microsoftonline.com/"
+MICROSOFT_AUTH_CLOCK_SKEW_SECONDS = 60
 LOGIN_TOKEN_COOKIE_KEY = "signed_login_token"
 LOGIN_TOKEN_COOKIE_PREFIX = "aoyama-kokyaku/login/"
 LOGIN_TOKEN_TTL_SECONDS = 3 * 60 * 60
@@ -693,15 +705,89 @@ def set_query_params_safely(params):
         st.experimental_set_query_params(**clean_params)
 
 
-@st.fragment(run_every="10s")
-def enforce_login_expiry():
-    """操作がなくても3時間経過後にフルアプリをログイン画面へ戻す。"""
-    token = str(st.session_state.get("login_token", "") or "").strip()
-    if validate_login_token(token):
-        return
+def get_microsoft_user_claims():
+    """Streamlitが検証したMicrosoft OIDCのユーザー情報を辞書で返す。"""
+    try:
+        if hasattr(st.user, "to_dict"):
+            claims = st.user.to_dict()
+        else:
+            claims = dict(st.user)
+    except Exception:
+        return {}
+    return dict(claims or {})
 
+
+def get_configured_auth_client_id():
+    """[auth] に設定されたログイン専用MicrosoftアプリのClient IDを返す。"""
+    try:
+        auth_settings = st.secrets.get("auth", {})
+        return str(auth_settings.get("client_id", "") or "").strip()
+    except Exception:
+        return ""
+
+
+def validate_microsoft_identity(claims, require_allowed_sub=True):
+    """Microsoftログイン情報を確認し、問題がある場合だけ理由コードを返す。"""
+    data = dict(claims or {})
+    if not bool(data.get("is_logged_in")):
+        return "not_logged_in"
+
+    subject = str(data.get("sub") or "").strip()
+    issuer = str(data.get("iss") or "").strip()
+    audience = str(data.get("aud") or "").strip()
+    configured_client_id = get_configured_auth_client_id()
+
+    if not subject:
+        return "missing_sub"
+    if not issuer.startswith(MICROSOFT_ISSUER_PREFIX):
+        return "invalid_issuer"
+    if not audience or not configured_client_id:
+        return "missing_audience"
+    if not hmac.compare_digest(audience, configured_client_id):
+        return "invalid_audience"
+    if require_allowed_sub and not MICROSOFT_ALLOWED_SUB:
+        return "allowed_sub_not_configured"
+    if MICROSOFT_ALLOWED_SUB and not hmac.compare_digest(subject, MICROSOFT_ALLOWED_SUB):
+        return "account_not_allowed"
+    return ""
+
+
+def microsoft_auth_seconds_remaining(claims, now=None):
+    """Microsoftログイン開始から、アプリ側の3時間期限までの残り秒数を返す。"""
+    try:
+        issued_at = int(dict(claims or {}).get("iat"))
+    except (TypeError, ValueError):
+        return -1
+    current_time = int(time.time() if now is None else now)
+    if issued_at > current_time + MICROSOFT_AUTH_CLOCK_SKEW_SECONDS:
+        return -1
+    return issued_at + LOGIN_TOKEN_TTL_SECONDS - current_time
+
+
+def is_microsoft_auth_current(claims, now=None):
+    return microsoft_auth_seconds_remaining(claims, now=now) > 0
+
+
+def clear_application_login_state(revoke_current=True):
+    """独自の3時間トークンと画面内ログイン状態をまとめて消す。"""
+    if revoke_current:
+        revoke_login_token(get_active_login_token())
+    clear_login_token_cookie()
     st.session_state.authenticated = False
     st.session_state.pop("login_token", None)
+
+
+@st.fragment(run_every="10s")
+def enforce_login_expiry():
+    """Microsoft認証または独自トークンが切れたら、Microsoftログアウトへ進める。"""
+    claims = get_microsoft_user_claims()
+    token = str(st.session_state.get("login_token", "") or "").strip()
+    identity_error = validate_microsoft_identity(claims, require_allowed_sub=True)
+    if not identity_error and is_microsoft_auth_current(claims) and validate_login_token(token):
+        return
+
+    clear_application_login_state(revoke_current=True)
+    st.session_state["microsoft_force_logout"] = True
     set_query_params_safely({"page": "home", "expired": "1"})
     st.rerun()
 
@@ -1856,15 +1942,89 @@ def confirm_onedrive_attachment_delete_dialog(
 # 旧URL認証情報は無視して削除する。
 remove_obsolete_login_query_params()
 
-# Microsoftから戻った時は、保存済みの署名付きログインを検証してから認証を完了する。
-process_onedrive_callback_if_present()
-
 
 # =========================
-# ログイン認証
+# Microsoftログイン認証（v51テスト版）
 # =========================
 if "authenticated" not in st.session_state:
     st.session_state.authenticated = False
+
+microsoft_claims = get_microsoft_user_claims()
+microsoft_is_logged_in = bool(microsoft_claims.get("is_logged_in"))
+
+# 期限切れを検知したフラグがある場合は、OIDC Cookieも削除してログイン画面へ戻す。
+if st.session_state.pop("microsoft_force_logout", False):
+    clear_application_login_state(revoke_current=True)
+    st.logout()
+    st.stop()
+
+if not microsoft_is_logged_in:
+    # v50のパスワード認証Cookieだけが残っていても、Microsoft認証なしでは入れない。
+    clear_application_login_state(revoke_current=False)
+    st.title("🔒 取引先カルテ")
+    st.write("Microsoftアカウントで本人確認してから開きます。")
+    st.caption("この画面では顧客情報・取引先情報・Dropbox・WATER itのデータを読み込みません。")
+
+    if not LOGIN_TOKEN_SECRET:
+        st.error("LOGIN_TOKEN_SECRET が設定されていません。既存のSecrets設定を確認してください。")
+        st.stop()
+
+    if st.button("Microsoftでログイン", type="primary", use_container_width=True):
+        try:
+            st.login()
+        except Exception as exc:
+            st.error("Microsoftログインを開始できませんでした。[auth]設定とrequirements.txtを確認してください。")
+            st.exception(exc)
+    st.stop()
+
+identity_error = validate_microsoft_identity(microsoft_claims, require_allowed_sub=False)
+if identity_error:
+    clear_application_login_state(revoke_current=False)
+    st.title("🔒 取引先カルテ")
+    st.error("Microsoftのログイン情報を安全に確認できなかったため、アプリを表示しません。")
+    st.caption(f"確認コード: {identity_error}")
+    if st.button("Microsoftからログアウト", use_container_width=True):
+        st.logout()
+    st.stop()
+
+microsoft_sub = str(microsoft_claims.get("sub") or "").strip()
+microsoft_account_name = str(
+    microsoft_claims.get("preferred_username")
+    or microsoft_claims.get("email")
+    or microsoft_claims.get("name")
+    or "Microsoftアカウント"
+).strip()
+
+# 初回だけ、本人のsubを確認してSecretsへ登録する。登録されるまではアプリデータを表示しない。
+if not MICROSOFT_ALLOWED_SUB:
+    clear_application_login_state(revoke_current=False)
+    st.title("🔐 Microsoftログイン 初回確認")
+    st.success(f"Microsoftへのログインに成功しました：{microsoft_account_name}")
+    st.warning("まだ許可アカウントが登録されていないため、取引先カルテ本体は表示していません。")
+    st.write("下の2行をStreamlit CloudのSecretsの一番下へ追加してください。")
+    st.code(f'[app_auth]\nallowed_sub = "{microsoft_sub}"', language="toml")
+    st.caption("この識別子はパスワードやトークンではありません。このMicrosoftログイン専用アプリ内で、本人のアカウントを限定するために使います。")
+    if st.button("Microsoftからログアウト", use_container_width=True):
+        st.logout()
+    st.stop()
+
+if not hmac.compare_digest(microsoft_sub, MICROSOFT_ALLOWED_SUB):
+    clear_application_login_state(revoke_current=False)
+    st.title("⛔ ログインできません")
+    st.error("このMicrosoftアカウントは、取引先カルテの許可アカウントではありません。")
+    st.caption(f"ログイン中のアカウント：{microsoft_account_name}")
+    if st.button("別のMicrosoftアカウントでやり直す", type="primary", use_container_width=True):
+        st.logout()
+    st.stop()
+
+if not is_microsoft_auth_current(microsoft_claims):
+    clear_application_login_state(revoke_current=True)
+    st.warning("取引先カルテの3時間のログイン期限が切れました。もう一度Microsoftでログインしてください。")
+    st.logout()
+    st.stop()
+
+# OneDrive認証から戻った場合も、許可されたMicrosoftアカウントを確認した後で処理する。
+process_onedrive_callback_if_present()
 
 cookie_login_token = get_login_token_from_cookie()
 login_token_payload = validate_login_token(cookie_login_token)
@@ -1872,66 +2032,26 @@ login_token_payload = validate_login_token(cookie_login_token)
 if cookie_login_token and not login_token_payload:
     clear_login_token_cookie()
 
+if not login_token_payload:
+    # Microsoft本人確認が成功した時だけ、既存処理用の3時間トークンを発行する。
+    cookie_login_token = create_login_token()
+    save_login_token_cookie(cookie_login_token)
+    login_token_payload = validate_login_token(cookie_login_token)
+
 if login_token_payload:
     st.session_state.authenticated = True
     st.session_state["login_token"] = cookie_login_token
 else:
-    st.session_state.authenticated = False
-    st.session_state.pop("login_token", None)
-
-if not st.session_state.authenticated:
-    st.title("🔒 取引先カルテ")
-
-    # ログイン画面は下の共通CSSより前に停止するため、パスワード欄の枠線だけここで指定する。
-    st.markdown(
-        """
-        <style>
-        div[data-testid="stTextInputRootElement"],
-        div[data-baseweb="input"] {
-            border: 1px solid rgba(15, 23, 42, 0.28) !important;
-            border-radius: 14px !important;
-            background: #ffffff !important;
-        }
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    if not APP_PASSWORD:
-        st.error("APP_PASSWORD が設定されていません。Streamlit Cloud の Secrets に APP_PASSWORD を追加してください。")
-        st.stop()
-    if not LOGIN_TOKEN_SECRET:
-        st.error("LOGIN_TOKEN_SECRET が設定されていません。APP_PASSWORDとは別の長いランダム文字列をSecretsに追加してください。")
-        st.stop()
-    if hmac.compare_digest(LOGIN_TOKEN_SECRET, str(APP_PASSWORD)):
-        st.error("LOGIN_TOKEN_SECRET はAPP_PASSWORDと別の値にしてください。")
-        st.stop()
-
-    password = st.text_input("パスワード", type="password")
-
-    if st.button("ログイン"):
-        if hmac.compare_digest(str(password), str(APP_PASSWORD)):
-            login_token = create_login_token()
-            save_login_token_cookie(login_token)
-            st.session_state.authenticated = True
-            st.session_state["login_token"] = login_token
-            st.session_state.page = "home"
-            st.session_state.selected_customer = None
-            st.session_state.pop("customer_search_input", None)
-            st.session_state.pop("customer_search_live", None)
-            set_query_params_safely({"page": "home"})
-            st.rerun()
-        else:
-            st.error("パスワードが違います。")
-
+    clear_application_login_state(revoke_current=False)
+    st.error("ログイン状態を安全に保存できませんでした。")
+    st.logout()
     st.stop()
 
 active_login_token = get_active_login_token()
 active_login_payload = validate_login_token(active_login_token)
 if not active_login_payload:
-    st.session_state.authenticated = False
-    st.session_state.pop("login_token", None)
-    clear_login_token_cookie()
+    clear_application_login_state(revoke_current=True)
+    st.session_state["microsoft_force_logout"] = True
     set_query_params_safely({"page": "home", "auth_invalid": "1"})
     st.rerun()
 
@@ -15900,17 +16020,15 @@ with col_title:
 with col_logout:
     st.write("")
     if st.button("ログアウト"):
-        revoke_login_token(get_active_login_token())
-        clear_login_token_cookie()
-        st.session_state.authenticated = False
-        st.session_state.pop("login_token", None)
+        clear_application_login_state(revoke_current=True)
         st.session_state.page = "home"
         st.session_state.selected_customer = None
         st.session_state.selected_partner_id = None
         st.session_state.selected_partner_type = None
         clear_onedrive_auth_state()
         set_query_params_safely({"page": "home", "logout": "1"})
-        st.rerun()
+        st.logout()
+        st.stop()
 
 history_warning = st.session_state.pop("change_history_warning", None)
 if history_warning:
