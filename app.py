@@ -34,6 +34,11 @@ try:
 except ImportError:
     st_keyup = None
 
+try:
+    from streamlit_cookies_manager import EncryptedCookieManager
+except ImportError:
+    EncryptedCookieManager = None
+
 
 # =========================
 # 基本設定
@@ -142,12 +147,26 @@ SHEET1_ADDRESS_COLUMN = 10   # J列：住所
 SHEET1_MAP_COLUMN = 11       # K列：マップ位置
 APP_PASSWORD = st.secrets.get("APP_PASSWORD", "")
 LOGIN_TOKEN_SECRET = str(st.secrets.get("LOGIN_TOKEN_SECRET", "") or "").strip()
-LOGIN_TOKEN_QUERY_PARAM = "auth"
-LOGIN_TOKEN_STORAGE_KEY = "aoyama_login_token_v1"
+LOGIN_TOKEN_COOKIE_KEY = "signed_login_token"
+LOGIN_TOKEN_COOKIE_PREFIX = "aoyama-kokyaku/login/"
 LOGIN_TOKEN_TTL_SECONDS = 3 * 60 * 60
 LOGIN_TOKEN_VERSION = 1
 LOGIN_TOKEN_AUDIENCE = "aoyama-kokyaku"
 LOGIN_TOKEN_CLOCK_SKEW_SECONDS = 30
+
+if EncryptedCookieManager is None:
+    st.error(
+        "ログイン用Cookie機能が読み込めません。requirements.txt に "
+        "streamlit-cookies-manager-v2==0.3.1 を追加してください。"
+    )
+    st.stop()
+
+LOGIN_COOKIES = EncryptedCookieManager(
+    prefix=LOGIN_TOKEN_COOKIE_PREFIX,
+    password=LOGIN_TOKEN_SECRET or "__LOGIN_TOKEN_SECRET_NOT_CONFIGURED__",
+)
+if not LOGIN_COOKIES.ready():
+    st.stop()
 SUPABASE_URL = st.secrets.get("SUPABASE_URL", "")
 SUPABASE_SECRET_KEY = st.secrets.get("SUPABASE_SECRET_KEY", "")
 SUPABASE_SERVICE_ROLE_KEY = st.secrets.get("SUPABASE_SERVICE_ROLE_KEY", "")
@@ -602,18 +621,60 @@ def revoke_login_token(token):
         store["items"][token_id] = expires_at
 
 
-def get_login_token_from_query():
-    return str(get_raw_query_params().get(LOGIN_TOKEN_QUERY_PARAM, "") or "").strip()
+def get_login_token_from_cookie():
+    """暗号化Cookieから署名付きログイントークンを読む。"""
+    try:
+        return str(LOGIN_COOKIES.get(LOGIN_TOKEN_COOKIE_KEY, "") or "").strip()
+    except Exception:
+        return ""
+
+
+def save_login_token_cookie(token):
+    """署名付きログイントークンをブラウザの永続Cookieへ保存する。"""
+    token_text = str(token or "").strip()
+    if not validate_login_token(token_text):
+        raise RuntimeError("有効なログイントークンを保存できません。")
+    LOGIN_COOKIES[LOGIN_TOKEN_COOKIE_KEY] = token_text
+    LOGIN_COOKIES.save()
+
+
+def clear_login_token_cookie():
+    """ログインCookieを即時削除する。"""
+    try:
+        del LOGIN_COOKIES[LOGIN_TOKEN_COOKIE_KEY]
+    except KeyError:
+        pass
+    except Exception:
+        try:
+            LOGIN_COOKIES[LOGIN_TOKEN_COOKIE_KEY] = ""
+        except Exception:
+            return
+    try:
+        LOGIN_COOKIES.save()
+    except Exception:
+        pass
+
+
+def remove_obsolete_login_query_params():
+    """旧 logged_in=1 と v49 の auth パラメータを認証に使わずURLから除く。"""
+    try:
+        for key in ("logged_in", "auth"):
+            if key in st.query_params:
+                del st.query_params[key]
+    except Exception:
+        pass
 
 
 def get_active_login_token():
     session_token = str(st.session_state.get("login_token", "") or "").strip()
     if validate_login_token(session_token):
         return session_token
-    query_token = get_login_token_from_query()
-    if validate_login_token(query_token):
-        st.session_state["login_token"] = query_token
-        return query_token
+
+    cookie_token = get_login_token_from_cookie()
+    if validate_login_token(cookie_token):
+        st.session_state["login_token"] = cookie_token
+        return cookie_token
+
     st.session_state.pop("login_token", None)
     return ""
 
@@ -632,111 +693,17 @@ def set_query_params_safely(params):
         st.experimental_set_query_params(**clean_params)
 
 
-def render_login_browser_storage(token="", expires_at=None, clear=False):
-    """ブラウザ再起動用に署名済みトークンをlocalStorageへ保存・削除する。"""
-    token_text = str(token or "")
-    try:
-        expiry_value = int(expires_at or 0)
-    except (TypeError, ValueError):
-        expiry_value = 0
-    components.html(
-        f"""
-        <script>
-        (() => {{
-          const parentWindow = window.parent;
-          const storageKey = {json.dumps(LOGIN_TOKEN_STORAGE_KEY)};
-          const token = {json.dumps(token_text)};
-          const expiresAt = {expiry_value};
-          const shouldClear = {str(bool(clear)).lower()};
-          try {{
-            if (shouldClear) {{
-              parentWindow.localStorage.removeItem(storageKey);
-            }} else if (token && expiresAt > 0) {{
-              parentWindow.localStorage.setItem(
-                storageKey,
-                JSON.stringify({{token: token, exp: expiresAt}})
-              );
-            }}
-          }} catch (_) {{}}
-        }})();
-        </script>
-        """,
-        height=1,
-        width=1,
-        scrolling=False,
-    )
-
-
-def render_login_browser_restore():
-    """URLにトークンがない時だけ、3時間以内のブラウザ保存トークンを復元する。"""
-    components.html(
-        f"""
-        <script>
-        (() => {{
-          const parentWindow = window.parent;
-          const storageKey = {json.dumps(LOGIN_TOKEN_STORAGE_KEY)};
-          const tokenParam = {json.dumps(LOGIN_TOKEN_QUERY_PARAM)};
-          try {{
-            const url = new URL(parentWindow.location.href);
-            if (url.searchParams.get(tokenParam)) return;
-            const raw = parentWindow.localStorage.getItem(storageKey);
-            if (!raw) return;
-            const saved = JSON.parse(raw);
-            const token = String(saved.token || '');
-            const expiresAt = Number(saved.exp || 0);
-            if (!token || !Number.isFinite(expiresAt) || Date.now() >= expiresAt * 1000) {{
-              parentWindow.localStorage.removeItem(storageKey);
-              return;
-            }}
-            url.searchParams.delete('logout');
-            url.searchParams.delete('auth_invalid');
-            if (!url.searchParams.get('page')) url.searchParams.set('page', 'home');
-            url.searchParams.set(tokenParam, token);
-            parentWindow.location.replace(url.pathname + '?' + url.searchParams.toString());
-          }} catch (_) {{}}
-        }})();
-        </script>
-        """,
-        height=1,
-        width=1,
-        scrolling=False,
-    )
-
-
-def render_login_expiry_watcher(expires_at):
-    """画面を操作していなくても、ログイン成功から3時間でログイン画面へ戻す。"""
-    try:
-        expiry_ms = int(expires_at) * 1000
-    except (TypeError, ValueError):
+@st.fragment(run_every="10s")
+def enforce_login_expiry():
+    """操作がなくても3時間経過後にフルアプリをログイン画面へ戻す。"""
+    token = str(st.session_state.get("login_token", "") or "").strip()
+    if validate_login_token(token):
         return
-    components.html(
-        f"""
-        <script>
-        (() => {{
-          const parentWindow = window.parent;
-          const storageKey = {json.dumps(LOGIN_TOKEN_STORAGE_KEY)};
-          const timerKey = '__aoyama_login_expiry_timer_v1';
-          const expiresAt = {expiry_ms};
-          if (parentWindow[timerKey]) {{
-            parentWindow.clearTimeout(parentWindow[timerKey]);
-          }}
-          const expireLogin = () => {{
-            try {{ parentWindow.localStorage.removeItem(storageKey); }} catch (_) {{}}
-            const url = new URL(parentWindow.location.href);
-            url.search = '';
-            url.searchParams.set('page', 'home');
-            url.searchParams.set('expired', '1');
-            parentWindow.location.replace(url.pathname + '?' + url.searchParams.toString());
-          }};
-          const delay = Math.max(0, expiresAt - Date.now() + 150);
-          parentWindow[timerKey] = parentWindow.setTimeout(expireLogin, delay);
-        }})();
-        </script>
-        """,
-        height=1,
-        width=1,
-        scrolling=False,
-    )
+
+    st.session_state.authenticated = False
+    st.session_state.pop("login_token", None)
+    set_query_params_safely({"page": "home", "expired": "1"})
+    st.rerun()
 
 
 def set_query_params_after_onedrive_auth(
@@ -750,7 +717,6 @@ def set_query_params_after_onedrive_auth(
     if not validate_login_token(token_text):
         raise RuntimeError("ログイン期限が切れています。もう一度ログインしてください。")
     params = {
-        LOGIN_TOKEN_QUERY_PARAM: token_text,
         "page": str(page or "home"),
     }
     if customer:
@@ -899,6 +865,7 @@ def process_onedrive_callback_if_present():
     if not pending or not login_payload:
         st.session_state.authenticated = False
         st.session_state.pop("login_token", None)
+        clear_login_token_cookie()
         set_query_params_safely({"page": "home", "auth_invalid": "1"})
         st.rerun()
 
@@ -909,6 +876,7 @@ def process_onedrive_callback_if_present():
 
     st.session_state.authenticated = True
     st.session_state["login_token"] = login_token
+    save_login_token_cookie(login_token)
     st.session_state["page"] = return_page
     st.session_state["selected_customer"] = customer_name if return_page == "detail" else None
     if return_page == "partner_detail":
@@ -1885,6 +1853,9 @@ def confirm_onedrive_attachment_delete_dialog(
             st.rerun()
 
 
+# 旧URL認証情報は無視して削除する。
+remove_obsolete_login_query_params()
+
 # Microsoftから戻った時は、保存済みの署名付きログインを検証してから認証を完了する。
 process_onedrive_callback_if_present()
 
@@ -1895,19 +1866,15 @@ process_onedrive_callback_if_present()
 if "authenticated" not in st.session_state:
     st.session_state.authenticated = False
 
-raw_login_params = get_raw_query_params()
-query_login_token = str(raw_login_params.get(LOGIN_TOKEN_QUERY_PARAM, "") or "").strip()
-login_token_payload = validate_login_token(query_login_token)
+cookie_login_token = get_login_token_from_cookie()
+login_token_payload = validate_login_token(cookie_login_token)
 
-if query_login_token and not login_token_payload:
-    st.session_state.authenticated = False
-    st.session_state.pop("login_token", None)
-    set_query_params_safely({"page": "home", "auth_invalid": "1"})
-    st.rerun()
+if cookie_login_token and not login_token_payload:
+    clear_login_token_cookie()
 
 if login_token_payload:
     st.session_state.authenticated = True
-    st.session_state["login_token"] = query_login_token
+    st.session_state["login_token"] = cookie_login_token
 else:
     st.session_state.authenticated = False
     st.session_state.pop("login_token", None)
@@ -1930,11 +1897,6 @@ if not st.session_state.authenticated:
         unsafe_allow_html=True,
     )
 
-    if raw_login_params.get("logout") or raw_login_params.get("auth_invalid") or raw_login_params.get("expired"):
-        render_login_browser_storage(clear=True)
-    else:
-        render_login_browser_restore()
-
     if not APP_PASSWORD:
         st.error("APP_PASSWORD が設定されていません。Streamlit Cloud の Secrets に APP_PASSWORD を追加してください。")
         st.stop()
@@ -1950,19 +1912,14 @@ if not st.session_state.authenticated:
     if st.button("ログイン"):
         if hmac.compare_digest(str(password), str(APP_PASSWORD)):
             login_token = create_login_token()
-            login_payload = validate_login_token(login_token)
+            save_login_token_cookie(login_token)
             st.session_state.authenticated = True
             st.session_state["login_token"] = login_token
             st.session_state.page = "home"
             st.session_state.selected_customer = None
             st.session_state.pop("customer_search_input", None)
             st.session_state.pop("customer_search_live", None)
-            set_query_params_safely(
-                {
-                    LOGIN_TOKEN_QUERY_PARAM: login_token,
-                    "page": "home",
-                }
-            )
+            set_query_params_safely({"page": "home"})
             st.rerun()
         else:
             st.error("パスワードが違います。")
@@ -1974,15 +1931,11 @@ active_login_payload = validate_login_token(active_login_token)
 if not active_login_payload:
     st.session_state.authenticated = False
     st.session_state.pop("login_token", None)
+    clear_login_token_cookie()
     set_query_params_safely({"page": "home", "auth_invalid": "1"})
     st.rerun()
 
-render_login_browser_storage(
-    token=active_login_token,
-    expires_at=active_login_payload.get("exp"),
-)
-render_login_expiry_watcher(active_login_payload.get("exp"))
-
+enforce_login_expiry()
 
 
 # =========================
@@ -8229,12 +8182,8 @@ def get_query_value(key, default=""):
 
 
 def update_query_params(**params):
-    """ブラウザの戻るボタンを維持しつつ、有効な署名付きログインもURLへ残す。"""
+    """ブラウザの戻るボタンを維持しつつ、画面遷移用パラメータだけを更新する。"""
     try:
-        login_token = get_active_login_token()
-        if validate_login_token(login_token):
-            st.query_params[LOGIN_TOKEN_QUERY_PARAM] = login_token
-
         for key, value in params.items():
             if value is None or value == "":
                 if key in st.query_params:
@@ -8258,9 +8207,6 @@ def make_app_url(
 ):
     """ブラウザの戻るボタンで戻れるように、通常リンク用URLを作る。"""
     params = {"page": page}
-    login_token = get_active_login_token()
-    if validate_login_token(login_token):
-        params[LOGIN_TOKEN_QUERY_PARAM] = login_token
     if customer:
         params["customer"] = str(customer)
     if customer_search:
@@ -15955,6 +15901,7 @@ with col_logout:
     st.write("")
     if st.button("ログアウト"):
         revoke_login_token(get_active_login_token())
+        clear_login_token_cookie()
         st.session_state.authenticated = False
         st.session_state.pop("login_token", None)
         st.session_state.page = "home"
