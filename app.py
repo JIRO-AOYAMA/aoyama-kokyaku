@@ -4768,7 +4768,11 @@ def render_home_todo_section():
             box-shadow: none !important;
             padding: 0 !important;
             min-height: 3rem !important;
-            font-size: 2.05rem !important;
+            font-size: 3rem !important;
+            line-height: 1 !important;
+        }
+        div[class*="st-key-home_todo_check_"] button p {
+            font-size: 3rem !important;
             line-height: 1 !important;
         }
         div[class*="st-key-home_todo_check_"] button:hover,
