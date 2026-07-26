@@ -4773,9 +4773,21 @@ def render_home_todo_section():
             color: #b8a4e6 !important;
         }
         div[class*="st-key-home_todo_check_"] button p {
-            font-size: 2.5rem !important;
+            display: inline-flex !important;
+            align-items: center !important;
+            justify-content: center !important;
+            width: 2.5rem !important;
+            height: 2.5rem !important;
+            margin: 0 !important;
+            border: 3px solid #b8a4e6 !important;
+            border-radius: 0.55rem !important;
+            background: #b8a4e6 !important;
+            box-shadow: none !important;
+            font-size: 1.8rem !important;
+            font-weight: 700 !important;
             line-height: 1 !important;
-            color: #b8a4e6 !important;
+            color: #ffffff !important;
+            text-shadow: none !important;
         }
         div[class*="st-key-home_todo_check_"] button:hover,
         div[class*="st-key-home_todo_check_"] button:focus,
@@ -4800,7 +4812,7 @@ def render_home_todo_section():
             with st.container(border=False, key=f"home_todo_card_{note_id}"):
                 check_col, text_col, delete_col = st.columns([0.9, 5.7, 1.35], vertical_alignment="center")
                 with check_col:
-                    check_label = "☑" if completed else "☐"
+                    check_label = "✓" if completed else "\u00a0"
                     if st.button(
                         check_label,
                         key=f"home_todo_check_{note_id}",
