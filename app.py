@@ -4754,40 +4754,41 @@ def render_home_todo_section():
         for index, todo in enumerate(todos):
             note_id = clean_value(todo.get("id"), blank_text=str(index))
             completed = bool(todo.get("completed"))
-            check_col, text_col, edit_col, delete_col = st.columns([0.65, 5.2, 0.8, 0.8])
-            with check_col:
-                check_label = "☑" if completed else "□"
-                if st.button(
-                    check_label,
-                    key=f"home_todo_check_{note_id}",
-                    help="未完了に戻す" if completed else "完了にする",
-                    use_container_width=True,
-                ):
-                    try:
-                        set_home_todo_completed(todo, not completed)
-                        st.rerun()
-                    except Exception as exc:
-                        st.error(str(exc))
-            with text_col:
-                safe_text = html.escape(str(todo.get("text") or "")).replace("\n", "<br>")
-                if completed:
-                    st.markdown(
-                        f'<div style="padding:.45rem .1rem;color:#777;text-decoration:line-through;">{safe_text}</div>',
-                        unsafe_allow_html=True,
-                    )
-                else:
-                    st.markdown(
-                        f'<div style="padding:.45rem .1rem;font-weight:600;">{safe_text}</div>',
-                        unsafe_allow_html=True,
-                    )
-            with edit_col:
-                if st.button("編集", key=f"home_todo_edit_{note_id}", use_container_width=True):
-                    show_home_todo_edit_dialog(todo)
-            with delete_col:
-                if st.button("削除", key=f"home_todo_delete_{note_id}", use_container_width=True):
-                    show_home_todo_delete_dialog(todo)
-            if index < len(todos) - 1:
-                st.markdown('<div style="border-top:1px solid rgba(128,128,128,.18);margin:.2rem 0 .45rem;"></div>', unsafe_allow_html=True)
+            todo_text = str(todo.get("text") or "").strip()
+            button_text = todo_text.replace("\r", " ").replace("\n", " ") or "（内容なし）"
+
+            # 1件ずつ独立したカードにし、本文タップで編集を開く。
+            with st.container(border=True):
+                check_col, text_col, delete_col = st.columns([0.9, 5.7, 1.35], vertical_alignment="center")
+                with check_col:
+                    check_label = "✅" if completed else "⬜"
+                    if st.button(
+                        check_label,
+                        key=f"home_todo_check_{note_id}",
+                        help="未完了に戻す" if completed else "完了にする",
+                        use_container_width=True,
+                    ):
+                        try:
+                            set_home_todo_completed(todo, not completed)
+                            st.rerun()
+                        except Exception as exc:
+                            st.error(str(exc))
+                with text_col:
+                    if st.button(
+                        button_text,
+                        key=f"home_todo_edit_{note_id}",
+                        help="タップして編集",
+                        use_container_width=True,
+                        type="tertiary",
+                    ):
+                        show_home_todo_edit_dialog(todo)
+                with delete_col:
+                    if st.button(
+                        "削除",
+                        key=f"home_todo_delete_{note_id}",
+                        use_container_width=True,
+                    ):
+                        show_home_todo_delete_dialog(todo)
 
 
 def render_note_card(note, show_customer=True):
