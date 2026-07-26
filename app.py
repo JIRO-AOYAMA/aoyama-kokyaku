@@ -158,6 +158,12 @@ MICROSOFT_ALLOWED_SUB = str(
     or st.secrets.get("MICROSOFT_ALLOWED_SUB", "")
     or ""
 ).strip()
+MICROSOFT_CLIENT_SECRET_EXPIRES_AT = str(
+    APP_AUTH_SETTINGS.get("client_secret_expires_at", "") or ""
+).strip()
+MICROSOFT_CLIENT_SECRET_WARNING_DAYS = 60
+MICROSOFT_CLIENT_SECRET_CRITICAL_DAYS = 30
+MICROSOFT_CLIENT_SECRET_URGENT_DAYS = 7
 MICROSOFT_ISSUER_PREFIX = "https://login.microsoftonline.com/"
 MICROSOFT_AUTH_CLOCK_SKEW_SECONDS = 60
 LOGIN_TOKEN_COOKIE_KEY = "signed_login_token"
@@ -737,6 +743,80 @@ def get_configured_auth_client_id():
         return str(auth_settings.get("client_id", "") or "").strip()
     except Exception:
         return ""
+
+
+def get_microsoft_client_secret_expiry_info(today=None):
+    """ログイン専用MicrosoftアプリのSecret期限と残り日数を返す。"""
+    configured_value = str(MICROSOFT_CLIENT_SECRET_EXPIRES_AT or "").strip()
+    if not configured_value:
+        return {"configured": False, "valid": True, "expires_at": None, "days_remaining": None}
+
+    try:
+        expires_at = datetime.strptime(configured_value, "%Y-%m-%d").date()
+    except ValueError:
+        return {
+            "configured": True,
+            "valid": False,
+            "expires_at": None,
+            "days_remaining": None,
+        }
+
+    current_date = today or datetime.now(timezone(timedelta(hours=9))).date()
+    return {
+        "configured": True,
+        "valid": True,
+        "expires_at": expires_at,
+        "days_remaining": (expires_at - current_date).days,
+    }
+
+
+def show_microsoft_client_secret_expiry_notice():
+    """期限が近い場合だけ、ログイン後の全画面上部へ更新警告を表示する。"""
+    info = get_microsoft_client_secret_expiry_info()
+    if not info["configured"]:
+        return
+
+    if not info["valid"]:
+        st.error(
+            "Microsoftログイン用クライアントシークレットの期限日を確認できません。"
+            " Secretsの [app_auth] client_secret_expires_at を YYYY-MM-DD 形式で確認してください。"
+        )
+        return
+
+    days_remaining = int(info["days_remaining"])
+    expires_text = info["expires_at"].strftime("%Y年%m月%d日")
+
+    if days_remaining > MICROSOFT_CLIENT_SECRET_WARNING_DAYS:
+        return
+    if days_remaining < 0:
+        st.error(
+            f"Microsoftログイン用クライアントシークレットは {expires_text} に期限切れになっています。"
+            " 新しいシークレットを作成し、Streamlit Secretsの [auth] client_secret を更新してください。"
+        )
+        return
+    if days_remaining == 0:
+        st.error(
+            f"Microsoftログイン用クライアントシークレットは本日（{expires_text}）が期限です。"
+            " 本日中に更新してください。"
+        )
+        return
+    if days_remaining <= MICROSOFT_CLIENT_SECRET_URGENT_DAYS:
+        st.error(
+            f"Microsoftログイン用クライアントシークレットの期限まで残り {days_remaining} 日です"
+            f"（{expires_text}）。早急に更新してください。"
+        )
+        return
+    if days_remaining <= MICROSOFT_CLIENT_SECRET_CRITICAL_DAYS:
+        st.warning(
+            f"Microsoftログイン用クライアントシークレットの期限まで残り {days_remaining} 日です"
+            f"（{expires_text}）。更新準備を進めてください。"
+        )
+        return
+
+    st.warning(
+        f"Microsoftログイン用クライアントシークレットの期限まで残り {days_remaining} 日です"
+        f"（{expires_text}）。期限前に更新してください。"
+    )
 
 
 def validate_microsoft_identity(claims, require_allowed_sub=True):
@@ -2341,7 +2421,7 @@ remove_obsolete_login_query_params()
 
 
 # =========================
-# Microsoftログイン認証（v52：履歴・新規ブラウザ通知）
+# Microsoftログイン認証（v53：履歴・新規ブラウザ通知・Secret期限警告）
 # =========================
 if "authenticated" not in st.session_state:
     st.session_state.authenticated = False
@@ -16654,6 +16734,8 @@ with col_logout:
         set_query_params_safely({"page": "home", "logout": "1"})
         st.logout()
         st.stop()
+
+show_microsoft_client_secret_expiry_notice()
 
 login_audit_warning = st.session_state.pop("login_audit_warning", None)
 if login_audit_warning:
