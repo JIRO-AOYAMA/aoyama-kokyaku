@@ -15064,6 +15064,33 @@ def update_trade_partner_row(sheet_name, record_id, values):
                 break
         if target_row is None:
             raise ValueError(f"{sheet_name}で対象IDが見つかりません。")
+
+        # 取引先マスターの会社名を変更する場合は、区分に関係なく
+        # マスター全体で同名が存在しないか確認する。編集中の行は除外する。
+        if sheet_name == TRADE_PARTNER_MASTER_SHEET and "会社名" in values:
+            if "会社名" not in header_map:
+                raise ValueError("取引先マスターに会社名列がありません。")
+            old_company = editor.get_cell_value(
+                sheet_name, target_row, header_map["会社名"]
+            )
+            new_company = trade_partner_input_value("会社名", values.get("会社名"))
+            if not same_excel_value(old_company, new_company):
+                normalized_company = normalize_match_value(new_company)
+                if normalized_company:
+                    for check_row in range(2, editor.get_max_row(sheet_name) + 1):
+                        if check_row == target_row:
+                            continue
+                        existing = trade_partner_text(
+                            editor.get_cell_value(
+                                sheet_name, check_row, header_map["会社名"]
+                            )
+                        )
+                        if (
+                            existing
+                            and normalize_match_value(existing) == normalized_company
+                        ):
+                            raise ValueError("同じ会社名がすでに登録されています。")
+
         changes = {}
         for header, value in values.items():
             if header not in header_map or header == id_field or header == "会社名（確認用）":
