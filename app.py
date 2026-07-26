@@ -4750,6 +4750,39 @@ def render_home_todo_section():
         st.info("やることメモはまだありません。右上の「＋ 追加」から登録できます。")
         return
 
+    st.markdown(
+        """
+        <style>
+        /* やることメモだけを対象にし、他のボタンやカードには影響させない。 */
+        div[class*="st-key-home_todo_card_"] {
+            background: #ffffff !important;
+            border: 1px solid rgba(49, 51, 63, 0.18) !important;
+            border-radius: 14px !important;
+            padding: 0.55rem 0.7rem !important;
+            margin-bottom: 0.65rem !important;
+            box-shadow: 0 1px 3px rgba(15, 23, 42, 0.06) !important;
+        }
+        div[class*="st-key-home_todo_check_"] button {
+            background: transparent !important;
+            border: 0 !important;
+            box-shadow: none !important;
+            padding: 0 !important;
+            min-height: 3rem !important;
+            font-size: 2.05rem !important;
+            line-height: 1 !important;
+        }
+        div[class*="st-key-home_todo_check_"] button:hover,
+        div[class*="st-key-home_todo_check_"] button:focus,
+        div[class*="st-key-home_todo_check_"] button:active {
+            background: transparent !important;
+            border: 0 !important;
+            box-shadow: none !important;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
     with st.container(height=HOME_TODO_LIST_HEIGHT, border=True):
         for index, todo in enumerate(todos):
             note_id = clean_value(todo.get("id"), blank_text=str(index))
@@ -4757,11 +4790,11 @@ def render_home_todo_section():
             todo_text = str(todo.get("text") or "").strip()
             button_text = todo_text.replace("\r", " ").replace("\n", " ") or "（内容なし）"
 
-            # 1件ずつ独立したカードにし、本文タップで編集を開く。
-            with st.container(border=True):
+            # 1件ずつ白いカードにし、本文タップで編集を開く。
+            with st.container(border=False, key=f"home_todo_card_{note_id}"):
                 check_col, text_col, delete_col = st.columns([0.9, 5.7, 1.35], vertical_alignment="center")
                 with check_col:
-                    check_label = "✅" if completed else "⬜"
+                    check_label = "☑" if completed else "☐"
                     if st.button(
                         check_label,
                         key=f"home_todo_check_{note_id}",
