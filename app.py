@@ -4767,23 +4767,23 @@ def render_home_todo_section():
             border: 0 !important;
             box-shadow: none !important;
             padding: 0 !important;
-            min-height: 2.5rem !important;
-            font-size: 2.5rem !important;
+            min-height: 1.875rem !important;
+            font-size: 1.875rem !important;
             line-height: 1 !important;
-            color: #b8a4e6 !important;
+            color: #d8d0f2 !important;
         }
         div[class*="st-key-home_todo_check_"] button p {
             display: inline-flex !important;
             align-items: center !important;
             justify-content: center !important;
-            width: 2.5rem !important;
-            height: 2.5rem !important;
+            width: 1.875rem !important;
+            height: 1.875rem !important;
             margin: 0 !important;
-            border: 3px solid #b8a4e6 !important;
-            border-radius: 0.55rem !important;
-            background: #b8a4e6 !important;
+            border: 2.25px solid #d8d0f2 !important;
+            border-radius: 0.4125rem !important;
+            background: #d8d0f2 !important;
             box-shadow: none !important;
-            font-size: 1.8rem !important;
+            font-size: 1.35rem !important;
             font-weight: 700 !important;
             line-height: 1 !important;
             color: #ffffff !important;
