@@ -8912,6 +8912,7 @@ def sync_page_from_query_params():
     elif page != "partner_detail":
         st.session_state["selected_partner_id"] = None
         st.session_state["selected_partner_type"] = None
+        clear_trade_partner_immediate_data()
 
 
 def set_page(page_name, rerun=False):
@@ -8922,6 +8923,7 @@ def set_page(page_name, rerun=False):
     if page_name != "partner_detail":
         st.session_state["selected_partner_id"] = None
         st.session_state["selected_partner_type"] = None
+        clear_trade_partner_immediate_data()
 
     update_query_params(
         page=page_name,
@@ -14105,6 +14107,8 @@ TRADE_PARTNER_NOTE_PREFIXES = {
     "supplier": "【仕入先】",
     "carrier": "【運送会社】",
 }
+TRADE_PARTNER_IMMEDIATE_DATA_KEY = "trade_partner_immediate_data"
+TRADE_PARTNER_IMMEDIATE_PARTNER_ID_KEY = "trade_partner_immediate_partner_id"
 
 
 def normalize_trade_partner_header(value):
@@ -14744,6 +14748,78 @@ class TradePartnerXlsxEditor:
         return output.getvalue()
 
 
+def read_trade_partner_data_from_editor(editor):
+    """検証済みの取引先カルテから、画面表示用データを作る。"""
+    missing = [name for name in TRADE_PARTNER_REQUIRED_SHEETS if not editor.has_sheet(name)]
+    if missing:
+        raise RuntimeError("取引先カルテ.xlsxに必要なシートがありません：" + "、".join(missing))
+    return {name: editor.read_sheet(name) for name in TRADE_PARTNER_REQUIRED_SHEETS}
+
+
+def clear_trade_partner_immediate_data():
+    """保存直後だけ使う取引先カルテの最新データを破棄する。"""
+    st.session_state.pop(TRADE_PARTNER_IMMEDIATE_DATA_KEY, None)
+    st.session_state.pop(TRADE_PARTNER_IMMEDIATE_PARTNER_ID_KEY, None)
+
+
+def store_trade_partner_immediate_data(data, partner_id):
+    """Dropbox反映待ちや古いキャッシュに左右されないよう、保存済みデータを保持する。"""
+    target = trade_partner_text(partner_id)
+    if not target or not isinstance(data, dict):
+        clear_trade_partner_immediate_data()
+        return
+    st.session_state[TRADE_PARTNER_IMMEDIATE_DATA_KEY] = data
+    st.session_state[TRADE_PARTNER_IMMEDIATE_PARTNER_ID_KEY] = target
+
+
+def get_trade_partner_detail_data(partner_id):
+    """同じ取引先の保存直後データがあれば優先し、なければDropboxから読む。"""
+    target = trade_partner_text(partner_id)
+    immediate_id = trade_partner_text(
+        st.session_state.get(TRADE_PARTNER_IMMEDIATE_PARTNER_ID_KEY)
+    )
+    immediate_data = st.session_state.get(TRADE_PARTNER_IMMEDIATE_DATA_KEY)
+    if target and immediate_id == target and isinstance(immediate_data, dict):
+        return immediate_data
+    if immediate_data is not None or immediate_id:
+        clear_trade_partner_immediate_data()
+    return load_trade_partner_data()
+
+
+def verify_trade_partner_saved_result(data, result):
+    """保存後データに、対象行と変更値が実在することを確認する。"""
+    if not isinstance(result, dict):
+        raise RuntimeError("取引先カルテの保存結果を確認できませんでした。")
+    sheet_name = result.get("sheet_name")
+    record_id = trade_partner_text(result.get("record_id"))
+    if sheet_name not in TRADE_PARTNER_ID_FIELDS or not record_id:
+        raise RuntimeError("取引先カルテの保存対象を確認できませんでした。")
+
+    id_field = TRADE_PARTNER_ID_FIELDS[sheet_name]
+    saved_row = next(
+        (
+            row
+            for row in data[sheet_name]["rows"]
+            if trade_partner_text(row.get(id_field)) == record_id
+        ),
+        None,
+    )
+    if saved_row is None:
+        raise RuntimeError(
+            f"保存後の確認で{sheet_name}の対象ID（{record_id}）が見つかりません。"
+        )
+
+    for header, change in (result.get("changes") or {}).items():
+        if not isinstance(change, (tuple, list)) or len(change) < 2:
+            continue
+        expected = change[1]
+        actual = saved_row.get(header)
+        if not same_excel_value(actual, expected):
+            raise RuntimeError(
+                f"保存後の確認で{sheet_name}の「{header}」が更新されていません。"
+            )
+
+
 @st.cache_data(ttl=60, show_spinner=False)
 def load_trade_partner_data():
     access_token = get_dropbox_access_token()
@@ -14756,10 +14832,7 @@ def load_trade_partner_data():
         )
 
     editor = TradePartnerXlsxEditor(content)
-    missing = [name for name in TRADE_PARTNER_REQUIRED_SHEETS if not editor.has_sheet(name)]
-    if missing:
-        raise RuntimeError("取引先カルテ.xlsxに必要なシートがありません：" + "、".join(missing))
-    return {name: editor.read_sheet(name) for name in TRADE_PARTNER_REQUIRED_SHEETS}
+    return read_trade_partner_data_from_editor(editor)
 
 def get_trade_partner_master_rows(data, partner_type=None):
     rows = []
@@ -14930,6 +15003,8 @@ def save_trade_partner_workbook(mutator):
     for sheet_name in TRADE_PARTNER_REQUIRED_SHEETS:
         if not verified.get_header_map(sheet_name):
             raise ValueError(f"保存後の検証で{sheet_name}の見出しを確認できません。")
+    latest_data = read_trade_partner_data_from_editor(verified)
+    verify_trade_partner_saved_result(latest_data, result)
 
     upload_response = upload_dropbox_file(
         target_path,
@@ -14949,6 +15024,10 @@ def save_trade_partner_workbook(mutator):
     verify_dropbox_file_metadata(metadata, saved_content, previous_revision=revision)
     trim_trade_partner_backups(access_token, keep=30)
     load_trade_partner_data.clear()
+    store_trade_partner_immediate_data(
+        latest_data,
+        result.get("partner_id") or result.get("record_id"),
+    )
     return result
 
 def trade_partner_input_value(header, value):
@@ -15002,6 +15081,7 @@ def update_trade_partner_row(sheet_name, record_id, values):
                 editor.get_cell_value(sheet_name, target_row, header_map["取引先ID"])
             )
         return {
+            "sheet_name": sheet_name,
             "record_id": target_id,
             "partner_id": partner_id,
             "changed": len(changes),
@@ -15072,6 +15152,7 @@ def create_trade_partner_record(sheet_name, values):
         if sheet_name != TRADE_PARTNER_MASTER_SHEET:
             partner_id = trade_partner_text(values.get("取引先ID"))
         return {
+            "sheet_name": sheet_name,
             "record_id": record_id,
             "partner_id": partner_id,
             "row_number": row_number,
@@ -15521,7 +15602,7 @@ def show_trade_partner_notes(partner_type, partner_id, company_name):
 
 def show_trade_partner_detail(partner_type, partner_id):
     show_trade_partner_home_link(partner_type)
-    data = load_trade_partner_data()
+    data = get_trade_partner_detail_data(partner_id)
     master = get_trade_partner_by_id(data, partner_id)
     if not master or not is_trade_partner_marked(master.get(trade_partner_category_field(partner_type))):
         st.warning("選択した会社の情報が見つかりません。")
@@ -16662,6 +16743,7 @@ with st.sidebar:
     st.markdown("### メニュー")
     if st.button("🔄 更新", use_container_width=True):
         st.cache_data.clear()
+        clear_trade_partner_immediate_data()
         st.rerun()
     st.markdown("---")
 
