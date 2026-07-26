@@ -209,6 +209,10 @@ LOGIN_AUDIT_REQUEST_TIMEOUT = 15
 LOGIN_HISTORY_PAGE_SIZE = 100
 LINE_STATUS_NOTE_PREFIX = "line_status_"
 LINE_STATUS_BODY = "__LINE_CONNECTED__"
+HOME_TODO_CUSTOMER_NAME = "__HOME_TODO__"
+HOME_TODO_ID_PREFIX = "home_todo_"
+HOME_TODO_BODY_PREFIX = "__home_todo_v1__:"
+HOME_TODO_LIST_HEIGHT = 420
 VOICE_INPUT_HELP = "スマホではキーボードのマイクを押して音声入力できます。"
 PAST_PRODUCT_NOTE_PREFIX = "__past_product_note__:"
 ESTIMATE_PREFIX = "__estimate__:"
@@ -4433,7 +4437,12 @@ def load_notes_from_supabase(customer_name=None, limit=500):
     if not isinstance(notes, list):
         return []
 
-    return notes
+    # ホーム専用の「やることメモ」は、既存の顧客メモ・取引先メモには混ぜない。
+    return [
+        note
+        for note in notes
+        if clean_value(note.get("customer_name"), blank_text="") != HOME_TODO_CUSTOMER_NAME
+    ]
 
 
 def insert_note_to_supabase(note):
@@ -4512,6 +4521,273 @@ def add_note(customer_name, body):
 
 def get_notes_for_customer(customer_name):
     return load_notes_from_supabase(customer_name=customer_name)
+
+
+def encode_home_todo_body(text, completed=False):
+    payload = {
+        "text": str(text or "").strip(),
+        "completed": bool(completed),
+    }
+    return HOME_TODO_BODY_PREFIX + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+
+
+def decode_home_todo_body(body):
+    raw = str(body or "")
+    if not raw.startswith(HOME_TODO_BODY_PREFIX):
+        return {"text": raw.strip(), "completed": False}
+    try:
+        payload = json.loads(raw[len(HOME_TODO_BODY_PREFIX):])
+    except Exception:
+        return {"text": raw[len(HOME_TODO_BODY_PREFIX):].strip(), "completed": False}
+    return {
+        "text": str(payload.get("text") or "").strip(),
+        "completed": bool(payload.get("completed", False)),
+    }
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def load_home_todos_from_supabase(limit=500):
+    """ホーム画面専用のやることメモを読み込む。"""
+    if not has_supabase_config():
+        return []
+    try:
+        response = requests.get(
+            get_supabase_notes_url(),
+            headers=get_supabase_headers(),
+            params={
+                "select": "id,customer_name,body,created_at",
+                "customer_name": f"eq.{HOME_TODO_CUSTOMER_NAME}",
+                "order": "created_at.desc",
+                "limit": str(limit),
+            },
+            timeout=30,
+        )
+    except Exception as exc:
+        raise RuntimeError(f"やることメモを読み込めませんでした：{exc}") from exc
+    if response.status_code != 200:
+        raise RuntimeError(f"やることメモを読み込めませんでした（{response.status_code}）。")
+    try:
+        rows = response.json()
+    except Exception as exc:
+        raise RuntimeError("やることメモのデータ形式が正しくありません。") from exc
+    if not isinstance(rows, list):
+        return []
+    todos = []
+    for row in rows:
+        parsed = decode_home_todo_body(row.get("body"))
+        if not parsed["text"]:
+            continue
+        todos.append({**row, **parsed})
+    # 未完了を先にし、同じ状態では新しい順を保つ。
+    todos.sort(key=lambda item: bool(item.get("completed")))
+    return todos
+
+
+def save_home_todo(text, existing=None):
+    todo_text = str(text or "").strip()
+    if not todo_text:
+        raise ValueError("メモを入力してください。")
+    existing = existing or {}
+    note_id = clean_value(existing.get("id"), blank_text="") or (
+        HOME_TODO_ID_PREFIX + make_note_id()
+    )
+    completed = bool(existing.get("completed", False))
+    if existing:
+        try:
+            response = requests.patch(
+                get_supabase_notes_url(),
+                headers=get_supabase_headers(prefer="return=minimal"),
+                params={"id": f"eq.{note_id}"},
+                json={"body": encode_home_todo_body(todo_text, completed)},
+                timeout=30,
+            )
+        except Exception as exc:
+            raise RuntimeError(f"やることメモを更新できませんでした：{exc}") from exc
+        if response.status_code not in (200, 204):
+            raise RuntimeError(f"やることメモを更新できませんでした（{response.status_code}）。")
+    else:
+        insert_note_to_supabase(
+            {
+                "id": note_id,
+                "customer_name": HOME_TODO_CUSTOMER_NAME,
+                "body": encode_home_todo_body(todo_text, False),
+                "created_at": get_jst_now().isoformat(),
+            }
+        )
+    load_home_todos_from_supabase.clear()
+    load_notes_from_supabase.clear()
+
+
+def set_home_todo_completed(todo, completed):
+    note_id = clean_value(todo.get("id"), blank_text="")
+    if not note_id:
+        raise ValueError("対象のメモが見つかりません。")
+    try:
+        response = requests.patch(
+            get_supabase_notes_url(),
+            headers=get_supabase_headers(prefer="return=minimal"),
+            params={"id": f"eq.{note_id}"},
+            json={
+                "body": encode_home_todo_body(
+                    todo.get("text", ""),
+                    completed,
+                )
+            },
+            timeout=30,
+        )
+    except Exception as exc:
+        raise RuntimeError(f"完了状態を更新できませんでした：{exc}") from exc
+    if response.status_code not in (200, 204):
+        raise RuntimeError(f"完了状態を更新できませんでした（{response.status_code}）。")
+    load_home_todos_from_supabase.clear()
+    load_notes_from_supabase.clear()
+
+
+def delete_home_todo(todo):
+    note_id = clean_value(todo.get("id"), blank_text="")
+    if not note_id:
+        raise ValueError("対象のメモが見つかりません。")
+    if not delete_note_from_supabase(note_id):
+        raise RuntimeError("やることメモを削除できませんでした。")
+    load_home_todos_from_supabase.clear()
+
+
+@st.dialog("やることメモを追加")
+def show_home_todo_add_dialog():
+    text = st.text_area(
+        "メモ",
+        key="home_todo_add_text",
+        height=140,
+        placeholder="例：7月20日の週で青雲、醤油粕",
+        help=VOICE_INPUT_HELP,
+    )
+    save_col, cancel_col = st.columns(2)
+    with save_col:
+        if st.button("追加する", type="primary", use_container_width=True):
+            try:
+                save_home_todo(text)
+                st.session_state.pop("home_todo_add_text", None)
+                st.session_state["home_todo_message"] = "メモを追加しました。"
+                st.rerun()
+            except Exception as exc:
+                st.error(str(exc))
+    with cancel_col:
+        if st.button("キャンセル", use_container_width=True):
+            st.rerun()
+
+
+@st.dialog("やることメモを編集")
+def show_home_todo_edit_dialog(todo):
+    note_id = clean_value(todo.get("id"), blank_text="")
+    text = st.text_area(
+        "メモ",
+        value=str(todo.get("text") or ""),
+        key=f"home_todo_edit_text_{note_id}",
+        height=140,
+        help=VOICE_INPUT_HELP,
+    )
+    save_col, cancel_col = st.columns(2)
+    with save_col:
+        if st.button("保存する", type="primary", use_container_width=True):
+            try:
+                save_home_todo(text, existing=todo)
+                st.session_state["home_todo_message"] = "メモを更新しました。"
+                st.rerun()
+            except Exception as exc:
+                st.error(str(exc))
+    with cancel_col:
+        if st.button("キャンセル", use_container_width=True):
+            st.rerun()
+
+
+@st.dialog("やることメモを削除")
+def show_home_todo_delete_dialog(todo):
+    preview = str(todo.get("text") or "").strip()
+    st.warning("このメモを削除します。")
+    if preview:
+        st.caption(preview if len(preview) <= 100 else preview[:97] + "…")
+    st.caption("この操作は元に戻せません。")
+    delete_col, cancel_col = st.columns(2)
+    with delete_col:
+        if st.button("削除する", type="primary", use_container_width=True):
+            try:
+                delete_home_todo(todo)
+                st.session_state["home_todo_message"] = "メモを削除しました。"
+                st.rerun()
+            except Exception as exc:
+                st.error(str(exc))
+    with cancel_col:
+        if st.button("キャンセル", use_container_width=True):
+            st.rerun()
+
+
+def render_home_todo_section():
+    """今のホーム画面を変えず、その最下部にやることメモだけを追加する。"""
+    st.markdown("---")
+    title_col, add_col = st.columns([4, 1])
+    with title_col:
+        st.subheader("☑️ やることメモ")
+        st.caption("未完了を上に表示します。メモが多い場合は枠内をスクロールできます。")
+    with add_col:
+        if st.button("＋ 追加", key="home_todo_add_button", use_container_width=True):
+            show_home_todo_add_dialog()
+
+    message = st.session_state.pop("home_todo_message", None)
+    if message:
+        st.success(message)
+
+    if not has_supabase_config():
+        st.info("やることメモを使うには、現在のSupabase設定が必要です。")
+        return
+
+    try:
+        todos = load_home_todos_from_supabase()
+    except Exception as exc:
+        st.warning(str(exc))
+        return
+
+    if not todos:
+        st.info("やることメモはまだありません。右上の「＋ 追加」から登録できます。")
+        return
+
+    with st.container(height=HOME_TODO_LIST_HEIGHT, border=True):
+        for index, todo in enumerate(todos):
+            note_id = clean_value(todo.get("id"), blank_text=str(index))
+            completed = bool(todo.get("completed"))
+            check_col, text_col, edit_col, delete_col = st.columns([0.65, 5.2, 0.8, 0.8])
+            with check_col:
+                check_label = "☑" if completed else "□"
+                if st.button(
+                    check_label,
+                    key=f"home_todo_check_{note_id}",
+                    help="未完了に戻す" if completed else "完了にする",
+                    use_container_width=True,
+                ):
+                    try:
+                        set_home_todo_completed(todo, not completed)
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(str(exc))
+            with text_col:
+                safe_text = html.escape(str(todo.get("text") or "")).replace("\n", "<br>")
+                if completed:
+                    st.markdown(
+                        f'<div style="padding:.45rem .1rem;color:#777;text-decoration:line-through;">{safe_text}</div>',
+                        unsafe_allow_html=True,
+                    )
+                else:
+                    st.markdown(
+                        f'<div style="padding:.45rem .1rem;font-weight:600;">{safe_text}</div>',
+                        unsafe_allow_html=True,
+                    )
+            with edit_col:
+                if st.button("編集", key=f"home_todo_edit_{note_id}", use_container_width=True):
+                    show_home_todo_edit_dialog(todo)
+            with delete_col:
+                if st.button("削除", key=f"home_todo_delete_{note_id}", use_container_width=True):
+                    show_home_todo_delete_dialog(todo)
+            if index < len(todos) - 1:
+                st.markdown('<div style="border-top:1px solid rgba(128,128,128,.18);margin:.2rem 0 .45rem;"></div>', unsafe_allow_html=True)
 
 
 def render_note_card(note, show_customer=True):
@@ -16080,6 +16356,8 @@ def show_top_home():
         if alert_count:
             label += f"（未確認 {alert_count}）"
         st.markdown(render_page_link(label, page="login_history"), unsafe_allow_html=True)
+
+    render_home_todo_section()
 
 
 # =========================
