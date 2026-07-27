@@ -1640,390 +1640,648 @@ def download_onedrive_file(access_token, item_id):
 
 
 def render_onedrive_pdf_inline(pdf_content, filename):
-    """OneDriveへ移動せず、PC・スマホ共通のPDF.jsビューアーで表示する。"""
+    """OneDriveへ移動せず、画面全体を使うPDF.jsビューアーで表示する。"""
     pdf_bytes = bytes(pdf_content or b"")
     if not pdf_bytes:
         st.error("PDFデータが空のため表示できません。")
         return
 
     encoded = base64.b64encode(pdf_bytes).decode("ascii")
+    viewer_id = "onedrive_fullscreen_pdf_" + hashlib.sha256(
+        (str(filename or "") + str(len(pdf_bytes))).encode("utf-8")
+    ).hexdigest()[:16]
+
+    # components.html の小さなiframe内ではなく、親画面へ全画面ビューアーを配置する。
+    # スマホではピンチ・パン・ダブルタップ、PCではホイール・ドラッグで操作できる。
     viewer_html = r"""
-    <!doctype html>
-    <html lang="ja">
-    <head>
-      <meta charset="utf-8">
-      <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=5, user-scalable=yes">
-      <style>
-        html, body {
-          width: 100%;
-          height: 100%;
-          margin: 0;
-          padding: 0;
+    <script>
+    (() => {
+      const parentWindow = window.parent;
+      const parentDocument = parentWindow.document;
+      const viewerId = __VIEWER_ID_JSON__;
+      const encodedPdf = __PDF_BASE64_JSON__;
+      const filename = __FILENAME_JSON__;
+      const viewerGlobalKey = "__aoyamaOneDriveFullscreenViewerCleanup";
+      const pdfJsSources = [
+        {
+          script: "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js",
+          worker: "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js",
+        },
+        {
+          script: "https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.min.js",
+          worker: "https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.worker.min.js",
+        },
+        {
+          script: "https://unpkg.com/pdfjs-dist@3.11.174/build/pdf.min.js",
+          worker: "https://unpkg.com/pdfjs-dist@3.11.174/build/pdf.worker.min.js",
+        },
+      ];
+
+      if (typeof parentWindow[viewerGlobalKey] === "function") {
+        try { parentWindow[viewerGlobalKey](); } catch (_) {}
+      }
+
+      const previousViewer = parentDocument.getElementById(viewerId);
+      if (previousViewer) previousViewer.remove();
+      const anyViewer = parentDocument.querySelector('[data-onedrive-fullscreen-viewer="1"]');
+      if (anyViewer) anyViewer.remove();
+
+      const oldOverflow = parentDocument.body.style.overflow;
+      const overlay = parentDocument.createElement("div");
+      overlay.id = viewerId;
+      overlay.dataset.onedriveFullscreenViewer = "1";
+      overlay.setAttribute("role", "dialog");
+      overlay.setAttribute("aria-modal", "true");
+      overlay.setAttribute("aria-label", "PDFを全画面表示");
+      overlay.innerHTML = `
+        <div class="odp-stage" aria-label="PDF表示領域">
+          <div class="odp-page-anchor">
+            <div class="odp-page-frame">
+              <canvas class="odp-canvas" aria-label="PDFページ"></canvas>
+            </div>
+          </div>
+          <div class="odp-loading">PDFを読み込んでいます…</div>
+          <div class="odp-error" hidden>
+            <strong>PDFを表示できませんでした。</strong><br>
+            通信状態を確認して、いったん閉じてからもう一度開いてください。
+          </div>
+        </div>
+        <div class="odp-toolbar">
+          <div class="odp-filename"></div>
+          <div class="odp-controls">
+            <button class="odp-prev" type="button" aria-label="前のページ">‹</button>
+            <span class="odp-page-status">読込中…</span>
+            <button class="odp-next" type="button" aria-label="次のページ">›</button>
+            <button class="odp-zoom-out" type="button" aria-label="縮小">−</button>
+            <button class="odp-fit" type="button" aria-label="幅に合わせる">幅</button>
+            <button class="odp-zoom-in" type="button" aria-label="拡大">＋</button>
+            <button class="odp-fullscreen" type="button" aria-label="ブラウザの全画面表示">⛶</button>
+            <button class="odp-close" type="button" aria-label="閉じる">×</button>
+          </div>
+        </div>
+        <div class="odp-help">2本指で拡大・縮小　ドラッグで移動　ダブルタップで切替</div>
+      `;
+
+      const style = parentDocument.createElement("style");
+      style.textContent = `
+        #${viewerId} {
+          position: fixed;
+          inset: 0;
+          z-index: 2147483647;
+          width: 100vw;
+          height: 100dvh;
           overflow: hidden;
-          background: #f3f4f6;
-          font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-          color: #111827;
+          background: #151515;
+          color: #fff;
+          font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+          overscroll-behavior: none;
+          -webkit-user-select: none;
+          user-select: none;
         }
-        * { box-sizing: border-box; }
-        .pdf-viewer {
-          display: flex;
-          flex-direction: column;
-          width: 100%;
-          height: 100vh;
-          min-height: 680px;
-          background: #f3f4f6;
+        #${viewerId}, #${viewerId} * { box-sizing: border-box; }
+        #${viewerId} .odp-stage {
+          position: absolute;
+          inset: 0;
+          overflow: hidden;
+          background: #242424;
+          touch-action: none;
+          cursor: grab;
         }
-        .pdf-toolbar {
-          display: flex;
-          align-items: center;
-          justify-content: center;
-          flex-wrap: wrap;
-          gap: 8px;
-          flex: 0 0 auto;
-          padding: 9px 8px;
-          border-bottom: 1px solid #d1d5db;
-          background: #ffffff;
-          position: relative;
-          z-index: 2;
+        #${viewerId} .odp-stage.odp-dragging { cursor: grabbing; }
+        #${viewerId} .odp-page-anchor {
+          position: absolute;
+          top: 62px;
+          left: 50%;
+          transform: translateX(-50%);
+          will-change: transform;
         }
-        .pdf-toolbar button {
-          min-width: 44px;
-          min-height: 38px;
-          padding: 7px 11px;
-          border: 1px solid #cbd5e1;
-          border-radius: 8px;
-          background: #ffffff;
-          color: #111827;
-          font-size: 15px;
-          font-weight: 600;
-          cursor: pointer;
+        #${viewerId} .odp-page-frame {
+          transform-origin: center top;
+          will-change: transform;
+          background: #fff;
+          box-shadow: 0 4px 24px rgba(0,0,0,.55);
         }
-        .pdf-toolbar button:hover:not(:disabled) { background: #f8fafc; }
-        .pdf-toolbar button:disabled {
-          opacity: 0.4;
-          cursor: default;
-        }
-        .page-status {
-          min-width: 92px;
-          text-align: center;
-          font-size: 14px;
-          font-weight: 600;
-          white-space: nowrap;
-        }
-        .pdf-stage {
-          flex: 1 1 auto;
-          min-height: 0;
-          overflow: auto;
-          padding: 14px;
-          text-align: center;
-          overscroll-behavior: contain;
-          -webkit-overflow-scrolling: touch;
-        }
-        .canvas-wrap {
-          display: inline-block;
-          position: relative;
-          min-width: 1px;
-          min-height: 1px;
-          background: #ffffff;
-          box-shadow: 0 2px 12px rgba(15, 23, 42, 0.18);
-        }
-        #pdf-canvas {
+        #${viewerId} .odp-canvas {
           display: block;
           max-width: none;
-          background: #ffffff;
+          background: #fff;
+          -webkit-user-drag: none;
+          user-select: none;
         }
-        .pdf-message {
+        #${viewerId} .odp-loading,
+        #${viewerId} .odp-error {
+          position: absolute;
+          left: 50%;
+          top: 50%;
+          transform: translate(-50%, -50%);
+          max-width: calc(100vw - 40px);
+          padding: 16px 20px;
+          border-radius: 12px;
+          background: rgba(20,20,20,.82);
+          color: #fff;
+          font-size: 15px;
+          line-height: 1.65;
+          text-align: center;
+          pointer-events: none;
+        }
+        #${viewerId} .odp-error { background: rgba(100,18,18,.90); }
+        #${viewerId} .odp-toolbar {
+          position: absolute;
+          top: max(8px, env(safe-area-inset-top));
+          left: 10px;
+          right: 10px;
+          z-index: 4;
           display: flex;
           align-items: center;
-          justify-content: center;
-          min-height: 260px;
-          padding: 24px;
-          font-size: 15px;
-          line-height: 1.7;
-          text-align: center;
-          color: #374151;
+          justify-content: space-between;
+          gap: 12px;
+          min-height: 46px;
+          pointer-events: none;
         }
-        .pdf-error {
-          display: none;
-          max-width: 620px;
-          margin: 24px auto;
-          padding: 18px;
-          border: 1px solid #fecaca;
-          border-radius: 10px;
-          background: #fff7f7;
-          color: #991b1b;
-          line-height: 1.7;
-          text-align: left;
-        }
-        .pdf-error a {
-          display: inline-block;
-          margin-top: 10px;
+        #${viewerId} .odp-filename {
+          min-width: 0;
+          max-width: min(42vw, 520px);
+          overflow: hidden;
+          text-overflow: ellipsis;
+          white-space: nowrap;
           padding: 8px 12px;
-          border-radius: 8px;
-          background: #ffffff;
-          border: 1px solid #fca5a5;
-          color: #991b1b;
+          border-radius: 18px;
+          background: rgba(20,20,20,.72);
+          color: #fff;
+          font-size: 13px;
+          line-height: 1.3;
+          pointer-events: auto;
+        }
+        #${viewerId} .odp-controls {
+          display: flex;
+          align-items: center;
+          justify-content: flex-end;
+          gap: 6px;
+          min-width: 0;
+          pointer-events: auto;
+        }
+        #${viewerId} .odp-page-status {
+          min-width: 62px;
+          padding: 8px 7px;
+          border-radius: 18px;
+          background: rgba(20,20,20,.72);
+          color: #fff;
+          font-size: 13px;
+          font-weight: 650;
+          line-height: 1;
+          text-align: center;
+          white-space: nowrap;
+        }
+        #${viewerId} button {
+          width: 42px;
+          height: 42px;
+          flex: 0 0 42px;
+          display: inline-flex;
+          align-items: center;
+          justify-content: center;
+          border: 0;
+          border-radius: 21px;
+          background: rgba(35,35,35,.82);
+          color: #fff;
+          font-size: 25px;
           font-weight: 600;
-          text-decoration: none;
+          line-height: 1;
+          cursor: pointer;
+          touch-action: manipulation;
         }
-        @media (max-width: 640px) {
-          .pdf-viewer { min-height: 620px; }
-          .pdf-toolbar { gap: 6px; padding: 7px 5px; }
-          .pdf-toolbar button {
-            min-width: 40px;
-            min-height: 36px;
-            padding: 6px 9px;
-            font-size: 14px;
-          }
-          .page-status { min-width: 76px; font-size: 13px; }
-          .pdf-stage { padding: 8px; }
+        #${viewerId} button:disabled { opacity: .34; cursor: default; }
+        #${viewerId} .odp-fit { font-size: 14px; font-weight: 750; }
+        #${viewerId} .odp-fullscreen { font-size: 21px; }
+        #${viewerId} .odp-close { font-size: 28px; }
+        #${viewerId} .odp-help {
+          position: absolute;
+          left: 50%;
+          bottom: max(14px, env(safe-area-inset-bottom));
+          z-index: 4;
+          transform: translateX(-50%);
+          max-width: calc(100vw - 28px);
+          padding: 7px 12px;
+          border-radius: 16px;
+          background: rgba(20,20,20,.70);
+          color: #fff;
+          font-size: 13px;
+          line-height: 1.35;
+          text-align: center;
+          white-space: nowrap;
+          pointer-events: none;
+          opacity: 1;
+          transition: opacity .35s ease;
         }
-      </style>
-    </head>
-    <body>
-      <div class="pdf-viewer">
-        <div class="pdf-toolbar" aria-label="PDF操作">
-          <button id="prev-page" type="button" disabled aria-label="前のページ">◀</button>
-          <span id="page-status" class="page-status">読込中…</span>
-          <button id="next-page" type="button" disabled aria-label="次のページ">▶</button>
-          <button id="zoom-out" type="button" disabled aria-label="縮小">－</button>
-          <button id="fit-width" type="button" disabled aria-label="幅に合わせる">幅</button>
-          <button id="zoom-in" type="button" disabled aria-label="拡大">＋</button>
-        </div>
-        <div id="pdf-stage" class="pdf-stage">
-          <div id="loading-message" class="pdf-message">PDFを読み込んでいます…</div>
-          <div id="canvas-wrap" class="canvas-wrap" hidden>
-            <canvas id="pdf-canvas" aria-label="PDFページ"></canvas>
-          </div>
-          <div id="pdf-error" class="pdf-error" role="alert">
-            <strong>PDFを画面内に表示できませんでした。</strong><br>
-            下のリンクまたはダイアログ下部の保存ボタンから確認してください。<br>
-            <a id="open-pdf" href="#" target="_blank" rel="noopener">PDFを別画面で開く</a>
-          </div>
-        </div>
-      </div>
-      <script>
-        (() => {
-          const encodedPdf = __PDF_BASE64_JSON__;
-          const filename = __FILENAME_JSON__;
-          const pdfJsSources = [
-            {
-              script: "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js",
-              worker: "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js",
-            },
-            {
-              script: "https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.min.js",
-              worker: "https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.worker.min.js",
-            },
-            {
-              script: "https://unpkg.com/pdfjs-dist@3.11.174/build/pdf.min.js",
-              worker: "https://unpkg.com/pdfjs-dist@3.11.174/build/pdf.worker.min.js",
-            },
-          ];
-
-          const stage = document.getElementById("pdf-stage");
-          const canvas = document.getElementById("pdf-canvas");
-          const context = canvas.getContext("2d", { alpha: false });
-          const canvasWrap = document.getElementById("canvas-wrap");
-          const loadingMessage = document.getElementById("loading-message");
-          const errorBox = document.getElementById("pdf-error");
-          const openPdf = document.getElementById("open-pdf");
-          const pageStatus = document.getElementById("page-status");
-          const prevButton = document.getElementById("prev-page");
-          const nextButton = document.getElementById("next-page");
-          const zoomOutButton = document.getElementById("zoom-out");
-          const fitWidthButton = document.getElementById("fit-width");
-          const zoomInButton = document.getElementById("zoom-in");
-
-          let pdfDocument = null;
-          let currentPage = 1;
-          let zoom = 1;
-          let fitWidth = true;
-          let renderInProgress = false;
-          let pendingRender = false;
-          let blobUrl = "";
-          let resizeTimer = null;
-
-          function decodeBase64(base64Text) {
-            const binary = atob(base64Text);
-            const bytes = new Uint8Array(binary.length);
-            for (let index = 0; index < binary.length; index += 1) {
-              bytes[index] = binary.charCodeAt(index);
-            }
-            return bytes;
+        @media (max-width: 370px) {
+          #${viewerId} .odp-zoom-out,
+          #${viewerId} .odp-fit,
+          #${viewerId} .odp-zoom-in { display: none; }
+        }
+        @media (max-width: 760px) {
+          #${viewerId} .odp-toolbar {
+            top: max(6px, env(safe-area-inset-top));
+            left: 6px;
+            right: 6px;
+            gap: 6px;
           }
-
-          function prepareFallbackLink(pdfBytes) {
-            try {
-              const blob = new Blob([pdfBytes], { type: "application/pdf" });
-              blobUrl = URL.createObjectURL(blob);
-              openPdf.href = blobUrl;
-              openPdf.download = "";
-              openPdf.setAttribute("aria-label", `${filename}を別画面で開く`);
-            } catch (error) {
-              openPdf.style.display = "none";
-            }
+          #${viewerId} .odp-filename { display: none; }
+          #${viewerId} .odp-controls { width: 100%; justify-content: center; gap: 4px; }
+          #${viewerId} button {
+            width: 38px;
+            height: 38px;
+            flex-basis: 38px;
+            border-radius: 19px;
+            font-size: 22px;
           }
+          #${viewerId} .odp-fit { font-size: 13px; }
+          #${viewerId} .odp-fullscreen { display: none; }
+          #${viewerId} .odp-page-status { min-width: 54px; padding: 7px 5px; font-size: 12px; }
+          #${viewerId} .odp-page-anchor { top: 54px; }
+          #${viewerId} .odp-help { font-size: 12px; }
+        }
+      `;
+      overlay.appendChild(style);
+      parentDocument.body.appendChild(overlay);
+      parentDocument.body.style.overflow = "hidden";
 
-          function showError(error) {
-            console.error("PDF viewer error", error);
-            loadingMessage.style.display = "none";
-            canvasWrap.hidden = true;
-            errorBox.style.display = "block";
-            pageStatus.textContent = "表示失敗";
+      const stage = overlay.querySelector(".odp-stage");
+      const pageAnchor = overlay.querySelector(".odp-page-anchor");
+      const pageFrame = overlay.querySelector(".odp-page-frame");
+      const canvas = overlay.querySelector(".odp-canvas");
+      const context = canvas.getContext("2d", { alpha: false });
+      const loadingNode = overlay.querySelector(".odp-loading");
+      const errorNode = overlay.querySelector(".odp-error");
+      const filenameNode = overlay.querySelector(".odp-filename");
+      const pageStatus = overlay.querySelector(".odp-page-status");
+      const prevButton = overlay.querySelector(".odp-prev");
+      const nextButton = overlay.querySelector(".odp-next");
+      const zoomOutButton = overlay.querySelector(".odp-zoom-out");
+      const fitButton = overlay.querySelector(".odp-fit");
+      const zoomInButton = overlay.querySelector(".odp-zoom-in");
+      const fullscreenButton = overlay.querySelector(".odp-fullscreen");
+      const closeButton = overlay.querySelector(".odp-close");
+      const helpNode = overlay.querySelector(".odp-help");
+      filenameNode.textContent = filename;
+
+      let pdfDocument = null;
+      let currentPage = 1;
+      let renderTask = null;
+      let renderSerial = 0;
+      let baseWidth = 1;
+      let baseHeight = 1;
+      let viewScale = 1;
+      let translateX = 0;
+      let translateY = 0;
+      let resizeTimer = null;
+      let closed = false;
+      let helpTimer = parentWindow.setTimeout(() => {
+        helpNode.style.opacity = "0";
+      }, 2600);
+
+      const pointers = new Map();
+      let lastSinglePoint = null;
+      let lastPinchDistance = 0;
+      let lastPinchMidpoint = null;
+      let pointerMoved = false;
+      let lastTapAt = 0;
+      let lastTapX = 0;
+      let lastTapY = 0;
+
+      const clamp = (value, min, max) => Math.min(max, Math.max(min, value));
+      const topPadding = () => (parentWindow.innerWidth <= 760 ? 54 : 62);
+      const bottomPadding = () => 12;
+      const sidePadding = () => (parentWindow.innerWidth <= 760 ? 6 : 12);
+
+      function decodeBase64(base64Text) {
+        const binary = atob(base64Text);
+        const bytes = new Uint8Array(binary.length);
+        for (let index = 0; index < binary.length; index += 1) {
+          bytes[index] = binary.charCodeAt(index);
+        }
+        return bytes;
+      }
+
+      function midpoint(a, b) {
+        return { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
+      }
+
+      function distance(a, b) {
+        return Math.hypot(a.x - b.x, a.y - b.y);
+      }
+
+      function clampTranslation() {
+        const stageWidth = Math.max(1, stage.clientWidth);
+        const stageHeight = Math.max(1, stage.clientHeight);
+        const scaledWidth = baseWidth * viewScale;
+        const scaledHeight = baseHeight * viewScale;
+        const horizontalLimit = Math.max(0, (scaledWidth - stageWidth) / 2 + sidePadding());
+        const minimumY = Math.min(0, stageHeight - topPadding() - bottomPadding() - scaledHeight);
+        translateX = clamp(translateX, -horizontalLimit, horizontalLimit);
+        translateY = clamp(translateY, minimumY, 0);
+      }
+
+      function applyTransform() {
+        clampTranslation();
+        pageFrame.style.transform = `translate3d(${translateX}px, ${translateY}px, 0) scale(${viewScale})`;
+      }
+
+      function resetView() {
+        viewScale = 1;
+        translateX = 0;
+        translateY = 0;
+        applyTransform();
+      }
+
+      function zoomAt(newScale, clientX, clientY) {
+        const oldScale = viewScale;
+        newScale = clamp(newScale, 1, 8);
+        if (Math.abs(newScale - oldScale) < 0.001) return;
+        const rect = stage.getBoundingClientRect();
+        const stageX = clientX - rect.left - rect.width / 2;
+        const stageY = clientY - rect.top - topPadding();
+        const contentX = (stageX - translateX) / oldScale;
+        const contentY = (stageY - translateY) / oldScale;
+        viewScale = newScale;
+        translateX = stageX - contentX * newScale;
+        translateY = stageY - contentY * newScale;
+        if (viewScale <= 1.001) resetView();
+        else applyTransform();
+      }
+
+      function setControls() {
+        const ready = Boolean(pdfDocument);
+        prevButton.disabled = !ready || currentPage <= 1;
+        nextButton.disabled = !ready || currentPage >= pdfDocument.numPages;
+        zoomOutButton.disabled = !ready || viewScale <= 1.001;
+        fitButton.disabled = !ready;
+        zoomInButton.disabled = !ready || viewScale >= 7.999;
+        pageStatus.textContent = ready ? `${currentPage} / ${pdfDocument.numPages}` : "読込中…";
+      }
+
+      function showError(error) {
+        console.error("PDF viewer error", error);
+        loadingNode.hidden = true;
+        pageAnchor.style.display = "none";
+        errorNode.hidden = false;
+        pageStatus.textContent = "表示失敗";
+      }
+
+      async function loadPdfJs() {
+        if (window.pdfjsLib) {
+          return { library: window.pdfjsLib, worker: pdfJsSources[0].worker };
+        }
+        for (const source of pdfJsSources) {
+          try {
+            const library = await new Promise((resolve, reject) => {
+              const script = document.createElement("script");
+              script.src = source.script;
+              script.async = true;
+              script.onload = () => {
+                if (window.pdfjsLib) resolve(window.pdfjsLib);
+                else reject(new Error("PDF.jsを初期化できませんでした。"));
+              };
+              script.onerror = () => reject(new Error("PDF.jsを読み込めませんでした。"));
+              document.head.appendChild(script);
+            });
+            return { library, worker: source.worker };
+          } catch (error) {
+            console.warn("PDF.js source failed", source.script, error);
           }
+        }
+        throw new Error("PDF.jsを読み込めませんでした。");
+      }
 
-          function setControlsEnabled(enabled) {
-            prevButton.disabled = !enabled || currentPage <= 1;
-            nextButton.disabled = !enabled || !pdfDocument || currentPage >= pdfDocument.numPages;
-            zoomOutButton.disabled = !enabled;
-            fitWidthButton.disabled = !enabled;
-            zoomInButton.disabled = !enabled;
+      async function renderPage(resetPosition = true) {
+        if (!pdfDocument || closed) return;
+        const serial = ++renderSerial;
+        if (renderTask && typeof renderTask.cancel === "function") {
+          try { renderTask.cancel(); } catch (_) {}
+        }
+        setControls();
+        try {
+          const page = await pdfDocument.getPage(currentPage);
+          if (serial !== renderSerial || closed) return;
+          const unitViewport = page.getViewport({ scale: 1 });
+          const availableWidth = Math.max(240, stage.clientWidth - sidePadding() * 2);
+          const fitScale = availableWidth / unitViewport.width;
+          const viewport = page.getViewport({ scale: fitScale });
+          const pixelRatio = Math.min(3, Math.max(1.5, parentWindow.devicePixelRatio || 1));
+
+          baseWidth = viewport.width;
+          baseHeight = viewport.height;
+          canvas.width = Math.max(1, Math.floor(baseWidth * pixelRatio));
+          canvas.height = Math.max(1, Math.floor(baseHeight * pixelRatio));
+          canvas.style.width = `${Math.floor(baseWidth)}px`;
+          canvas.style.height = `${Math.floor(baseHeight)}px`;
+          pageAnchor.style.width = `${Math.floor(baseWidth)}px`;
+          pageAnchor.style.height = `${Math.floor(baseHeight)}px`;
+          pageAnchor.style.display = "block";
+
+          renderTask = page.render({
+            canvasContext: context,
+            viewport,
+            transform: [pixelRatio, 0, 0, pixelRatio, 0, 0],
+            background: "rgb(255,255,255)",
+          });
+          await renderTask.promise;
+          if (serial !== renderSerial || closed) return;
+
+          loadingNode.hidden = true;
+          errorNode.hidden = true;
+          if (resetPosition) resetView();
+          else applyTransform();
+          setControls();
+        } catch (error) {
+          if (error && error.name === "RenderingCancelledException") return;
+          showError(error);
+        } finally {
+          renderTask = null;
+        }
+      }
+
+      function changePage(delta) {
+        if (!pdfDocument) return;
+        const nextPage = clamp(currentPage + delta, 1, pdfDocument.numPages);
+        if (nextPage === currentPage) return;
+        currentPage = nextPage;
+        renderPage(true);
+      }
+
+      function closeViewer() {
+        if (closed) return;
+        closed = true;
+        parentWindow.clearTimeout(helpTimer);
+        parentWindow.clearTimeout(resizeTimer);
+        renderSerial += 1;
+        if (renderTask && typeof renderTask.cancel === "function") {
+          try { renderTask.cancel(); } catch (_) {}
+        }
+        parentDocument.removeEventListener("keydown", onKeyDown, true);
+        parentWindow.removeEventListener("resize", onResize, true);
+        if (parentDocument.fullscreenElement === overlay && parentDocument.exitFullscreen) {
+          parentDocument.exitFullscreen().catch(() => {});
+        }
+        parentDocument.body.style.overflow = oldOverflow;
+        if (overlay.isConnected) overlay.remove();
+        if (parentWindow[viewerGlobalKey] === closeViewer) {
+          delete parentWindow[viewerGlobalKey];
+        }
+      }
+
+      parentWindow[viewerGlobalKey] = closeViewer;
+
+      function onKeyDown(event) {
+        if (event.key === "Escape") closeViewer();
+        else if (event.key === "ArrowLeft" || event.key === "PageUp") changePage(-1);
+        else if (event.key === "ArrowRight" || event.key === "PageDown") changePage(1);
+        else if (event.key === "+" || event.key === "=") {
+          const rect = stage.getBoundingClientRect();
+          zoomAt(viewScale * 1.25, rect.left + rect.width / 2, rect.top + rect.height / 2);
+          setControls();
+        } else if (event.key === "-") {
+          const rect = stage.getBoundingClientRect();
+          zoomAt(viewScale / 1.25, rect.left + rect.width / 2, rect.top + rect.height / 2);
+          setControls();
+        }
+      }
+
+      function onResize() {
+        if (!pdfDocument || closed) return;
+        parentWindow.clearTimeout(resizeTimer);
+        resizeTimer = parentWindow.setTimeout(() => renderPage(true), 180);
+      }
+
+      parentDocument.addEventListener("keydown", onKeyDown, true);
+      parentWindow.addEventListener("resize", onResize, true);
+      closeButton.addEventListener("click", closeViewer);
+      prevButton.addEventListener("click", () => changePage(-1));
+      nextButton.addEventListener("click", () => changePage(1));
+      fitButton.addEventListener("click", () => {
+        resetView();
+        setControls();
+      });
+      zoomInButton.addEventListener("click", () => {
+        const rect = stage.getBoundingClientRect();
+        zoomAt(viewScale * 1.25, rect.left + rect.width / 2, rect.top + rect.height / 2);
+        setControls();
+      });
+      zoomOutButton.addEventListener("click", () => {
+        const rect = stage.getBoundingClientRect();
+        zoomAt(viewScale / 1.25, rect.left + rect.width / 2, rect.top + rect.height / 2);
+        setControls();
+      });
+      fullscreenButton.addEventListener("click", async () => {
+        try {
+          if (parentDocument.fullscreenElement) await parentDocument.exitFullscreen();
+          else if (overlay.requestFullscreen) await overlay.requestFullscreen();
+        } catch (_) {}
+      });
+
+      stage.addEventListener("pointerdown", (event) => {
+        event.preventDefault();
+        stage.setPointerCapture?.(event.pointerId);
+        pointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
+        pointerMoved = false;
+        if (pointers.size === 1) {
+          lastSinglePoint = { x: event.clientX, y: event.clientY };
+          stage.classList.add("odp-dragging");
+        } else if (pointers.size === 2) {
+          const values = Array.from(pointers.values());
+          lastPinchDistance = distance(values[0], values[1]);
+          lastPinchMidpoint = midpoint(values[0], values[1]);
+        }
+      }, { passive: false });
+
+      stage.addEventListener("pointermove", (event) => {
+        if (!pointers.has(event.pointerId)) return;
+        event.preventDefault();
+        const previous = pointers.get(event.pointerId);
+        pointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
+        if (Math.hypot(event.clientX - previous.x, event.clientY - previous.y) > 2) {
+          pointerMoved = true;
+        }
+
+        if (pointers.size >= 2) {
+          const values = Array.from(pointers.values()).slice(0, 2);
+          const currentDistance = distance(values[0], values[1]);
+          const currentMidpoint = midpoint(values[0], values[1]);
+          if (lastPinchDistance > 0 && lastPinchMidpoint) {
+            const targetScale = viewScale * (currentDistance / lastPinchDistance);
+            zoomAt(targetScale, currentMidpoint.x, currentMidpoint.y);
+            translateX += currentMidpoint.x - lastPinchMidpoint.x;
+            translateY += currentMidpoint.y - lastPinchMidpoint.y;
+            applyTransform();
+            setControls();
           }
+          lastPinchDistance = currentDistance;
+          lastPinchMidpoint = currentMidpoint;
+          lastSinglePoint = null;
+        } else if (pointers.size === 1 && lastSinglePoint) {
+          translateX += event.clientX - lastSinglePoint.x;
+          translateY += event.clientY - lastSinglePoint.y;
+          lastSinglePoint = { x: event.clientX, y: event.clientY };
+          applyTransform();
+        }
+      }, { passive: false });
 
-          function calculateScale(page) {
-            const baseViewport = page.getViewport({ scale: 1 });
-            if (!fitWidth) return zoom;
-            const availableWidth = Math.max(240, stage.clientWidth - 30);
-            return Math.max(0.25, Math.min(4, availableWidth / baseViewport.width));
+      function finishPointer(event) {
+        const point = pointers.get(event.pointerId) || { x: event.clientX, y: event.clientY };
+        pointers.delete(event.pointerId);
+        if (pointers.size === 1) {
+          const remaining = Array.from(pointers.values())[0];
+          lastSinglePoint = { x: remaining.x, y: remaining.y };
+          lastPinchDistance = 0;
+          lastPinchMidpoint = null;
+        } else if (pointers.size === 0) {
+          stage.classList.remove("odp-dragging");
+          lastSinglePoint = null;
+          lastPinchDistance = 0;
+          lastPinchMidpoint = null;
+          const now = Date.now();
+          if (!pointerMoved && now - lastTapAt < 320 && Math.hypot(point.x - lastTapX, point.y - lastTapY) < 36) {
+            if (viewScale > 1.05) resetView();
+            else zoomAt(2.5, point.x, point.y);
+            setControls();
+            lastTapAt = 0;
+          } else if (!pointerMoved) {
+            lastTapAt = now;
+            lastTapX = point.x;
+            lastTapY = point.y;
           }
+        }
+      }
 
-          async function renderPage() {
-            if (!pdfDocument) return;
-            if (renderInProgress) {
-              pendingRender = true;
-              return;
-            }
+      stage.addEventListener("pointerup", finishPointer, { passive: false });
+      stage.addEventListener("pointercancel", finishPointer, { passive: false });
 
-            renderInProgress = true;
-            pendingRender = false;
-            setControlsEnabled(false);
-            pageStatus.textContent = `${currentPage} / ${pdfDocument.numPages}`;
+      stage.addEventListener("wheel", (event) => {
+        event.preventDefault();
+        const factor = event.deltaY < 0 ? 1.18 : 1 / 1.18;
+        zoomAt(viewScale * factor, event.clientX, event.clientY);
+        setControls();
+      }, { passive: false });
 
-            try {
-              const page = await pdfDocument.getPage(currentPage);
-              const scale = calculateScale(page);
-              const viewport = page.getViewport({ scale });
-              const pixelRatio = Math.min(window.devicePixelRatio || 1, 2.5);
-
-              canvas.width = Math.max(1, Math.floor(viewport.width * pixelRatio));
-              canvas.height = Math.max(1, Math.floor(viewport.height * pixelRatio));
-              canvas.style.width = `${Math.floor(viewport.width)}px`;
-              canvas.style.height = `${Math.floor(viewport.height)}px`;
-
-              const transform = pixelRatio === 1
-                ? null
-                : [pixelRatio, 0, 0, pixelRatio, 0, 0];
-
-              await page.render({
-                canvasContext: context,
-                viewport,
-                transform,
-                background: "rgb(255,255,255)",
-              }).promise;
-
-              loadingMessage.style.display = "none";
-              errorBox.style.display = "none";
-              canvasWrap.hidden = false;
-              pageStatus.textContent = `${currentPage} / ${pdfDocument.numPages}`;
-              stage.scrollTo({ top: 0, left: 0, behavior: "auto" });
-            } catch (error) {
-              showError(error);
-            } finally {
-              renderInProgress = false;
-              setControlsEnabled(Boolean(pdfDocument));
-              if (pendingRender) renderPage();
-            }
+      (async () => {
+        try {
+          const pdfBytes = decodeBase64(encodedPdf);
+          const loadedPdfJs = await loadPdfJs();
+          if (closed) return;
+          const pdfjsLib = loadedPdfJs.library;
+          pdfjsLib.GlobalWorkerOptions.workerSrc = loadedPdfJs.worker;
+          pdfDocument = await pdfjsLib.getDocument({ data: pdfBytes }).promise;
+          if (!pdfDocument || pdfDocument.numPages < 1) {
+            throw new Error("PDFに表示できるページがありません。");
           }
-
-          async function loadPdfJs() {
-            if (window.pdfjsLib) {
-              return { library: window.pdfjsLib, worker: pdfJsSources[0].worker };
-            }
-
-            for (const source of pdfJsSources) {
-              try {
-                const library = await new Promise((resolve, reject) => {
-                  const script = document.createElement("script");
-                  script.src = source.script;
-                  script.async = true;
-                  script.onload = () => {
-                    if (window.pdfjsLib) resolve(window.pdfjsLib);
-                    else reject(new Error("PDF.jsを初期化できませんでした。"));
-                  };
-                  script.onerror = () => reject(new Error("PDF.jsを読み込めませんでした。"));
-                  document.head.appendChild(script);
-                });
-                return { library, worker: source.worker };
-              } catch (error) {
-                console.warn("PDF.js source failed", source.script, error);
-              }
-            }
-            throw new Error("PDF.jsを読み込めませんでした。");
-          }
-
-          prevButton.addEventListener("click", () => {
-            if (!pdfDocument || currentPage <= 1) return;
-            currentPage -= 1;
-            renderPage();
-          });
-
-          nextButton.addEventListener("click", () => {
-            if (!pdfDocument || currentPage >= pdfDocument.numPages) return;
-            currentPage += 1;
-            renderPage();
-          });
-
-          zoomOutButton.addEventListener("click", () => {
-            fitWidth = false;
-            zoom = Math.max(0.35, zoom / 1.2);
-            renderPage();
-          });
-
-          zoomInButton.addEventListener("click", () => {
-            fitWidth = false;
-            zoom = Math.min(4, zoom * 1.2);
-            renderPage();
-          });
-
-          fitWidthButton.addEventListener("click", () => {
-            fitWidth = true;
-            renderPage();
-          });
-
-          window.addEventListener("resize", () => {
-            if (!pdfDocument || !fitWidth) return;
-            window.clearTimeout(resizeTimer);
-            resizeTimer = window.setTimeout(renderPage, 160);
-          });
-
-          window.addEventListener("beforeunload", () => {
-            if (blobUrl) URL.revokeObjectURL(blobUrl);
-          });
-
-          (async () => {
-            try {
-              const pdfBytes = decodeBase64(encodedPdf);
-              prepareFallbackLink(pdfBytes);
-              const loadedPdfJs = await loadPdfJs();
-              const pdfjsLib = loadedPdfJs.library;
-              pdfjsLib.GlobalWorkerOptions.workerSrc = loadedPdfJs.worker;
-              pdfDocument = await pdfjsLib.getDocument({ data: pdfBytes }).promise;
-              if (!pdfDocument || pdfDocument.numPages < 1) {
-                throw new Error("PDFに表示できるページがありません。");
-              }
-              currentPage = 1;
-              setControlsEnabled(true);
-              await renderPage();
-            } catch (error) {
-              showError(error);
-            }
-          })();
-        })();
-      </script>
-    </body>
-    </html>
+          currentPage = 1;
+          await renderPage(true);
+        } catch (error) {
+          if (!closed) showError(error);
+        }
+      })();
+    })();
+    </script>
     """
+    viewer_html = viewer_html.replace("__VIEWER_ID_JSON__", json.dumps(viewer_id))
     viewer_html = viewer_html.replace("__PDF_BASE64_JSON__", json.dumps(encoded))
     viewer_html = viewer_html.replace(
         "__FILENAME_JSON__",
@@ -2031,10 +2289,10 @@ def render_onedrive_pdf_inline(pdf_content, filename):
     )
     components.html(
         viewer_html,
-        height=740,
+        height=1,
+        width=1,
         scrolling=False,
     )
-
 
 def download_onedrive_thumbnail(access_token, item_id):
     response = onedrive_graph_request(
@@ -2629,18 +2887,9 @@ def show_onedrive_image_dialog(image_content, filename):
     )
 
 
-@st.dialog("PDFを表示", width="large")
 def show_onedrive_pdf_dialog(pdf_content, filename, mime_type, metadata_id):
-    """現在の画面位置を保ったまま、PDFをダイアログ内に表示する。"""
+    """現在の画面位置を保ったまま、PDFを全画面ビューアーで表示する。"""
     render_onedrive_pdf_inline(pdf_content, filename)
-    st.download_button(
-        "PDFを端末に保存",
-        data=pdf_content,
-        file_name=filename,
-        mime=mime_type or "application/pdf",
-        use_container_width=True,
-        key=f"onedrive_attachment_pdf_dialog_download_{metadata_id}",
-    )
 
 
 
