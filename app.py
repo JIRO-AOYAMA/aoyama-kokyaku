@@ -10017,6 +10017,12 @@ def get_product_search_rows(df):
     rows["_商品名検索"] = rows["商品名"].apply(
         lambda value: clean_value(value, blank_text="").strip()
     )
+    if "メーカー" in rows.columns:
+        rows["_メーカー検索"] = rows["メーカー"].apply(
+            lambda value: clean_value(value, blank_text="").strip()
+        )
+    else:
+        rows["_メーカー検索"] = ""
     rows["_顧客名検索"] = rows["顧客名"].apply(
         lambda value: clean_value(value, blank_text="").strip()
     )
@@ -10028,19 +10034,24 @@ def get_product_search_rows(df):
 
 
 def get_product_search_candidates(product_rows, keyword):
-    """入力文字を含む、現在または過去に登録された商品名を候補タブ用に返す。"""
+    """商品名またはメーカー名に入力文字を含む商品を候補タブ用に返す。"""
     keyword = str(keyword or "").strip()
     if product_rows.empty or not keyword:
         return []
 
-    matches = product_rows[
-        product_rows["_商品名検索"].str.contains(
-            keyword,
-            case=False,
-            na=False,
-            regex=False,
-        )
-    ]
+    product_matches = product_rows["_商品名検索"].str.contains(
+        keyword,
+        case=False,
+        na=False,
+        regex=False,
+    )
+    manufacturer_matches = product_rows["_メーカー検索"].str.contains(
+        keyword,
+        case=False,
+        na=False,
+        regex=False,
+    )
+    matches = product_rows[product_matches | manufacturer_matches]
     candidates = matches["_商品名検索"].drop_duplicates().tolist()
     keyword_folded = keyword.casefold()
     return sorted(
@@ -10167,7 +10178,7 @@ def show_product_search(df=None):
     st.subheader("🔎 商品検索")
     show_back_home_button("product_back_home")
     st.caption(
-        "商品名の一部を入力し、候補タブを選んでください。"
+        "商品名またはメーカー名の一部を入力し、候補タブを選んでください。"
         "次回配達日や残数には関係なく、現在使用中の顧客と過去に使用した顧客を分けて表示します。"
     )
 
@@ -10175,9 +10186,9 @@ def show_product_search(df=None):
     if st_keyup is not None:
         keyword = str(
             st_keyup(
-                "商品名で検索",
+                "商品名・メーカーで検索",
                 value=default_keyword,
-                placeholder="例：酒 と入力すると酒粕などが候補に出ます",
+                placeholder="例：酒、日清丸紅",
                 debounce=250,
                 key="product_search_live",
             )
@@ -10185,9 +10196,9 @@ def show_product_search(df=None):
         ).strip()
     else:
         keyword = st.text_input(
-            "商品名で検索",
+            "商品名・メーカーで検索",
             value=default_keyword,
-            placeholder="例：酒 と入力すると酒粕などが候補に出ます",
+            placeholder="例：酒、日清丸紅",
             key="product_search_input",
             help=VOICE_INPUT_HELP,
         ).strip()
@@ -10198,7 +10209,7 @@ def show_product_search(df=None):
         update_query_params(page="product", product_search=None)
 
     if not keyword:
-        st.info("商品名を入力してください。")
+        st.info("商品名またはメーカー名を入力してください。")
         return
 
     if df is None:
@@ -10209,7 +10220,7 @@ def show_product_search(df=None):
     candidates = get_product_search_candidates(product_rows, keyword)
 
     if not candidates:
-        st.warning("該当する商品名がありません。")
+        st.warning("該当する商品がありません。")
         return
 
     st.write(f"商品候補：{len(candidates)}件")
