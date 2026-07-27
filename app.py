@@ -10109,24 +10109,42 @@ def build_exact_product_search_results(product_rows, product_name, keyword=""):
 
         if not active_group.empty:
             duplicate_count = len(active_group)
-            usage_text = (
-                format_number(active_group.iloc[0]["使用数量/日"])
-                if duplicate_count == 1
-                else "複数行（確認が必要）"
-            )
+            if duplicate_count == 1:
+                active_row = active_group.iloc[0]
+                usage_text = format_number(active_row["使用数量/日"])
+                manufacturer = clean_value(
+                    active_row.get("メーカー"),
+                    blank_text="未設定",
+                )
+                next_delivery = format_date(active_row.get("次回配達予定"))
+            else:
+                usage_text = "複数行（確認が必要）"
+                manufacturer = "複数行（確認が必要）"
+                next_delivery = "複数行（確認が必要）"
+
             current_results.append(
                 {
                     "顧客名": customer_name,
                     "地域": region,
+                    "メーカー": manufacturer,
                     "使用数量/日": usage_text,
+                    "次回配達予定": next_delivery,
                     "重複件数": duplicate_count,
                 }
             )
         else:
+            past_row = group.iloc[0]
             past_results.append(
                 {
                     "顧客名": customer_name,
                     "地域": region,
+                    "メーカー": clean_value(
+                        past_row.get("メーカー"),
+                        blank_text="未設定",
+                    ),
+                    "次回配達予定": format_date(
+                        past_row.get("次回配達予定")
+                    ),
                 }
             )
 
@@ -10152,9 +10170,17 @@ def render_product_search_customer(item, keyword, current):
         st.caption("地域")
         st.markdown(f"**{html.escape(item['地域'])}**")
 
+        st.caption("メーカー")
+        st.markdown(f"**{html.escape(item['メーカー'])}**")
+
         if current:
             st.caption("使用数量/日")
             st.markdown(f"**{html.escape(item['使用数量/日'])}**")
+
+        st.caption("次回配達予定")
+        st.markdown(f"**{html.escape(item['次回配達予定'])}**")
+
+        if current:
             if item["重複件数"] > 1:
                 st.warning(
                     "同じ顧客名・商品名の使用中行が複数見つかりました。"
@@ -10162,6 +10188,15 @@ def render_product_search_customer(item, keyword, current):
                 )
         else:
             st.caption("この商品を過去に使用")
+
+
+def render_product_search_customer_grid(items, keyword, current):
+    """商品検索の顧客カードを、1段につき2件ずつ表示する。"""
+    for start in range(0, len(items), 2):
+        columns = st.columns(2)
+        for column, item in zip(columns, items[start:start + 2]):
+            with column:
+                render_product_search_customer(item, keyword, current)
 
 
 def render_product_search_results(product_rows, product_name, keyword):
@@ -10181,8 +10216,11 @@ def render_product_search_results(product_rows, product_name, keyword):
     if not current_results:
         st.info("この商品を現在使用している顧客はいません。")
     else:
-        for item in current_results:
-            render_product_search_customer(item, keyword, current=True)
+        render_product_search_customer_grid(
+            current_results,
+            keyword,
+            current=True,
+        )
 
     with st.expander(
         f"⚪ 過去に使用　{len(past_results)}件",
@@ -10191,8 +10229,11 @@ def render_product_search_results(product_rows, product_name, keyword):
         if not past_results:
             st.info("この商品を過去に使用した顧客はいません。")
         else:
-            for item in past_results:
-                render_product_search_customer(item, keyword, current=False)
+            render_product_search_customer_grid(
+                past_results,
+                keyword,
+                current=False,
+            )
 
 
 def show_product_search(df=None):
