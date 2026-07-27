@@ -2536,11 +2536,11 @@ cookie_login_token = get_login_token_from_cookie()
 login_token_payload = validate_login_token(cookie_login_token)
 
 if cookie_login_token and not login_token_payload:
-    # 期限切れ・改変済みのCookieが残っている場合は、Microsoftから再ログインする。
-    clear_application_login_state(revoke_current=False)
-    st.session_state["microsoft_force_logout"] = True
-    set_query_params_safely({"page": "home", "expired": "1"})
-    st.rerun()
+    # 旧3時間版・期限切れ・改変済みのアプリ用Cookieだけを削除する。
+    # Microsoft本人確認はすでに成功しているため、ここでMicrosoftからはログアウトしない。
+    clear_login_token_cookie()
+    st.session_state.pop("login_token", None)
+    cookie_login_token = ""
 
 if not login_token_payload:
     # 初回発行はMicrosoftログインから12時間以内に限定する。
