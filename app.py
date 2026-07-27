@@ -10045,11 +10045,14 @@ def get_product_search_candidates(product_rows, keyword):
         na=False,
         regex=False,
     )
-    manufacturer_matches = product_rows["_メーカー検索"].str.contains(
-        keyword,
-        case=False,
-        na=False,
-        regex=False,
+    manufacturer_matches = (
+        product_rows["_メーカー検索"].str.contains(
+            keyword,
+            case=False,
+            na=False,
+            regex=False,
+        )
+        & (~product_rows["使用数量/日"].apply(is_blank_or_zero))
     )
     matches = product_rows[product_matches | manufacturer_matches]
     candidates = matches["_商品名検索"].drop_duplicates().tolist()
@@ -10066,9 +10069,26 @@ def get_product_search_candidates(product_rows, keyword):
     )
 
 
-def build_exact_product_search_results(product_rows, product_name):
-    """商品名の完全一致結果を顧客単位にまとめ、現在使用中と過去使用に分ける。"""
+def build_exact_product_search_results(product_rows, product_name, keyword=""):
+    """商品名検索は従来どおり、メーカー検索は現在使用中の一致行だけを返す。"""
     exact = product_rows[product_rows["_商品名検索"] == product_name].copy()
+
+    keyword_text = str(keyword or "").strip()
+    product_name_matches_keyword = (
+        bool(keyword_text)
+        and keyword_text.casefold() in str(product_name or "").casefold()
+    )
+    if keyword_text and not product_name_matches_keyword:
+        exact = exact[
+            exact["_メーカー検索"].str.contains(
+                keyword_text,
+                case=False,
+                na=False,
+                regex=False,
+            )
+            & (~exact["使用数量/日"].apply(is_blank_or_zero))
+        ].copy()
+
     if exact.empty:
         return [], []
 
@@ -10149,6 +10169,7 @@ def render_product_search_results(product_rows, product_name, keyword):
     current_results, past_results = build_exact_product_search_results(
         product_rows,
         product_name,
+        keyword,
     )
 
     st.markdown(
