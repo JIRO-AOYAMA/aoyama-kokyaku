@@ -168,7 +168,9 @@ MICROSOFT_ISSUER_PREFIX = "https://login.microsoftonline.com/"
 MICROSOFT_AUTH_CLOCK_SKEW_SECONDS = 60
 LOGIN_TOKEN_COOKIE_KEY = "signed_login_token"
 LOGIN_TOKEN_COOKIE_PREFIX = "aoyama-kokyaku/login/"
-LOGIN_TOKEN_TTL_SECONDS = 3 * 60 * 60
+LOGIN_TOKEN_TTL_SECONDS = 12 * 60 * 60
+# 有効期限まで1時間を切った状態でアプリが開かれていれば、12時間へ更新する。
+LOGIN_TOKEN_REFRESH_THRESHOLD_SECONDS = 60 * 60
 LOGIN_TOKEN_VERSION = 1
 LOGIN_TOKEN_AUDIENCE = "aoyama-kokyaku"
 LOGIN_TOKEN_CLOCK_SKEW_SECONDS = 30
@@ -570,16 +572,17 @@ def is_login_token_revoked(token_id, now=None):
         return token_id in store["items"]
 
 
-def create_login_token(now=None):
-    """別Secretで署名した、ログイン成功から3時間だけ有効なトークンを作る。"""
+def create_login_token(now=None, token_id=None):
+    """別Secretで署名した、発行時点から12時間有効なトークンを作る。"""
     if not LOGIN_TOKEN_SECRET:
         raise RuntimeError("LOGIN_TOKEN_SECRET が設定されていません。")
     issued_at = int(time.time() if now is None else now)
+    session_token_id = str(token_id or "").strip() or uuid.uuid4().hex
     payload = {
         "aud": LOGIN_TOKEN_AUDIENCE,
         "exp": issued_at + LOGIN_TOKEN_TTL_SECONDS,
         "iat": issued_at,
-        "jti": uuid.uuid4().hex,
+        "jti": session_token_id,
         "ver": LOGIN_TOKEN_VERSION,
     }
     payload_bytes = json.dumps(
@@ -598,7 +601,7 @@ def create_login_token(now=None):
 
 
 def validate_login_token(token, now=None, check_revocation=True):
-    """署名・用途・発行時刻・3時間期限を確認し、有効時だけpayloadを返す。"""
+    """署名・用途・発行時刻・12時間期限を確認し、有効時だけpayloadを返す。"""
     if not LOGIN_TOKEN_SECRET:
         return None
     token_text = str(token or "").strip()
@@ -639,6 +642,27 @@ def validate_login_token(token, now=None, check_revocation=True):
     if check_revocation and is_login_token_revoked(token_id, now=current_time):
         return None
     return payload
+
+
+def refresh_login_token_if_needed(token, now=None):
+    """有効期限が近いトークンを、アプリ利用中に12時間へ安全に更新する。"""
+    payload = validate_login_token(token, now=now)
+    if not payload:
+        return ""
+
+    current_time = int(time.time() if now is None else now)
+    expires_at = int(payload.get("exp") or 0)
+    if expires_at - current_time > LOGIN_TOKEN_REFRESH_THRESHOLD_SECONDS:
+        return str(token or "").strip()
+
+    # 同じログインセッションとして扱うため、監査用のjtiは引き継ぐ。
+    refreshed_token = create_login_token(
+        now=current_time,
+        token_id=payload.get("jti"),
+    )
+    save_login_token_cookie(refreshed_token)
+    st.session_state["login_token"] = refreshed_token
+    return refreshed_token
 
 
 def revoke_login_token(token):
@@ -850,7 +874,7 @@ def validate_microsoft_identity(claims, require_allowed_sub=True):
 
 
 def microsoft_auth_seconds_remaining(claims, now=None):
-    """Microsoftログイン開始から、アプリ側の3時間期限までの残り秒数を返す。"""
+    """Microsoftログイン後、初回トークンを発行できる12時間の残り秒数を返す。"""
     try:
         issued_at = int(dict(claims or {}).get("iat"))
     except (TypeError, ValueError):
@@ -866,7 +890,7 @@ def is_microsoft_auth_current(claims, now=None):
 
 
 def clear_application_login_state(revoke_current=True):
-    """独自の3時間トークンと画面内ログイン状態をまとめて消す。"""
+    """独自の12時間トークンと画面内ログイン状態をまとめて消す。"""
     if revoke_current:
         revoke_login_token(get_active_login_token())
     clear_login_token_cookie()
@@ -876,11 +900,17 @@ def clear_application_login_state(revoke_current=True):
 
 @st.fragment(run_every="10s")
 def enforce_login_expiry():
-    """Microsoft認証または独自トークンが切れたら、Microsoftログアウトへ進める。"""
+    """Microsoft本人確認と独自トークンを確認し、利用中は期限を12時間へ更新する。"""
     claims = get_microsoft_user_claims()
     token = str(st.session_state.get("login_token", "") or "").strip()
     identity_error = validate_microsoft_identity(claims, require_allowed_sub=True)
-    if not identity_error and is_microsoft_auth_current(claims) and validate_login_token(token):
+    token_payload = validate_login_token(token)
+    if not identity_error and token_payload:
+        # 更新に失敗しても、現在のトークンが有効な間は画面を中断しない。
+        try:
+            refresh_login_token_if_needed(token)
+        except Exception:
+            pass
         return
 
     clear_application_login_state(revoke_current=True)
@@ -1420,7 +1450,7 @@ def get_onedrive_access_token():
 
 
 def process_onedrive_callback_if_present():
-    """有効な3時間ログインを確認してから、Microsoft認証の戻りを処理する。"""
+    """有効な12時間ログインを確認してから、Microsoft認証の戻りを処理する。"""
     params = get_raw_query_params()
     if not params.get("code") and not params.get("error"):
         return False
@@ -2499,12 +2529,6 @@ if not hmac.compare_digest(microsoft_sub, MICROSOFT_ALLOWED_SUB):
         st.logout()
     st.stop()
 
-if not is_microsoft_auth_current(microsoft_claims):
-    clear_application_login_state(revoke_current=True)
-    st.warning("取引先カルテの3時間のログイン期限が切れました。もう一度Microsoftでログインしてください。")
-    st.logout()
-    st.stop()
-
 # OneDrive認証から戻った場合も、許可されたMicrosoftアカウントを確認した後で処理する。
 process_onedrive_callback_if_present()
 
@@ -2512,15 +2536,34 @@ cookie_login_token = get_login_token_from_cookie()
 login_token_payload = validate_login_token(cookie_login_token)
 
 if cookie_login_token and not login_token_payload:
-    clear_login_token_cookie()
+    # 期限切れ・改変済みのCookieが残っている場合は、Microsoftから再ログインする。
+    clear_application_login_state(revoke_current=False)
+    st.session_state["microsoft_force_logout"] = True
+    set_query_params_safely({"page": "home", "expired": "1"})
+    st.rerun()
 
 if not login_token_payload:
-    # Microsoft本人確認が成功した時だけ、既存処理用の3時間トークンを発行する。
+    # 初回発行はMicrosoftログインから12時間以内に限定する。
+    # 有効な独自トークンがある間は、Microsoftのiatが12時間を超えても利用を継続できる。
+    if not is_microsoft_auth_current(microsoft_claims):
+        clear_application_login_state(revoke_current=False)
+        st.session_state["microsoft_force_logout"] = True
+        set_query_params_safely({"page": "home", "expired": "1"})
+        st.rerun()
     cookie_login_token = create_login_token()
     save_login_token_cookie(cookie_login_token)
     login_token_payload = validate_login_token(cookie_login_token)
 
 if login_token_payload:
+    # 残り1時間を切っていれば、操作中に切れないよう12時間へ更新する。
+    try:
+        refreshed_login_token = refresh_login_token_if_needed(cookie_login_token)
+        if refreshed_login_token:
+            cookie_login_token = refreshed_login_token
+            login_token_payload = validate_login_token(cookie_login_token)
+    except Exception:
+        # 更新に失敗しても、現在のトークンが有効な間は従来どおり利用を続ける。
+        pass
     st.session_state.authenticated = True
     st.session_state["login_token"] = cookie_login_token
 else:
