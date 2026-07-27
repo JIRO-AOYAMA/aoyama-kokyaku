@@ -1640,27 +1640,399 @@ def download_onedrive_file(access_token, item_id):
 
 
 def render_onedrive_pdf_inline(pdf_content, filename):
-    """OneDriveへ移動せず、現在の顧客カルテ内にPDFを表示する。"""
-    encoded = base64.b64encode(bytes(pdf_content or b"")).decode("ascii")
-    safe_filename = html.escape(str(filename or "PDF"))
-    components.html(
-        f"""
-        <div style="width:100%; margin:0; padding:0;">
-          <object
-            data="data:application/pdf;base64,{encoded}"
-            type="application/pdf"
-            width="100%"
-            height="720"
-            aria-label="{safe_filename}"
-          >
-            <div style="padding:16px; font-family:sans-serif; line-height:1.6;">
-              この端末ではPDFを画面内に表示できません。下の保存ボタンから確認してください。
-            </div>
-          </object>
+    """OneDriveへ移動せず、PC・スマホ共通のPDF.jsビューアーで表示する。"""
+    pdf_bytes = bytes(pdf_content or b"")
+    if not pdf_bytes:
+        st.error("PDFデータが空のため表示できません。")
+        return
+
+    encoded = base64.b64encode(pdf_bytes).decode("ascii")
+    viewer_html = r"""
+    <!doctype html>
+    <html lang="ja">
+    <head>
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=5, user-scalable=yes">
+      <style>
+        html, body {
+          width: 100%;
+          height: 100%;
+          margin: 0;
+          padding: 0;
+          overflow: hidden;
+          background: #f3f4f6;
+          font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+          color: #111827;
+        }
+        * { box-sizing: border-box; }
+        .pdf-viewer {
+          display: flex;
+          flex-direction: column;
+          width: 100%;
+          height: 100vh;
+          min-height: 680px;
+          background: #f3f4f6;
+        }
+        .pdf-toolbar {
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          flex-wrap: wrap;
+          gap: 8px;
+          flex: 0 0 auto;
+          padding: 9px 8px;
+          border-bottom: 1px solid #d1d5db;
+          background: #ffffff;
+          position: relative;
+          z-index: 2;
+        }
+        .pdf-toolbar button {
+          min-width: 44px;
+          min-height: 38px;
+          padding: 7px 11px;
+          border: 1px solid #cbd5e1;
+          border-radius: 8px;
+          background: #ffffff;
+          color: #111827;
+          font-size: 15px;
+          font-weight: 600;
+          cursor: pointer;
+        }
+        .pdf-toolbar button:hover:not(:disabled) { background: #f8fafc; }
+        .pdf-toolbar button:disabled {
+          opacity: 0.4;
+          cursor: default;
+        }
+        .page-status {
+          min-width: 92px;
+          text-align: center;
+          font-size: 14px;
+          font-weight: 600;
+          white-space: nowrap;
+        }
+        .pdf-stage {
+          flex: 1 1 auto;
+          min-height: 0;
+          overflow: auto;
+          padding: 14px;
+          text-align: center;
+          overscroll-behavior: contain;
+          -webkit-overflow-scrolling: touch;
+        }
+        .canvas-wrap {
+          display: inline-block;
+          position: relative;
+          min-width: 1px;
+          min-height: 1px;
+          background: #ffffff;
+          box-shadow: 0 2px 12px rgba(15, 23, 42, 0.18);
+        }
+        #pdf-canvas {
+          display: block;
+          max-width: none;
+          background: #ffffff;
+        }
+        .pdf-message {
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          min-height: 260px;
+          padding: 24px;
+          font-size: 15px;
+          line-height: 1.7;
+          text-align: center;
+          color: #374151;
+        }
+        .pdf-error {
+          display: none;
+          max-width: 620px;
+          margin: 24px auto;
+          padding: 18px;
+          border: 1px solid #fecaca;
+          border-radius: 10px;
+          background: #fff7f7;
+          color: #991b1b;
+          line-height: 1.7;
+          text-align: left;
+        }
+        .pdf-error a {
+          display: inline-block;
+          margin-top: 10px;
+          padding: 8px 12px;
+          border-radius: 8px;
+          background: #ffffff;
+          border: 1px solid #fca5a5;
+          color: #991b1b;
+          font-weight: 600;
+          text-decoration: none;
+        }
+        @media (max-width: 640px) {
+          .pdf-viewer { min-height: 620px; }
+          .pdf-toolbar { gap: 6px; padding: 7px 5px; }
+          .pdf-toolbar button {
+            min-width: 40px;
+            min-height: 36px;
+            padding: 6px 9px;
+            font-size: 14px;
+          }
+          .page-status { min-width: 76px; font-size: 13px; }
+          .pdf-stage { padding: 8px; }
+        }
+      </style>
+    </head>
+    <body>
+      <div class="pdf-viewer">
+        <div class="pdf-toolbar" aria-label="PDF操作">
+          <button id="prev-page" type="button" disabled aria-label="前のページ">◀</button>
+          <span id="page-status" class="page-status">読込中…</span>
+          <button id="next-page" type="button" disabled aria-label="次のページ">▶</button>
+          <button id="zoom-out" type="button" disabled aria-label="縮小">－</button>
+          <button id="fit-width" type="button" disabled aria-label="幅に合わせる">幅</button>
+          <button id="zoom-in" type="button" disabled aria-label="拡大">＋</button>
         </div>
-        """,
+        <div id="pdf-stage" class="pdf-stage">
+          <div id="loading-message" class="pdf-message">PDFを読み込んでいます…</div>
+          <div id="canvas-wrap" class="canvas-wrap" hidden>
+            <canvas id="pdf-canvas" aria-label="PDFページ"></canvas>
+          </div>
+          <div id="pdf-error" class="pdf-error" role="alert">
+            <strong>PDFを画面内に表示できませんでした。</strong><br>
+            下のリンクまたはダイアログ下部の保存ボタンから確認してください。<br>
+            <a id="open-pdf" href="#" target="_blank" rel="noopener">PDFを別画面で開く</a>
+          </div>
+        </div>
+      </div>
+      <script>
+        (() => {
+          const encodedPdf = __PDF_BASE64_JSON__;
+          const filename = __FILENAME_JSON__;
+          const pdfJsSources = [
+            {
+              script: "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js",
+              worker: "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js",
+            },
+            {
+              script: "https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.min.js",
+              worker: "https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.worker.min.js",
+            },
+            {
+              script: "https://unpkg.com/pdfjs-dist@3.11.174/build/pdf.min.js",
+              worker: "https://unpkg.com/pdfjs-dist@3.11.174/build/pdf.worker.min.js",
+            },
+          ];
+
+          const stage = document.getElementById("pdf-stage");
+          const canvas = document.getElementById("pdf-canvas");
+          const context = canvas.getContext("2d", { alpha: false });
+          const canvasWrap = document.getElementById("canvas-wrap");
+          const loadingMessage = document.getElementById("loading-message");
+          const errorBox = document.getElementById("pdf-error");
+          const openPdf = document.getElementById("open-pdf");
+          const pageStatus = document.getElementById("page-status");
+          const prevButton = document.getElementById("prev-page");
+          const nextButton = document.getElementById("next-page");
+          const zoomOutButton = document.getElementById("zoom-out");
+          const fitWidthButton = document.getElementById("fit-width");
+          const zoomInButton = document.getElementById("zoom-in");
+
+          let pdfDocument = null;
+          let currentPage = 1;
+          let zoom = 1;
+          let fitWidth = true;
+          let renderInProgress = false;
+          let pendingRender = false;
+          let blobUrl = "";
+          let resizeTimer = null;
+
+          function decodeBase64(base64Text) {
+            const binary = atob(base64Text);
+            const bytes = new Uint8Array(binary.length);
+            for (let index = 0; index < binary.length; index += 1) {
+              bytes[index] = binary.charCodeAt(index);
+            }
+            return bytes;
+          }
+
+          function prepareFallbackLink(pdfBytes) {
+            try {
+              const blob = new Blob([pdfBytes], { type: "application/pdf" });
+              blobUrl = URL.createObjectURL(blob);
+              openPdf.href = blobUrl;
+              openPdf.download = "";
+              openPdf.setAttribute("aria-label", `${filename}を別画面で開く`);
+            } catch (error) {
+              openPdf.style.display = "none";
+            }
+          }
+
+          function showError(error) {
+            console.error("PDF viewer error", error);
+            loadingMessage.style.display = "none";
+            canvasWrap.hidden = true;
+            errorBox.style.display = "block";
+            pageStatus.textContent = "表示失敗";
+          }
+
+          function setControlsEnabled(enabled) {
+            prevButton.disabled = !enabled || currentPage <= 1;
+            nextButton.disabled = !enabled || !pdfDocument || currentPage >= pdfDocument.numPages;
+            zoomOutButton.disabled = !enabled;
+            fitWidthButton.disabled = !enabled;
+            zoomInButton.disabled = !enabled;
+          }
+
+          function calculateScale(page) {
+            const baseViewport = page.getViewport({ scale: 1 });
+            if (!fitWidth) return zoom;
+            const availableWidth = Math.max(240, stage.clientWidth - 30);
+            return Math.max(0.25, Math.min(4, availableWidth / baseViewport.width));
+          }
+
+          async function renderPage() {
+            if (!pdfDocument) return;
+            if (renderInProgress) {
+              pendingRender = true;
+              return;
+            }
+
+            renderInProgress = true;
+            pendingRender = false;
+            setControlsEnabled(false);
+            pageStatus.textContent = `${currentPage} / ${pdfDocument.numPages}`;
+
+            try {
+              const page = await pdfDocument.getPage(currentPage);
+              const scale = calculateScale(page);
+              const viewport = page.getViewport({ scale });
+              const pixelRatio = Math.min(window.devicePixelRatio || 1, 2.5);
+
+              canvas.width = Math.max(1, Math.floor(viewport.width * pixelRatio));
+              canvas.height = Math.max(1, Math.floor(viewport.height * pixelRatio));
+              canvas.style.width = `${Math.floor(viewport.width)}px`;
+              canvas.style.height = `${Math.floor(viewport.height)}px`;
+
+              const transform = pixelRatio === 1
+                ? null
+                : [pixelRatio, 0, 0, pixelRatio, 0, 0];
+
+              await page.render({
+                canvasContext: context,
+                viewport,
+                transform,
+                background: "rgb(255,255,255)",
+              }).promise;
+
+              loadingMessage.style.display = "none";
+              errorBox.style.display = "none";
+              canvasWrap.hidden = false;
+              pageStatus.textContent = `${currentPage} / ${pdfDocument.numPages}`;
+              stage.scrollTo({ top: 0, left: 0, behavior: "auto" });
+            } catch (error) {
+              showError(error);
+            } finally {
+              renderInProgress = false;
+              setControlsEnabled(Boolean(pdfDocument));
+              if (pendingRender) renderPage();
+            }
+          }
+
+          async function loadPdfJs() {
+            if (window.pdfjsLib) {
+              return { library: window.pdfjsLib, worker: pdfJsSources[0].worker };
+            }
+
+            for (const source of pdfJsSources) {
+              try {
+                const library = await new Promise((resolve, reject) => {
+                  const script = document.createElement("script");
+                  script.src = source.script;
+                  script.async = true;
+                  script.onload = () => {
+                    if (window.pdfjsLib) resolve(window.pdfjsLib);
+                    else reject(new Error("PDF.jsを初期化できませんでした。"));
+                  };
+                  script.onerror = () => reject(new Error("PDF.jsを読み込めませんでした。"));
+                  document.head.appendChild(script);
+                });
+                return { library, worker: source.worker };
+              } catch (error) {
+                console.warn("PDF.js source failed", source.script, error);
+              }
+            }
+            throw new Error("PDF.jsを読み込めませんでした。");
+          }
+
+          prevButton.addEventListener("click", () => {
+            if (!pdfDocument || currentPage <= 1) return;
+            currentPage -= 1;
+            renderPage();
+          });
+
+          nextButton.addEventListener("click", () => {
+            if (!pdfDocument || currentPage >= pdfDocument.numPages) return;
+            currentPage += 1;
+            renderPage();
+          });
+
+          zoomOutButton.addEventListener("click", () => {
+            fitWidth = false;
+            zoom = Math.max(0.35, zoom / 1.2);
+            renderPage();
+          });
+
+          zoomInButton.addEventListener("click", () => {
+            fitWidth = false;
+            zoom = Math.min(4, zoom * 1.2);
+            renderPage();
+          });
+
+          fitWidthButton.addEventListener("click", () => {
+            fitWidth = true;
+            renderPage();
+          });
+
+          window.addEventListener("resize", () => {
+            if (!pdfDocument || !fitWidth) return;
+            window.clearTimeout(resizeTimer);
+            resizeTimer = window.setTimeout(renderPage, 160);
+          });
+
+          window.addEventListener("beforeunload", () => {
+            if (blobUrl) URL.revokeObjectURL(blobUrl);
+          });
+
+          (async () => {
+            try {
+              const pdfBytes = decodeBase64(encodedPdf);
+              prepareFallbackLink(pdfBytes);
+              const loadedPdfJs = await loadPdfJs();
+              const pdfjsLib = loadedPdfJs.library;
+              pdfjsLib.GlobalWorkerOptions.workerSrc = loadedPdfJs.worker;
+              pdfDocument = await pdfjsLib.getDocument({ data: pdfBytes }).promise;
+              if (!pdfDocument || pdfDocument.numPages < 1) {
+                throw new Error("PDFに表示できるページがありません。");
+              }
+              currentPage = 1;
+              setControlsEnabled(true);
+              await renderPage();
+            } catch (error) {
+              showError(error);
+            }
+          })();
+        })();
+      </script>
+    </body>
+    </html>
+    """
+    viewer_html = viewer_html.replace("__PDF_BASE64_JSON__", json.dumps(encoded))
+    viewer_html = viewer_html.replace(
+        "__FILENAME_JSON__",
+        json.dumps(str(filename or "PDF"), ensure_ascii=False),
+    )
+    components.html(
+        viewer_html,
         height=740,
-        scrolling=True,
+        scrolling=False,
     )
 
 
