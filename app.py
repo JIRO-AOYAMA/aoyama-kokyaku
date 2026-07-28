@@ -14050,12 +14050,10 @@ def get_soluble_water_it_context(location, rows):
 
 
 def apply_soluble_water_it_forecast(rows, location, context):
-    """WATER it実測を日付ごとに反映し、その間だけアプリ予測を行う。
+    """黄色い手入力を最優先し、その次にWATER it実測・予測を表示する。
 
-    CSVに各日の9:00実測値が含まれる場合は、過去日も含めてその日の在庫表示を
-    実測値へ置き換える。実測値がない日は、直前の実測または黄色い手入力基準から
-    Excelの使用量・納品を使って計算する。Excel本体・元のrows・使用量/日・納品は
-    変更しない。
+    表示優先順位は、黄色い手入力値、WATER it実測値、WATER it予測値、
+    Excel自動計算値の順とする。Excel本体・元のrows・使用量/日・納品は変更しない。
     """
     display_rows = [dict(row) for row in rows]
     if not context:
@@ -14072,8 +14070,18 @@ def apply_soluble_water_it_forecast(rows, location, context):
         display_key = f"{location}_inventory_display"
         source_key = f"{location}_inventory_display_source"
 
-        # CSV内にその日の9:00実測があれば、最新日の直近値ではなく、
-        # 必ず9:00の値をExcel計算値より優先して緑の実測値として表示する。
+        # 黄色い手入力値は、その日のWATER it実測値より優先する。
+        # 以後の予測も、この手入力値を新しい基準として続ける。
+        if row.get(f"{location}_inventory_manual"):
+            manual_value = row.get(f"{location}_inventory")
+            if isinstance(manual_value, (int, float)):
+                previous_inventory = manual_value
+                row[display_key] = manual_value
+                row[source_key] = "excel_manual_baseline"
+                started = True
+                continue
+
+        # 黄色い手入力値がない日は、その日の9:00実測値を優先する。
         actual = daily_actuals.get(row_date)
         if actual is not None:
             actual_value = actual.get("value")
@@ -14089,16 +14097,6 @@ def apply_soluble_water_it_forecast(rows, location, context):
             row[display_key] = row.get(f"{location}_inventory")
             row[source_key] = "excel"
             continue
-
-        # 実測値がない日の黄色い在庫は、人が指定した次の基準値として尊重する。
-        # 後日の9:00実測が現れた時点で、その実測値へ再び補正される。
-        if row.get(f"{location}_inventory_manual"):
-            manual_value = row.get(f"{location}_inventory")
-            if isinstance(manual_value, (int, float)):
-                previous_inventory = manual_value
-                row[display_key] = manual_value
-                row[source_key] = "excel_manual_baseline"
-                continue
 
         usage = row.get(f"{location}_usage")
         delivery = row.get(f"{location}_delivery")
