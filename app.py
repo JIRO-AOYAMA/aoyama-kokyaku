@@ -16552,7 +16552,7 @@ def render_trade_partner_row_editor(
     excluded_headers = {id_field, "取引先ID", "会社名（確認用）"}
     if sheet_name == TRADE_PARTNER_MASTER_SHEET:
         excluded_headers.update({"仕入先区分", "運送会社区分"})
-    if sheet_name == TRADE_PARTNER_CONTACT_SHEET and partner_type == "carrier":
+    if sheet_name == TRADE_PARTNER_CONTACT_SHEET:
         excluded_headers.add("会社名")
     editable_headers = [header for header in headers if header not in excluded_headers]
     with st.expander("編集"):
@@ -16612,7 +16612,7 @@ def render_trade_partner_related_section(
             heading = trade_partner_text(row.get(primary_field))
             st.markdown(f"**{html.escape(heading)}**")
             display_excluded = {id_field, "取引先ID", "会社名（確認用）", primary_field}
-            if sheet_name == TRADE_PARTNER_CONTACT_SHEET and partner_type == "carrier":
+            if sheet_name == TRADE_PARTNER_CONTACT_SHEET:
                 display_excluded.add("会社名")
             render_trade_partner_fields(
                 row,
@@ -16630,7 +16630,7 @@ def render_trade_partner_related_section(
 
     with st.expander(f"＋ {add_label}"):
         add_excluded_headers = {id_field, "取引先ID", "会社名（確認用）"}
-        if sheet_name == TRADE_PARTNER_CONTACT_SHEET and partner_type == "carrier":
+        if sheet_name == TRADE_PARTNER_CONTACT_SHEET:
             add_excluded_headers.add("会社名")
         editable_headers = [
             header for header in headers
@@ -16638,7 +16638,7 @@ def render_trade_partner_related_section(
         ]
         with st.form(f"add_{sheet_name}_{partner_id}"):
             values = {"取引先ID": partner_id}
-            if sheet_name == TRADE_PARTNER_CONTACT_SHEET and partner_type == "carrier":
+            if sheet_name == TRADE_PARTNER_CONTACT_SHEET:
                 values["会社名"] = company_name
             for header in editable_headers:
                 values[header] = st.text_input(
