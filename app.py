@@ -16345,6 +16345,11 @@ def show_trade_partner_home(partner_type):
 
 def show_trade_partner_directory(partner_type):
     show_trade_partner_home_link(partner_type)
+    if partner_type == "supplier":
+        st.markdown(
+            render_page_link("＋ 新しい仕入先を登録", page="supplier_register"),
+            unsafe_allow_html=True,
+        )
     label = trade_partner_type_label(partner_type)
     st.header(f"📋 {label}一覧")
     data = load_trade_partner_data()
