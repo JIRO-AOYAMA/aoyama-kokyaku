@@ -6636,6 +6636,7 @@ def render_customer_attachments_section(
     identity = f"{entity_type}:{entity_id or entity_name}"
     suffix = hashlib.sha256(str(identity).encode("utf-8")).hexdigest()[:16]
     success_key = f"onedrive_attachment_success_{suffix}"
+    upload_error_key = f"onedrive_attachment_upload_error_{suffix}"
     edit_key = f"onedrive_attachment_edit_{suffix}"
     limit_key = f"onedrive_attachment_limit_{suffix}"
     open_key = f"onedrive_attachment_force_open_{suffix}"
@@ -6660,6 +6661,9 @@ def render_customer_attachments_section(
         success_message = st.session_state.pop(success_key, None)
         if success_message:
             st.success(success_message)
+        upload_error_message = st.session_state.pop(upload_error_key, None)
+        if upload_error_message:
+            st.error(upload_error_message)
         auth_success = st.session_state.pop("onedrive_auth_success", None)
         if auth_success:
             st.success("OneDriveの初回接続が完了しました。")
@@ -6726,13 +6730,15 @@ def render_customer_attachments_section(
                     st.error(f"OneDriveへの接続を開始できませんでした：{exc}")
             else:
                 st.markdown("#### 追加")
-                selected_image_file = st.file_uploader(
+                selected_image_files = st.file_uploader(
                     "🖼 保存済み画像を選ぶ" if mobile_browser else "🖼 画像を選ぶ",
                     type=["jpg", "jpeg", "png", "webp"],
-                    accept_multiple_files=False,
+                    accept_multiple_files=True,
                     key=f"onedrive_attachment_photo_uploader_{suffix}",
                 )
-                photo_file = selected_image_file
+                photo_files = list(selected_image_files or [])
+                if photo_files:
+                    st.caption(f"画像を{len(photo_files)}枚選択中")
                 pdf_file = st.file_uploader(
                     "📄 PDFを選ぶ",
                     type=["pdf"],
@@ -6767,42 +6773,59 @@ def render_customer_attachments_section(
                     use_container_width=True,
                     key=f"onedrive_attachment_upload_{suffix}",
                 ):
-                    uploaded = photo_file if photo_file is not None else pdf_file
-                    if uploaded is None:
+                    uploaded_files = photo_files if photo_files else ([pdf_file] if pdf_file is not None else [])
+                    if not uploaded_files:
                         st.warning("画像またはPDFを選んでください。")
                     else:
-                        try:
-                            tags = list(selected_history_tags) + normalize_attachment_tags(new_tags_text)
-                            with st.spinner("OneDriveへ保存しています…"):
-                                saved = save_entity_onedrive_attachment(
-                                    entity_type,
-                                    entity_name,
-                                    entity_id,
-                                    uploaded.name,
-                                    uploaded.getvalue(),
-                                    uploaded.type or mimetypes.guess_type(uploaded.name)[0] or "application/octet-stream",
-                                    tags,
-                                    remarks,
-                                    access_token,
-                                )
-                            remember_change_history_warning(
-                                record_change_history_safely(
-                                    attachment_entity_label(entity_type),
-                                    entity_id or "",
-                                    entity_name,
-                                    "追加",
-                                    {
-                                        "ファイル": ("", saved.get("original_name", "")),
-                                        "タグ": ("", " ".join(f"#{tag}" for tag in saved.get("tags", []))),
-                                    },
-                                    section="写真・資料",
-                                )
-                            )
-                            st.session_state[success_key] = "写真・資料を保存しました。"
+                        tags = list(selected_history_tags) + normalize_attachment_tags(new_tags_text)
+                        saved_items = []
+                        failed_items = []
+                        with st.spinner("OneDriveへ保存しています…"):
+                            for uploaded in uploaded_files:
+                                try:
+                                    saved = save_entity_onedrive_attachment(
+                                        entity_type,
+                                        entity_name,
+                                        entity_id,
+                                        uploaded.name,
+                                        uploaded.getvalue(),
+                                        uploaded.type or mimetypes.guess_type(uploaded.name)[0] or "application/octet-stream",
+                                        tags,
+                                        remarks,
+                                        access_token,
+                                    )
+                                    saved_items.append(saved)
+                                    remember_change_history_warning(
+                                        record_change_history_safely(
+                                            attachment_entity_label(entity_type),
+                                            entity_id or "",
+                                            entity_name,
+                                            "追加",
+                                            {
+                                                "ファイル": ("", saved.get("original_name", "")),
+                                                "タグ": ("", " ".join(f"#{tag}" for tag in saved.get("tags", []))),
+                                            },
+                                            section="写真・資料",
+                                        )
+                                    )
+                                except Exception as exc:
+                                    failed_items.append((uploaded.name, str(exc)))
+
+                        if saved_items:
+                            if len(saved_items) == 1:
+                                st.session_state[success_key] = "写真・資料を保存しました。"
+                            else:
+                                st.session_state[success_key] = f"写真・資料を{len(saved_items)}件保存しました。"
                             st.session_state[limit_key] = ONEDRIVE_PAGE_SIZE
+                        if failed_items:
+                            failed_names = "、".join(name for name, _ in failed_items)
+                            first_error = failed_items[0][1]
+                            st.session_state[upload_error_key] = (
+                                f"{len(failed_items)}件保存できませんでした：{failed_names}"
+                                + (f"（{first_error}）" if first_error else "")
+                            )
+                        if saved_items or failed_items:
                             st.rerun()
-                        except Exception as exc:
-                            st.error(f"保存できませんでした：{exc}")
 
             # 自動接続設定後は利用者ごとのMicrosoft接続操作を表示しない。
             if access_token and not configured_refresh_token:
