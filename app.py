@@ -12162,6 +12162,13 @@ def read_dispatch_month_sheets(excel_source):
     return df
 
 
+# 配車表Excelの読み込み・整形は、分割した処理を使用する。
+from app_modules.dispatch_excel import (
+    normalize_dispatch_text,
+    read_dispatch_month_sheets,
+)
+
+
 @st.cache_data(ttl=60, show_spinner=False)
 def get_cached_dispatch_dropbox_content():
     access_token = get_dropbox_access_token()
