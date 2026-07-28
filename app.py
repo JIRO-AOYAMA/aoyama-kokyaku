@@ -13434,6 +13434,21 @@ def build_soluble_updated_workbook(content, row_number, location, updates):
     return saved_content, changed
 
 
+# 分割したExcel処理をここから使用する。
+# 上に残る同名処理は移行中の比較用で、実行時には以下の関数へ切り替わる。
+from app_modules.soluble_excel import (
+    build_soluble_updated_workbook,
+    parse_soluble_number,
+    read_soluble_rows,
+    same_soluble_value,
+    soluble_cell_is_manual,
+    soluble_date_value,
+    soluble_formula_value,
+    soluble_input_value,
+    soluble_number_label,
+)
+
+
 def ensure_soluble_backup_folder(access_token):
     response = call_dropbox_rpc(
         "files/create_folder_v2",
