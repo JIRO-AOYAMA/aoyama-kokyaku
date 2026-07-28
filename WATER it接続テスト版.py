@@ -155,6 +155,13 @@ SHEET1_MAP_COLUMN = 11       # K列：マップ位置
 # v50までの共通パスワード設定はSecretsに残っていてもよいが、v51では認証に使用しない。
 APP_PASSWORD = st.secrets.get("APP_PASSWORD", "")
 LOGIN_TOKEN_SECRET = str(st.secrets.get("LOGIN_TOKEN_SECRET", "") or "").strip()
+# waterit-test ブランチ専用。テスト環境には本番のMicrosoft認証Secretsを
+# 複製せず、既存のAPP_PASSWORDで保護された確認用ログインを使う。
+TEST_PASSWORD_AUTH_MODE = True
+if TEST_PASSWORD_AUTH_MODE and not LOGIN_TOKEN_SECRET and APP_PASSWORD:
+    LOGIN_TOKEN_SECRET = hashlib.sha256(
+        ("waterit-test/login-token/" + str(APP_PASSWORD)).encode("utf-8")
+    ).hexdigest()
 try:
     APP_AUTH_SETTINGS = st.secrets.get("app_auth", {})
 except Exception:
@@ -760,6 +767,17 @@ def set_query_params_safely(params):
 
 def get_microsoft_user_claims():
     """Streamlitが検証したMicrosoft OIDCのユーザー情報を辞書で返す。"""
+    if TEST_PASSWORD_AUTH_MODE and st.session_state.get("test_password_authenticated"):
+        now = int(time.time())
+        return {
+            "is_logged_in": True,
+            "sub": "waterit-test-password-user",
+            "iss": MICROSOFT_ISSUER_PREFIX + "waterit-test/v2.0",
+            "aud": "waterit-test-password-auth",
+            "iat": now,
+            "exp": now + LOGIN_TOKEN_TTL_SECONDS,
+            "name": "テスト確認",
+        }
     try:
         if hasattr(st.user, "to_dict"):
             claims = st.user.to_dict()
@@ -772,6 +790,8 @@ def get_microsoft_user_claims():
 
 def get_configured_auth_client_id():
     """[auth] に設定されたログイン専用MicrosoftアプリのClient IDを返す。"""
+    if TEST_PASSWORD_AUTH_MODE and st.session_state.get("test_password_authenticated"):
+        return "waterit-test-password-auth"
     try:
         auth_settings = st.secrets.get("auth", {})
         return str(auth_settings.get("client_id", "") or "").strip()
@@ -855,6 +875,8 @@ def show_microsoft_client_secret_expiry_notice():
 
 def validate_microsoft_identity(claims, require_allowed_sub=True):
     """Microsoftログイン情報を確認し、問題がある場合だけ理由コードを返す。"""
+    if TEST_PASSWORD_AUTH_MODE and st.session_state.get("test_password_authenticated"):
+        return ""
     data = dict(claims or {})
     if not bool(data.get("is_logged_in")):
         return "not_logged_in"
@@ -3262,6 +3284,22 @@ remove_obsolete_login_query_params()
 if "authenticated" not in st.session_state:
     st.session_state.authenticated = False
 
+if TEST_PASSWORD_AUTH_MODE and not st.session_state.get("test_password_authenticated"):
+    st.title("🔒 取引先カルテ・テスト版")
+    st.caption("テスト版は、既存のアプリ用パスワードで保護されています。")
+    if not APP_PASSWORD:
+        st.error("テスト版のAPP_PASSWORDが設定されていません。")
+        st.stop()
+    test_password = st.text_input("パスワード", type="password")
+    if st.button("テスト版へログイン", type="primary", use_container_width=True):
+        if hmac.compare_digest(str(test_password), str(APP_PASSWORD)):
+            st.session_state["test_password_authenticated"] = True
+            st.session_state.authenticated = True
+            st.rerun()
+        else:
+            st.error("パスワードが違います。")
+    st.stop()
+
 microsoft_claims = get_microsoft_user_claims()
 microsoft_is_logged_in = bool(microsoft_claims.get("is_logged_in"))
 
@@ -3309,7 +3347,7 @@ microsoft_account_name = str(
 ).strip()
 
 # 初回だけ、本人のsubを確認してSecretsへ登録する。登録されるまではアプリデータを表示しない。
-if not MICROSOFT_ALLOWED_SUB:
+if not TEST_PASSWORD_AUTH_MODE and not MICROSOFT_ALLOWED_SUB:
     clear_application_login_state(revoke_current=False)
     st.title("🔐 Microsoftログイン 初回確認")
     st.success(f"Microsoftへのログインに成功しました：{microsoft_account_name}")
@@ -3321,7 +3359,10 @@ if not MICROSOFT_ALLOWED_SUB:
         st.logout()
     st.stop()
 
-if not hmac.compare_digest(microsoft_sub, MICROSOFT_ALLOWED_SUB):
+if (
+    not TEST_PASSWORD_AUTH_MODE
+    and not hmac.compare_digest(microsoft_sub, MICROSOFT_ALLOWED_SUB)
+):
     record_denied_microsoft_login(microsoft_claims, "account_not_allowed")
     clear_application_login_state(revoke_current=False)
     st.title("⛔ ログインできません")
@@ -18335,12 +18376,15 @@ with col_logout:
     if st.button("ログアウト"):
         record_logout_event(microsoft_claims, active_login_payload)
         clear_application_login_state(revoke_current=True)
+        st.session_state.pop("test_password_authenticated", None)
         st.session_state.page = "home"
         st.session_state.selected_customer = None
         st.session_state.selected_partner_id = None
         st.session_state.selected_partner_type = None
         clear_onedrive_auth_state()
         set_query_params_safely({"page": "home", "logout": "1"})
+        if TEST_PASSWORD_AUTH_MODE:
+            st.rerun()
         st.logout()
         st.stop()
 
