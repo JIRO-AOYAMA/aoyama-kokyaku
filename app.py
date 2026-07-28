@@ -92,9 +92,15 @@ SOLUBLE_DROPBOX_FILE_PATH = st.secrets.get(
     "SOLUBLE_DROPBOX_FILE_PATH",
     str(DROPBOX_FILE_PATH).rsplit("/", 1)[0] + "/" + SOLUBLE_FILE_NAME,
 )
+# waterit-test ブランチでは、本番Excelを絶対に更新しない。
+# Streamlit Secretsの値よりもテスト用コピーを優先する。
+SOLUBLE_DROPBOX_FILE_PATH = (
+    str(DROPBOX_FILE_PATH).rsplit("/", 1)[0]
+    + "/aoベンチャーグレイン配車表_テスト用.xlsx"
+)
 SOLUBLE_LOCAL_FILE = st.secrets.get(
     "SOLUBLE_LOCAL_FILE",
-    r"C:\Users\jiroa\Aoyama Dropbox\bulu jack\1共有　青山商店　本社\配車表-北海道-\aoベンチャーグレイン配車表.xlsx",
+    r"C:\Users\jiroa\Aoyama Dropbox\bulu jack\1共有　青山商店　本社\配車表-北海道-\aoベンチャーグレイン配車表_テスト用.xlsx",
 )
 SOLUBLE_BACKUP_FOLDER = str(SOLUBLE_DROPBOX_FILE_PATH).rsplit("/", 1)[0] + "/Backups"
 
@@ -14549,7 +14555,10 @@ def show_soluble_inventory_page():
     st.markdown("---")
     st.header("🧪 ソリュブル在庫")
     show_back_home_button("soluble_back_home")
-    st.caption("aoベンチャーグレイン配車表.xlsx の「ソリュブル」シートを表示します。")
+    st.caption(
+        "【テスト版】aoベンチャーグレイン配車表_テスト用.xlsx "
+        "の「ソリュブル」シートを表示します。"
+    )
 
     with st.spinner("ソリュブル在庫を読み込んでいます…"):
         content, source = load_soluble_workbook_content()
