@@ -2313,11 +2313,18 @@ def download_onedrive_thumbnail(access_token, item_id):
     return image_response.content
 
 
-def render_clickable_onedrive_thumbnail(thumbnail_content, filename, trigger_label, compact_height=150):
+def render_clickable_onedrive_thumbnail(
+    thumbnail_content,
+    filename,
+    trigger_label,
+    compact_height=150,
+    badge_text="",
+):
     """小さなサムネイル自体をタップして、既存のStreamlit表示ボタンを実行する。"""
     thumbnail_bytes = bytes(thumbnail_content or b"")
     safe_filename = str(filename or "画像")
     safe_trigger_label = str(trigger_label or "")
+    safe_badge_text = str(badge_text or "").strip()
     tile_id = "onedrive_thumbnail_tile_" + hashlib.sha256(
         (safe_filename + safe_trigger_label + str(len(thumbnail_bytes))).encode("utf-8")
     ).hexdigest()[:16]
@@ -2338,6 +2345,7 @@ def render_clickable_onedrive_thumbnail(thumbnail_content, filename, trigger_lab
         <div id={json.dumps(tile_id)} class="od-thumb-tile" role="button" tabindex="0"
              aria-label={json.dumps(safe_filename + 'を表示')} title={json.dumps(safe_filename)}>
           {image_markup}
+          <div class="od-thumb-count"></div>
           <div class="od-thumb-hint">タップして表示</div>
         </div>
         <style>
@@ -2370,6 +2378,18 @@ def render_clickable_onedrive_thumbnail(thumbnail_content, filename, trigger_lab
             justify-content:center;
             font:42px/1 system-ui, sans-serif;
           }}
+          .od-thumb-count {{
+            position:absolute;
+            top:7px;
+            right:7px;
+            display:none;
+            padding:4px 8px;
+            border-radius:12px;
+            color:#fff;
+            background:rgba(0,0,0,.68);
+            font:700 12px/1.2 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+            pointer-events:none;
+          }}
           .od-thumb-hint {{
             position:absolute;
             left:7px;
@@ -2386,7 +2406,13 @@ def render_clickable_onedrive_thumbnail(thumbnail_content, filename, trigger_lab
         <script>
         (() => {{
           const triggerLabel = {json.dumps(safe_trigger_label)};
+          const badgeText = {json.dumps(safe_badge_text)};
           const tile = document.getElementById({json.dumps(tile_id)});
+          const badge = tile.querySelector('.od-thumb-count');
+          if (badgeText) {{
+            badge.textContent = badgeText;
+            badge.style.display = 'block';
+          }}
           const parentDocument = window.parent.document;
           const normalizeText = (value) => String(value || '').replace(/\\s+/g, '');
           const findTrigger = () => {{
@@ -2578,24 +2604,49 @@ def render_clickable_onedrive_pdf_tile(filename, trigger_label, compact_height=1
     )
 
 
-def show_onedrive_image_dialog(image_content, filename):
-    """ページを移動せず、ピンチ操作対応の全画面画像ビューアーを開く。"""
-    image_bytes = bytes(image_content or b"")
-    if not image_bytes:
+def show_onedrive_image_gallery_dialog(image_items):
+    """複数画像を、ピンチ・パン・前後移動対応の全画面ビューアーで表示する。"""
+    prepared = []
+    for item in list(image_items or []):
+        if isinstance(item, dict):
+            image_content = item.get("content")
+            filename = item.get("filename")
+        else:
+            try:
+                image_content, filename = item
+            except Exception:
+                continue
+        image_bytes = bytes(image_content or b"")
+        if not image_bytes:
+            continue
+        safe_filename = str(filename or "画像")
+        guessed_type = mimetypes.guess_type(safe_filename)[0] or "image/jpeg"
+        if not str(guessed_type).startswith("image/"):
+            guessed_type = "image/jpeg"
+        encoded = base64.b64encode(image_bytes).decode("ascii")
+        prepared.append(
+            {
+                "filename": safe_filename,
+                "url": f"data:{guessed_type};base64,{encoded}",
+                "size": len(image_bytes),
+            }
+        )
+
+    if not prepared:
         st.error("画像データが空のため表示できません。")
         return
 
-    guessed_type = mimetypes.guess_type(str(filename or ""))[0] or "image/jpeg"
-    if not str(guessed_type).startswith("image/"):
-        guessed_type = "image/jpeg"
-    encoded = base64.b64encode(image_bytes).decode("ascii")
-    image_data_url = f"data:{guessed_type};base64,{encoded}"
+    viewer_signature = "|".join(
+        f"{item['filename']}:{item['size']}" for item in prepared
+    )
     viewer_id = "onedrive_fullscreen_image_" + hashlib.sha256(
-        (str(filename or "") + str(len(image_bytes))).encode("utf-8")
+        viewer_signature.encode("utf-8")
     ).hexdigest()[:16]
+    browser_images = [
+        {"filename": item["filename"], "url": item["url"]}
+        for item in prepared
+    ]
 
-    # components.html の小さなiframe内ではなく、親画面へ全画面ビューアーを配置する。
-    # そのため、スマホでも画面全体を使い、ピンチ・パン・ダブルタップができる。
     components.html(
         f"""
         <script>
@@ -2603,8 +2654,7 @@ def show_onedrive_image_dialog(image_content, filename):
           const parentWindow = window.parent;
           const parentDocument = parentWindow.document;
           const viewerId = {json.dumps(viewer_id)};
-          const imageUrl = {json.dumps(image_data_url)};
-          const filename = {json.dumps(str(filename or "画像"))};
+          const images = {json.dumps(browser_images, ensure_ascii=False)};
 
           const previousViewer = parentDocument.getElementById(viewerId);
           if (previousViewer) previousViewer.remove();
@@ -2624,10 +2674,13 @@ def show_onedrive_image_dialog(image_content, filename):
             </div>
             <div class="odv-toolbar">
               <div class="odv-filename"></div>
+              <div class="odv-count"></div>
               <button class="odv-fullscreen" type="button" aria-label="全画面表示">⛶</button>
               <button class="odv-close" type="button" aria-label="閉じる">×</button>
             </div>
-            <div class="odv-help">2本指で拡大・縮小　ダブルタップで切替</div>
+            <button class="odv-prev odv-nav" type="button" aria-label="前の画像">‹</button>
+            <button class="odv-next odv-nav" type="button" aria-label="次の画像">›</button>
+            <div class="odv-help">2本指で拡大・縮小　左右スワイプで画像を切替</div>
           `;
 
           const style = parentDocument.createElement('style');
@@ -2690,6 +2743,13 @@ def show_onedrive_image_dialog(image_content, filename):
               font-size: 14px;
               text-shadow: 0 1px 2px #000;
             }}
+            #${{viewerId}} .odv-count {{
+              flex: 0 0 auto;
+              min-width: 46px;
+              text-align: center;
+              font: 700 13px/1.2 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+              text-shadow: 0 1px 2px #000;
+            }}
             #${{viewerId}} button {{
               width: 44px;
               height: 44px;
@@ -2704,6 +2764,16 @@ def show_onedrive_image_dialog(image_content, filename):
               touch-action: manipulation;
             }}
             #${{viewerId}} .odv-fullscreen {{ font-size: 22px; }}
+            #${{viewerId}} .odv-nav {{
+              position:absolute;
+              top:50%;
+              transform:translateY(-50%);
+              z-index:2;
+              background:rgba(20,20,20,.58);
+              font-size:38px;
+            }}
+            #${{viewerId}} .odv-prev {{ left:10px; }}
+            #${{viewerId}} .odv-next {{ right:10px; }}
             #${{viewerId}} .odv-help {{
               position: absolute;
               left: 50%;
@@ -2720,8 +2790,13 @@ def show_onedrive_image_dialog(image_content, filename):
               opacity: 1;
               transition: opacity .35s ease;
             }}
-            @media (min-width: 900px) {{
-              #${{viewerId}} .odv-help {{ font-size: 14px; }}
+            @media (max-width: 640px) {{
+              #${{viewerId}} .odv-nav {{
+                top:auto;
+                bottom:max(68px, calc(env(safe-area-inset-bottom) + 54px));
+                transform:none;
+              }}
+              #${{viewerId}} .odv-help {{ font-size:12px; }}
             }}
           `;
           overlay.appendChild(style);
@@ -2733,20 +2808,22 @@ def show_onedrive_image_dialog(image_content, filename):
           const closeButton = overlay.querySelector('.odv-close');
           const fullscreenButton = overlay.querySelector('.odv-fullscreen');
           const filenameNode = overlay.querySelector('.odv-filename');
+          const countNode = overlay.querySelector('.odv-count');
+          const prevButton = overlay.querySelector('.odv-prev');
+          const nextButton = overlay.querySelector('.odv-next');
           const helpNode = overlay.querySelector('.odv-help');
-          image.alt = filename;
-          image.src = imageUrl;
-          filenameNode.textContent = filename;
 
+          let currentIndex = 0;
           let scale = 1;
           let translateX = 0;
           let translateY = 0;
           let lastTapAt = 0;
           let lastTapX = 0;
           let lastTapY = 0;
+          let swipeStart = null;
           let helpTimer = parentWindow.setTimeout(() => {{
             helpNode.style.opacity = '0';
-          }}, 2400);
+          }}, 2600);
           const pointers = new Map();
           let lastSinglePoint = null;
           let lastPinchDistance = 0;
@@ -2761,6 +2838,20 @@ def show_onedrive_image_dialog(image_content, filename):
             translateX = 0;
             translateY = 0;
             applyTransform();
+          }};
+          const showImage = (index) => {{
+            currentIndex = (index + images.length) % images.length;
+            resetView();
+            const current = images[currentIndex];
+            image.alt = current.filename;
+            image.src = current.url;
+            filenameNode.textContent = current.filename;
+            countNode.textContent = images.length > 1
+              ? `${{currentIndex + 1}} / ${{images.length}}`
+              : '';
+            const navDisplay = images.length > 1 ? '' : 'none';
+            prevButton.style.display = navDisplay;
+            nextButton.style.display = navDisplay;
           }};
           const zoomAt = (newScale, clientX, clientY) => {{
             newScale = clamp(newScale, 1, 8);
@@ -2791,9 +2882,13 @@ def show_onedrive_image_dialog(image_content, filename):
           }};
           const onKeyDown = (event) => {{
             if (event.key === 'Escape') closeViewer();
+            if (event.key === 'ArrowLeft' && images.length > 1) showImage(currentIndex - 1);
+            if (event.key === 'ArrowRight' && images.length > 1) showImage(currentIndex + 1);
           }};
           parentDocument.addEventListener('keydown', onKeyDown, true);
           closeButton.addEventListener('click', closeViewer);
+          prevButton.addEventListener('click', () => showImage(currentIndex - 1));
+          nextButton.addEventListener('click', () => showImage(currentIndex + 1));
 
           fullscreenButton.addEventListener('click', async () => {{
             try {{
@@ -2811,7 +2906,9 @@ def show_onedrive_image_dialog(image_content, filename):
             pointers.set(event.pointerId, {{x: event.clientX, y: event.clientY}});
             if (pointers.size === 1) {{
               lastSinglePoint = {{x: event.clientX, y: event.clientY}};
+              swipeStart = {{x: event.clientX, y: event.clientY, at: Date.now()}};
             }} else if (pointers.size === 2) {{
+              swipeStart = null;
               const values = Array.from(pointers.values());
               lastPinchDistance = distance(values[0], values[1]);
               lastPinchMidpoint = midpoint(values[0], values[1]);
@@ -2856,16 +2953,28 @@ def show_onedrive_image_dialog(image_content, filename):
               lastSinglePoint = null;
               lastPinchDistance = 0;
               lastPinchMidpoint = null;
-              const now = Date.now();
-              if (now - lastTapAt < 320 && Math.hypot(point.x - lastTapX, point.y - lastTapY) < 36) {{
-                if (scale > 1.05) resetView();
-                else zoomAt(2.5, point.x, point.y);
+              const dx = swipeStart ? point.x - swipeStart.x : 0;
+              const dy = swipeStart ? point.y - swipeStart.y : 0;
+              const elapsed = swipeStart ? Date.now() - swipeStart.at : 9999;
+              if (
+                scale <= 1.001 && images.length > 1 && elapsed < 900 &&
+                Math.abs(dx) > 60 && Math.abs(dx) > Math.abs(dy) * 1.2
+              ) {{
+                showImage(currentIndex + (dx < 0 ? 1 : -1));
                 lastTapAt = 0;
               }} else {{
-                lastTapAt = now;
-                lastTapX = point.x;
-                lastTapY = point.y;
+                const now = Date.now();
+                if (now - lastTapAt < 320 && Math.hypot(point.x - lastTapX, point.y - lastTapY) < 36) {{
+                  if (scale > 1.05) resetView();
+                  else zoomAt(2.5, point.x, point.y);
+                  lastTapAt = 0;
+                }} else {{
+                  lastTapAt = now;
+                  lastTapX = point.x;
+                  lastTapY = point.y;
+                }}
               }}
+              swipeStart = null;
             }}
           }};
           stage.addEventListener('pointerup', finishPointer, {{passive: false}});
@@ -2877,7 +2986,8 @@ def show_onedrive_image_dialog(image_content, filename):
             zoomAt(scale * factor, event.clientX, event.clientY);
           }}, {{passive: false}});
 
-          image.addEventListener('load', resetView, {{once: true}});
+          image.addEventListener('load', resetView);
+          showImage(0);
         }})();
         </script>
         """,
@@ -2886,6 +2996,12 @@ def show_onedrive_image_dialog(image_content, filename):
         scrolling=False,
     )
 
+
+def show_onedrive_image_dialog(image_content, filename):
+    """従来の単独画像表示を、共通の全画面ギャラリーで開く。"""
+    show_onedrive_image_gallery_dialog(
+        [{"content": image_content, "filename": filename}]
+    )
 
 def show_onedrive_pdf_dialog(pdf_content, filename, mime_type, metadata_id):
     """現在の画面位置を保ったまま、PDFを全画面ビューアーで表示する。"""
@@ -3008,6 +3124,11 @@ def render_onedrive_attachment_scroll_keeper(suffix, restore=False):
     )
 
 
+def is_onedrive_not_found_error(exc):
+    text = str(exc or "")
+    return "（404）" in text or "(404)" in text or "resource could not be found" in text.lower()
+
+
 @st.dialog("写真・資料を削除")
 def confirm_onedrive_attachment_delete_dialog(
     access_token,
@@ -3018,13 +3139,30 @@ def confirm_onedrive_attachment_delete_dialog(
     success_key,
     open_key,
     restore_key,
+    error_key="",
 ):
-    """現在位置を保ったまま、写真・資料の削除を確認して実行する。"""
-    metadata_id = attachment.get("id", "")
-    item_id = attachment.get("file_id", "")
-    filename = attachment.get("original_name", "名称未設定")
+    """OneDrive実体がない場合も含め、単独またはグループの写真・資料を削除する。"""
+    attachments = list(attachment) if isinstance(attachment, (list, tuple)) else [attachment]
+    attachments = [item for item in attachments if isinstance(item, dict)]
+    if not attachments:
+        st.error("削除対象が見つかりません。")
+        return
 
-    st.warning(f"「{filename}」をOneDriveから削除します。")
+    representative = attachments[0]
+    metadata_id = representative.get("id", "")
+    image_count = sum(1 for item in attachments if item.get("file_type") == "image")
+    filenames = [
+        str(item.get("original_name") or "名称未設定")
+        for item in attachments
+    ]
+    if len(attachments) > 1 and image_count == len(attachments):
+        target_label = f"写真{len(attachments)}枚"
+    elif len(attachments) > 1:
+        target_label = f"写真・資料{len(attachments)}件"
+    else:
+        target_label = f"「{filenames[0]}」"
+
+    st.warning(f"{target_label}をOneDriveから削除します。")
     st.caption("この操作は元に戻せません。")
     delete_col, cancel_col = st.columns(2)
 
@@ -3038,27 +3176,64 @@ def confirm_onedrive_attachment_delete_dialog(
             if not access_token:
                 st.error("削除するにはOneDriveへ接続してください。")
             else:
-                try:
-                    with st.spinner("削除しています…"):
-                        delete_onedrive_file(access_token, item_id)
-                        delete_customer_information(metadata_id)
+                deleted_items = []
+                failed_items = []
+                with st.spinner("削除しています…"):
+                    for item in attachments:
+                        item_metadata_id = str(item.get("id") or "")
+                        item_id = str(item.get("file_id") or "")
+                        item_name = str(item.get("original_name") or "名称未設定")
+                        try:
+                            if item_id:
+                                try:
+                                    delete_onedrive_file(access_token, item_id)
+                                except Exception as exc:
+                                    # OneDrive上で既に消えている場合は、孤立したSupabase記録だけ削除する。
+                                    if not is_onedrive_not_found_error(exc):
+                                        raise
+                            if item_metadata_id:
+                                delete_customer_information(item_metadata_id)
+                            st.session_state.pop(f"onedrive_thumbnail_{item_id}", None)
+                            deleted_items.append(item)
+                        except Exception as exc:
+                            failed_items.append((item_name, str(exc)))
+
+                if deleted_items:
+                    deleted_names = "、".join(
+                        str(item.get("original_name") or "名称未設定")
+                        for item in deleted_items
+                    )
                     remember_change_history_warning(
                         record_change_history_safely(
                             attachment_entity_label(entity_type),
                             entity_id or "",
                             entity_name,
                             "削除",
-                            {"ファイル": (filename, "")},
+                            {"ファイル": (deleted_names, "")},
                             section="写真・資料",
                         )
                     )
-                    st.session_state.pop(f"onedrive_thumbnail_{item_id}", None)
-                    st.session_state[success_key] = "写真・資料を削除しました。"
+                    if len(deleted_items) > 1:
+                        st.session_state[success_key] = f"写真を{len(deleted_items)}枚削除しました。"
+                    else:
+                        st.session_state[success_key] = "写真・資料を削除しました。"
+
+                if failed_items:
+                    failed_names = "、".join(name for name, _ in failed_items)
+                    first_error = failed_items[0][1]
+                    message = (
+                        f"{len(failed_items)}件削除できませんでした：{failed_names}"
+                        + (f"（{first_error}）" if first_error else "")
+                    )
+                    if error_key:
+                        st.session_state[error_key] = message
+                    else:
+                        st.error(message)
+
+                if deleted_items or failed_items:
                     st.session_state[open_key] = True
                     st.session_state[restore_key] = True
                     st.rerun()
-                except Exception as exc:
-                    st.error(f"削除できませんでした：{exc}")
 
     with cancel_col:
         if st.button(
@@ -6260,6 +6435,9 @@ def parse_onedrive_attachment_item(item):
         "created_at": clean_value(payload.get("created_at"), blank_text="")
         or clean_value(item.get("created_at"), blank_text=""),
         "updated_at": clean_value(item.get("updated_at"), blank_text=""),
+        "group_id": clean_value(payload.get("group_id"), blank_text=""),
+        "group_index": int(payload.get("group_index") or 0),
+        "group_size": max(1, int(payload.get("group_size") or 1)),
         "version": payload.get("version") or ONEDRIVE_ATTACHMENT_VERSION,
     }
 
@@ -6284,8 +6462,76 @@ def serialize_onedrive_attachment(attachment):
         "remarks": attachment.get("remarks", ""),
         "uploaded_by": attachment.get("uploaded_by", ""),
         "created_at": attachment.get("created_at", ""),
+        "group_id": attachment.get("group_id", ""),
+        "group_index": int(attachment.get("group_index") or 0),
+        "group_size": max(1, int(attachment.get("group_size") or 1)),
     }
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+
+
+def attachment_group_index(value):
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def group_onedrive_attachments_for_display(attachments):
+    """同時選択で保存した画像を1カードへまとめ、従来データは単独のまま返す。"""
+    groups = []
+    by_key = {}
+    for position, attachment in enumerate(list(attachments or [])):
+        group_id = clean_value(attachment.get("group_id"), blank_text="").strip()
+        if attachment.get("file_type") == "image" and group_id:
+            key = "group:" + ":".join(
+                [
+                    normalize_attachment_entity_type(attachment.get("entity_type")),
+                    clean_value(attachment.get("entity_id"), blank_text=""),
+                    group_id,
+                ]
+            )
+        else:
+            stable_id = (
+                clean_value(attachment.get("id"), blank_text="")
+                or clean_value(attachment.get("file_id"), blank_text="")
+                or f"position_{position}"
+            )
+            key = f"single:{stable_id}"
+
+        if key not in by_key:
+            group = {"key": key, "items": []}
+            by_key[key] = group
+            groups.append(group)
+        by_key[key]["items"].append(attachment)
+
+    for group in groups:
+        items = group["items"]
+        items.sort(
+            key=lambda item: (
+                attachment_group_index(item.get("group_index")),
+                str(item.get("created_at") or item.get("updated_at") or ""),
+                str(item.get("id") or ""),
+            )
+        )
+        representative = items[0]
+        group["representative"] = representative
+        group["count"] = len(items)
+        group["ui_id"] = hashlib.sha256(group["key"].encode("utf-8")).hexdigest()[:20]
+    return groups
+
+
+def update_onedrive_attachment_group_metadata(attachments, tags, remarks):
+    """グループ内の全画像へ同じタグ・備考を保存する。"""
+    updated = []
+    for attachment in list(attachments or []):
+        updated.append(
+            update_customer_onedrive_attachment_metadata(
+                attachment,
+                tags,
+                remarks,
+            )
+        )
+    return updated
 
 
 def get_customer_onedrive_folder_key(customer_key, customer_name):
@@ -6431,6 +6677,9 @@ def save_entity_onedrive_attachment(
     tags,
     remarks,
     access_token,
+    group_id="",
+    group_index=0,
+    group_size=1,
 ):
     entity_type = normalize_attachment_entity_type(entity_type)
     entity_name = clean_value(entity_name, blank_text="").strip()
@@ -6495,6 +6744,9 @@ def save_entity_onedrive_attachment(
         "remarks": str(remarks or "").strip(),
         "uploaded_by": uploaded_by,
         "created_at": get_jst_now().isoformat(),
+        "group_id": str(group_id or "").strip(),
+        "group_index": int(group_index or 0),
+        "group_size": max(1, int(group_size or 1)),
     }
     storage_key = attachment_storage_key(entity_type, entity_id, entity_name)
     try:
@@ -6654,9 +6906,10 @@ def render_customer_attachments_section(
             st.warning(f"写真・資料の一覧を読み込めませんでした：{exc}")
         return
 
+    attachment_groups = group_onedrive_attachments_for_display(attachments)
     force_open = bool(st.session_state.pop(open_key, False))
     restore_scroll = bool(st.session_state.pop(restore_key, False))
-    with st.expander(f"📎 写真・資料　{len(attachments)}件", expanded=force_open):
+    with st.expander(f"📎 写真・資料　{len(attachment_groups)}件", expanded=force_open):
         render_onedrive_attachment_scroll_keeper(suffix, restore=restore_scroll)
         success_message = st.session_state.pop(success_key, None)
         if success_message:
@@ -6780,8 +7033,10 @@ def render_customer_attachments_section(
                         tags = list(selected_history_tags) + normalize_attachment_tags(new_tags_text)
                         saved_items = []
                         failed_items = []
+                        image_group_id = uuid.uuid4().hex if len(photo_files) > 1 else ""
+                        image_group_size = len(photo_files) if photo_files else 1
                         with st.spinner("OneDriveへ保存しています…"):
-                            for uploaded in uploaded_files:
+                            for upload_index, uploaded in enumerate(uploaded_files):
                                 try:
                                     saved = save_entity_onedrive_attachment(
                                         entity_type,
@@ -6793,6 +7048,9 @@ def render_customer_attachments_section(
                                         tags,
                                         remarks,
                                         access_token,
+                                        group_id=image_group_id,
+                                        group_index=upload_index if image_group_id else 0,
+                                        group_size=image_group_size if image_group_id else 1,
                                     )
                                     saved_items.append(saved)
                                     remember_change_history_warning(
@@ -6962,47 +7220,66 @@ def render_customer_attachments_section(
             if not filtered:
                 st.info("条件に一致する写真・資料はありません。")
 
-            visible_attachments = filtered[:limit]
+            display_groups = group_onedrive_attachments_for_display(filtered)
+            visible_groups = display_groups[:limit]
             grid_column_count = 2 if is_mobile_browser() else 3
             grid_columns = []
 
-            for attachment_index, attachment in enumerate(visible_attachments):
-                if attachment_index % grid_column_count == 0:
+            for group_index, attachment_group in enumerate(visible_groups):
+                if group_index % grid_column_count == 0:
                     grid_columns = st.columns(grid_column_count, gap="small")
 
+                group_items = attachment_group["items"]
+                attachment = attachment_group["representative"]
+                group_count = attachment_group["count"]
+                group_ui_id = attachment_group["ui_id"]
                 item_id = attachment.get("file_id", "")
                 metadata_id = attachment.get("id", "")
                 filename = attachment.get("original_name", "名称未設定")
-                with grid_columns[attachment_index % grid_column_count]:
+                with grid_columns[group_index % grid_column_count]:
                     with st.container(border=True):
-                        preview_digest = hashlib.sha256(str(metadata_id).encode("utf-8")).digest()[:8]
+                        preview_digest = hashlib.sha256(group_ui_id.encode("utf-8")).digest()[:8]
                         preview_bits = "".join(f"{byte:08b}" for byte in preview_digest)
                         preview_trigger_label = "⁣" + "".join(
                             "​" if bit == "0" else "‌" for bit in preview_bits
                         )
                         preview_clicked = st.button(
                             preview_trigger_label,
-                            key=f"onedrive_attachment_preview_button_{metadata_id}",
+                            key=f"onedrive_attachment_preview_button_{group_ui_id}",
                         )
 
                         if attachment.get("file_type") == "image":
                             thumbnail_content = None
-                            if access_token and item_id:
-                                thumb_key = f"onedrive_thumbnail_{item_id}"
-                                if not isinstance(st.session_state.get(thumb_key), bytes):
-                                    try:
-                                        thumbnail = download_onedrive_thumbnail(access_token, item_id)
-                                        if thumbnail:
-                                            st.session_state[thumb_key] = thumbnail
-                                    except Exception:
-                                        pass
-                                if isinstance(st.session_state.get(thumb_key), bytes):
-                                    thumbnail_content = st.session_state[thumb_key]
+                            thumbnail_filename = filename
+                            if access_token:
+                                for thumbnail_item in group_items:
+                                    thumbnail_item_id = thumbnail_item.get("file_id", "")
+                                    if not thumbnail_item_id:
+                                        continue
+                                    thumb_key = f"onedrive_thumbnail_{thumbnail_item_id}"
+                                    if not isinstance(st.session_state.get(thumb_key), bytes):
+                                        try:
+                                            thumbnail = download_onedrive_thumbnail(
+                                                access_token,
+                                                thumbnail_item_id,
+                                            )
+                                            if thumbnail:
+                                                st.session_state[thumb_key] = thumbnail
+                                        except Exception:
+                                            pass
+                                    if isinstance(st.session_state.get(thumb_key), bytes):
+                                        thumbnail_content = st.session_state[thumb_key]
+                                        thumbnail_filename = thumbnail_item.get(
+                                            "original_name",
+                                            filename,
+                                        )
+                                        break
                             render_clickable_onedrive_thumbnail(
                                 thumbnail_content,
-                                filename,
+                                thumbnail_filename,
                                 preview_trigger_label,
                                 compact_height=142 if is_mobile_browser() else 150,
+                                badge_text=f"{group_count}枚" if group_count > 1 else "",
                             )
                         else:
                             render_clickable_onedrive_pdf_tile(
@@ -7015,20 +7292,61 @@ def render_customer_attachments_section(
                             if not access_token or not item_id:
                                 st.error("表示するにはOneDriveへ接続してください。")
                             else:
-                                try:
+                                if attachment.get("file_type") == "image":
+                                    image_items = []
+                                    missing_names = []
+                                    other_errors = []
                                     with st.spinner("ファイルを読み込んでいます…"):
-                                        content = download_onedrive_file(access_token, item_id)
-                                    if attachment.get("file_type") == "image":
-                                        show_onedrive_image_dialog(content, filename)
-                                    else:
+                                        for image_attachment in group_items:
+                                            image_item_id = image_attachment.get("file_id", "")
+                                            image_name = image_attachment.get(
+                                                "original_name",
+                                                "名称未設定",
+                                            )
+                                            if not image_item_id:
+                                                missing_names.append(image_name)
+                                                continue
+                                            try:
+                                                image_content = download_onedrive_file(
+                                                    access_token,
+                                                    image_item_id,
+                                                )
+                                                image_items.append(
+                                                    {
+                                                        "content": image_content,
+                                                        "filename": image_name,
+                                                    }
+                                                )
+                                            except Exception as exc:
+                                                if is_onedrive_not_found_error(exc):
+                                                    missing_names.append(image_name)
+                                                else:
+                                                    other_errors.append((image_name, str(exc)))
+                                    if image_items:
+                                        show_onedrive_image_gallery_dialog(image_items)
+                                    if missing_names:
+                                        st.warning(
+                                            "OneDrive上に見つからない画像があります："
+                                            + "、".join(missing_names)
+                                        )
+                                    if other_errors:
+                                        st.error(
+                                            "表示できない画像があります："
+                                            + "、".join(name for name, _ in other_errors)
+                                            + f"（{other_errors[0][1]}）"
+                                        )
+                                else:
+                                    try:
+                                        with st.spinner("ファイルを読み込んでいます…"):
+                                            content = download_onedrive_file(access_token, item_id)
                                         show_onedrive_pdf_dialog(
                                             content,
                                             filename,
                                             attachment.get("mime_type") or "application/pdf",
                                             metadata_id,
                                         )
-                                except Exception as exc:
-                                    st.error(f"表示できませんでした：{exc}")
+                                    except Exception as exc:
+                                        st.error(f"表示できませんでした：{exc}")
 
                         attachment_date = format_attachment_datetime(
                             attachment.get("created_at")
@@ -7048,7 +7366,7 @@ def render_customer_attachments_section(
                         if attachment.get("remarks"):
                             st.caption(attachment["remarks"])
 
-                        if active_edit_id == metadata_id:
+                        if active_edit_id == group_ui_id:
                             current_tags = normalize_attachment_tags(attachment.get("tags") or [])
                             edit_tag_options = list(tag_history_options)
                             for current_tag in reversed(current_tags):
@@ -7058,33 +7376,33 @@ def render_customer_attachments_section(
                                 "タグを編集（入力すると過去の候補を絞り込み）",
                                 edit_tag_options,
                                 default=current_tags,
-                                key=f"onedrive_attachment_edit_history_{metadata_id}",
+                                key=f"onedrive_attachment_edit_history_{group_ui_id}",
                             )
                             edited_new_tags = st.text_input(
                                 "新しいタグを追加",
                                 value="",
                                 placeholder="候補にないタグだけ入力",
-                                key=f"onedrive_attachment_edit_new_{metadata_id}",
+                                key=f"onedrive_attachment_edit_new_{group_ui_id}",
                             )
                             edited_remarks = st.text_area(
                                 "備考を編集",
                                 value=attachment.get("remarks", ""),
                                 height=90,
-                                key=f"onedrive_attachment_edit_remarks_{metadata_id}",
+                                key=f"onedrive_attachment_edit_remarks_{group_ui_id}",
                             )
                             save_col, cancel_col = st.columns(2)
                             with save_col:
                                 if st.button(
                                     "保存",
-                                    key=f"onedrive_attachment_edit_save_{metadata_id}",
+                                    key=f"onedrive_attachment_edit_save_{group_ui_id}",
                                     type="primary",
                                     use_container_width=True,
                                 ):
                                     try:
                                         old_tags = " ".join(f"#{tag}" for tag in attachment.get("tags", []))
                                         new_tags = list(edited_history_tags) + normalize_attachment_tags(edited_new_tags)
-                                        update_customer_onedrive_attachment_metadata(
-                                            attachment,
+                                        update_onedrive_attachment_group_metadata(
+                                            group_items,
                                             new_tags,
                                             edited_remarks,
                                         )
@@ -7101,7 +7419,11 @@ def render_customer_attachments_section(
                                                 entity_name,
                                                 "変更",
                                                 changes,
-                                                section=f"写真・資料：{filename}",
+                                                section=(
+                                                    f"写真・資料：画像{group_count}枚"
+                                                    if group_count > 1
+                                                    else f"写真・資料：{filename}"
+                                                ),
                                             )
                                         )
                                         st.session_state.pop(edit_key, None)
@@ -7112,7 +7434,7 @@ def render_customer_attachments_section(
                             with cancel_col:
                                 if st.button(
                                     "キャンセル",
-                                    key=f"onedrive_attachment_edit_cancel_{metadata_id}",
+                                    key=f"onedrive_attachment_edit_cancel_{group_ui_id}",
                                     use_container_width=True,
                                 ):
                                     st.session_state.pop(edit_key, None)
@@ -7123,31 +7445,32 @@ def render_customer_attachments_section(
                         with action_col:
                             if st.button(
                                 "編集",
-                                key=f"onedrive_attachment_edit_button_{metadata_id}",
+                                key=f"onedrive_attachment_edit_button_{group_ui_id}",
                                 use_container_width=True,
                                 help="タグ・備考を編集",
                             ):
-                                st.session_state[edit_key] = metadata_id
+                                st.session_state[edit_key] = group_ui_id
                                 st.rerun()
                         with delete_col:
                             if st.button(
                                 "削除",
-                                key=f"onedrive_attachment_delete_button_{metadata_id}",
+                                key=f"onedrive_attachment_delete_button_{group_ui_id}",
                                 use_container_width=True,
                             ):
                                 st.session_state.pop(edit_key, None)
                                 confirm_onedrive_attachment_delete_dialog(
                                     access_token,
-                                    attachment,
+                                    group_items,
                                     entity_type,
                                     entity_id,
                                     entity_name,
                                     success_key,
                                     open_key,
                                     restore_key,
+                                    upload_error_key,
                                 )
 
-            if len(filtered) > limit:
+            if len(display_groups) > limit:
                 if st.button(
                     "さらに表示",
                     key=f"onedrive_attachment_more_{suffix}",
@@ -7252,8 +7575,9 @@ def show_attachment_search_page():
         st.session_state[signature_key] = signature
         st.session_state[limit_key] = ONEDRIVE_PAGE_SIZE
 
-    st.caption(f"該当：{len(filtered)}件")
-    if not filtered:
+    display_groups = group_onedrive_attachments_for_display(filtered)
+    st.caption(f"該当：{len(display_groups)}件")
+    if not display_groups:
         st.info("条件に一致する写真・資料はありません。")
         return
 
@@ -7262,14 +7586,18 @@ def show_attachment_search_page():
         st.warning("画像やPDFを開くには、管理者によるOneDrive接続が必要です。")
 
     limit = int(st.session_state.get(limit_key, ONEDRIVE_PAGE_SIZE))
-    visible_attachments = filtered[:limit]
+    visible_groups = display_groups[:limit]
     grid_column_count = 2 if is_mobile_browser() else 4
     grid_columns = []
 
-    for attachment_index, attachment in enumerate(visible_attachments):
-        if attachment_index % grid_column_count == 0:
+    for group_index, attachment_group in enumerate(visible_groups):
+        if group_index % grid_column_count == 0:
             grid_columns = st.columns(grid_column_count, gap="small")
 
+        group_items = attachment_group["items"]
+        attachment = attachment_group["representative"]
+        group_count = attachment_group["count"]
+        group_ui_id = attachment_group["ui_id"]
         item_id = attachment.get("file_id", "")
         metadata_id = attachment.get("id", "")
         filename = attachment.get("original_name", "名称未設定")
@@ -7278,10 +7606,10 @@ def show_attachment_search_page():
         entity_name = clean_value(attachment.get("entity_name"), blank_text="") or "名称未設定"
         entity_label = attachment_entity_label(entity_type)
 
-        with grid_columns[attachment_index % grid_column_count]:
+        with grid_columns[group_index % grid_column_count]:
             with st.container(border=True):
                 preview_digest = hashlib.sha256(
-                    f"global:{metadata_id}".encode("utf-8")
+                    f"global:{group_ui_id}".encode("utf-8")
                 ).digest()[:8]
                 preview_bits = "".join(f"{byte:08b}" for byte in preview_digest)
                 preview_trigger_label = "⁣" + "".join(
@@ -7289,27 +7617,41 @@ def show_attachment_search_page():
                 )
                 preview_clicked = st.button(
                     preview_trigger_label,
-                    key=f"onedrive_attachment_global_preview_button_{metadata_id}",
+                    key=f"onedrive_attachment_global_preview_button_{group_ui_id}",
                 )
 
                 if attachment.get("file_type") == "image":
                     thumbnail_content = None
-                    if access_token and item_id:
-                        thumb_key = f"onedrive_thumbnail_{item_id}"
-                        if not isinstance(st.session_state.get(thumb_key), bytes):
-                            try:
-                                thumbnail = download_onedrive_thumbnail(access_token, item_id)
-                                if thumbnail:
-                                    st.session_state[thumb_key] = thumbnail
-                            except Exception:
-                                pass
-                        if isinstance(st.session_state.get(thumb_key), bytes):
-                            thumbnail_content = st.session_state[thumb_key]
+                    thumbnail_filename = filename
+                    if access_token:
+                        for thumbnail_item in group_items:
+                            thumbnail_item_id = thumbnail_item.get("file_id", "")
+                            if not thumbnail_item_id:
+                                continue
+                            thumb_key = f"onedrive_thumbnail_{thumbnail_item_id}"
+                            if not isinstance(st.session_state.get(thumb_key), bytes):
+                                try:
+                                    thumbnail = download_onedrive_thumbnail(
+                                        access_token,
+                                        thumbnail_item_id,
+                                    )
+                                    if thumbnail:
+                                        st.session_state[thumb_key] = thumbnail
+                                except Exception:
+                                    pass
+                            if isinstance(st.session_state.get(thumb_key), bytes):
+                                thumbnail_content = st.session_state[thumb_key]
+                                thumbnail_filename = thumbnail_item.get(
+                                    "original_name",
+                                    filename,
+                                )
+                                break
                     render_clickable_onedrive_thumbnail(
                         thumbnail_content,
-                        filename,
+                        thumbnail_filename,
                         preview_trigger_label,
                         compact_height=132 if is_mobile_browser() else 145,
+                        badge_text=f"{group_count}枚" if group_count > 1 else "",
                     )
                 else:
                     render_clickable_onedrive_pdf_tile(
@@ -7322,20 +7664,61 @@ def show_attachment_search_page():
                     if not access_token or not item_id:
                         st.error("表示するにはOneDriveへ接続してください。")
                     else:
-                        try:
+                        if attachment.get("file_type") == "image":
+                            image_items = []
+                            missing_names = []
+                            other_errors = []
                             with st.spinner("ファイルを読み込んでいます…"):
-                                content = download_onedrive_file(access_token, item_id)
-                            if attachment.get("file_type") == "image":
-                                show_onedrive_image_dialog(content, filename)
-                            else:
+                                for image_attachment in group_items:
+                                    image_item_id = image_attachment.get("file_id", "")
+                                    image_name = image_attachment.get(
+                                        "original_name",
+                                        "名称未設定",
+                                    )
+                                    if not image_item_id:
+                                        missing_names.append(image_name)
+                                        continue
+                                    try:
+                                        image_content = download_onedrive_file(
+                                            access_token,
+                                            image_item_id,
+                                        )
+                                        image_items.append(
+                                            {
+                                                "content": image_content,
+                                                "filename": image_name,
+                                            }
+                                        )
+                                    except Exception as exc:
+                                        if is_onedrive_not_found_error(exc):
+                                            missing_names.append(image_name)
+                                        else:
+                                            other_errors.append((image_name, str(exc)))
+                            if image_items:
+                                show_onedrive_image_gallery_dialog(image_items)
+                            if missing_names:
+                                st.warning(
+                                    "OneDrive上に見つからない画像があります："
+                                    + "、".join(missing_names)
+                                )
+                            if other_errors:
+                                st.error(
+                                    "表示できない画像があります："
+                                    + "、".join(name for name, _ in other_errors)
+                                    + f"（{other_errors[0][1]}）"
+                                )
+                        else:
+                            try:
+                                with st.spinner("ファイルを読み込んでいます…"):
+                                    content = download_onedrive_file(access_token, item_id)
                                 show_onedrive_pdf_dialog(
                                     content,
                                     filename,
                                     attachment.get("mime_type") or "application/pdf",
                                     f"global_{metadata_id}",
                                 )
-                        except Exception as exc:
-                            st.error(f"表示できませんでした：{exc}")
+                            except Exception as exc:
+                                st.error(f"表示できませんでした：{exc}")
 
                 if entity_type == "customer":
                     entity_url = make_app_url(page="detail", customer=entity_name)
@@ -7361,7 +7744,7 @@ def show_attachment_search_page():
                 if attachment.get("remarks"):
                     st.caption(attachment["remarks"])
 
-    if len(filtered) > limit:
+    if len(display_groups) > limit:
         if st.button(
             "さらに表示",
             key="attachment_global_more",
