@@ -12250,6 +12250,15 @@ def apply_dispatch_date_filter(df, column, mode, range_value):
     return df
 
 
+# 配車表の絞り込み処理は、分割した純粋関数を使用する。
+# 比較・切り戻しのため、直前の旧関数は当面残す。
+from app_modules.dispatch_filters import (
+    apply_dispatch_choice_filter,
+    apply_dispatch_date_filter,
+    dispatch_filter_options,
+)
+
+
 def show_dispatch_filters(df):
     """Excelフィルターに近いAND条件の絞り込みを表示する。"""
     with st.expander("🔎 絞り込み", expanded=False):
