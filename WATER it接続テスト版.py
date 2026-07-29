@@ -12220,6 +12220,14 @@ def read_dispatch_month_sheets(excel_source):
     return df
 
 
+# 配車表Excel読み込みは、分割したモジュール側の同名関数を使用する。
+# 比較・切り戻しのため、直前の旧関数は当面残す。
+from app_modules.dispatch_excel import (
+    normalize_dispatch_text,
+    read_dispatch_month_sheets,
+)
+
+
 @st.cache_data(ttl=60, show_spinner=False)
 def get_cached_dispatch_dropbox_content():
     access_token = get_dropbox_access_token()
@@ -12260,49 +12268,7 @@ def dispatch_date_label(value):
     return f"{target.month}/{target.day}（{weekdays[target.weekday()]}）"
 
 
-def dispatch_filter_options(series):
-    values = sorted({normalize_dispatch_text(value) for value in series if normalize_dispatch_text(value)})
-    if any(not normalize_dispatch_text(value) for value in series):
-        values.append("（空白）")
-    return values
-
-
-def apply_dispatch_choice_filter(df, column, selected):
-    if not selected:
-        return df
-    selected_values = {value for value in selected if value != "（空白）"}
-    include_blank = "（空白）" in selected
-    normalized = df[column].map(normalize_dispatch_text)
-    mask = normalized.isin(selected_values)
-    if include_blank:
-        mask = mask | normalized.eq("")
-    return df[mask]
-
-
-def apply_dispatch_date_filter(df, column, mode, range_value):
-    if mode == "すべて":
-        return df
-
-    today = date.today()
-    values = df[column]
-    if mode == "今日":
-        return df[values == today]
-    if mode == "明日":
-        return df[values == today + timedelta(days=1)]
-    if mode == "今週":
-        start = today - timedelta(days=today.weekday())
-        end = start + timedelta(days=6)
-        return df[values.map(lambda value: pd.notna(value) and start <= value <= end)]
-    if mode == "未入力":
-        return df[values.isna()]
-    if mode == "期間指定" and isinstance(range_value, (tuple, list)) and len(range_value) == 2:
-        start, end = range_value
-        return df[values.map(lambda value: pd.notna(value) and start <= value <= end)]
-    return df
-
-
 # 配車表の絞り込み処理は、分割した純粋関数を使用する。
-# 比較・切り戻しのため、直前の旧関数は当面残す。
 from app_modules.dispatch_filters import (
     apply_dispatch_choice_filter,
     apply_dispatch_date_filter,
