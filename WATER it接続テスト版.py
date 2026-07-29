@@ -3285,6 +3285,14 @@ if "authenticated" not in st.session_state:
     st.session_state.authenticated = False
 
 if TEST_PASSWORD_AUTH_MODE and not st.session_state.get("test_password_authenticated"):
+    # HTMLリンクによる画面移動でStreamlitのセッションが変わっても、
+    # 有効な署名付きCookieがあればテスト版のログイン状態を復元する。
+    existing_test_login_token = get_active_login_token()
+    if validate_login_token(existing_test_login_token):
+        st.session_state["test_password_authenticated"] = True
+        st.session_state.authenticated = True
+
+if TEST_PASSWORD_AUTH_MODE and not st.session_state.get("test_password_authenticated"):
     st.title("🔒 取引先カルテ・テスト版")
     st.caption("テスト版は、既存のアプリ用パスワードで保護されています。")
     if not APP_PASSWORD:
@@ -3293,6 +3301,9 @@ if TEST_PASSWORD_AUTH_MODE and not st.session_state.get("test_password_authentic
     test_password = st.text_input("パスワード", type="password")
     if st.button("テスト版へログイン", type="primary", use_container_width=True):
         if hmac.compare_digest(str(test_password), str(APP_PASSWORD)):
+            test_login_token = create_login_token()
+            save_login_token_cookie(test_login_token)
+            st.session_state["login_token"] = test_login_token
             st.session_state["test_password_authenticated"] = True
             st.session_state.authenticated = True
             st.rerun()
@@ -12288,6 +12299,15 @@ def apply_dispatch_date_filter(df, column, mode, range_value):
         start, end = range_value
         return df[values.map(lambda value: pd.notna(value) and start <= value <= end)]
     return df
+
+
+# 配車表の絞り込み処理は、分割した純粋関数を使用する。
+# 比較・切り戻しのため、直前の旧関数は当面残す。
+from app_modules.dispatch_filters import (
+    apply_dispatch_choice_filter,
+    apply_dispatch_date_filter,
+    dispatch_filter_options,
+)
 
 
 def show_dispatch_filters(df):
