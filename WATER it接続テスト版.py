@@ -7218,6 +7218,86 @@ def render_collapsible_attachment_remarks(value):
     )
 
 
+
+def render_attachment_card_layout_styles():
+    """写真・資料の一覧カードだけを、行内で上揃え・同じ高さに整える。"""
+    st.markdown(
+        """
+        <style>
+          .aoyama-attachment-card-marker {
+            display: none !important;
+          }
+
+          /* 既存のスマホ向け中央揃えを、このカード一覧だけ上書きする。 */
+          [data-testid="stHorizontalBlock"]:has(.aoyama-attachment-card-marker) {
+            align-items: stretch !important;
+          }
+          [data-testid="stHorizontalBlock"]:has(.aoyama-attachment-card-marker) > div {
+            align-self: stretch !important;
+            display: flex !important;
+            min-width: 0 !important;
+          }
+          [data-testid="stHorizontalBlock"]:has(.aoyama-attachment-card-marker)
+            > div > [data-testid="stVerticalBlock"] {
+            display: flex !important;
+            flex: 1 1 auto !important;
+            flex-direction: column !important;
+            width: 100% !important;
+            min-width: 0 !important;
+          }
+          [data-testid="stVerticalBlockBorderWrapper"]:has(.aoyama-attachment-card-marker) {
+            display: flex !important;
+            flex: 1 1 auto !important;
+            width: 100% !important;
+          }
+          [data-testid="stVerticalBlockBorderWrapper"]:has(.aoyama-attachment-card-marker)
+            > [data-testid="stVerticalBlock"] {
+            width: 100% !important;
+          }
+
+          .aoyama-attachment-card-entity {
+            min-height: 3.55rem;
+            margin: 0.08rem 0 0.2rem 0;
+            line-height: 1.45;
+            overflow: hidden;
+          }
+          .aoyama-attachment-card-entity a {
+            display: -webkit-box;
+            overflow: hidden;
+            color: rgb(0, 104, 201);
+            font-weight: 700;
+            text-decoration: none;
+            overflow-wrap: anywhere;
+            -webkit-box-orient: vertical;
+            -webkit-line-clamp: 2;
+          }
+          .aoyama-attachment-card-date {
+            min-height: 1.55rem;
+            color: rgba(49, 51, 63, 0.62);
+            font-size: 0.875rem;
+            line-height: 1.45;
+          }
+          .aoyama-attachment-card-tags {
+            min-height: 2.7rem;
+            margin: 0.08rem 0 0.16rem 0;
+            line-height: 1.75;
+            overflow-wrap: anywhere;
+          }
+          .aoyama-attachment-card-tag {
+            display: inline-block;
+            margin: 0 0.16rem 0.14rem 0;
+            padding: 0.04rem 0.28rem;
+            border-radius: 0.24rem;
+            background: rgba(22, 163, 74, 0.06);
+            color: rgb(20, 128, 59);
+            font-size: 0.82rem;
+            line-height: 1.45;
+          }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
 def onedrive_attachment_rows_to_dataframe(rows):
     records = []
     for row in rows:
@@ -8000,6 +8080,7 @@ def show_attachment_search_page():
         st.session_state[limit_key] = ONEDRIVE_PAGE_SIZE
 
     display_groups = group_onedrive_attachments_for_display(filtered)
+    render_attachment_card_layout_styles()
     st.caption(f"該当：{len(display_groups)}件")
     if not display_groups:
         st.info("条件に一致する写真・資料はありません。")
@@ -8032,6 +8113,10 @@ def show_attachment_search_page():
 
         with grid_columns[group_index % grid_column_count]:
             with st.container(border=True):
+                st.markdown(
+                    '<span class="aoyama-attachment-card-marker" aria-hidden="true"></span>',
+                    unsafe_allow_html=True,
+                )
                 preview_digest = hashlib.sha256(
                     f"global:{group_ui_id}".encode("utf-8")
                 ).digest()[:8]
@@ -8152,19 +8237,34 @@ def show_attachment_search_page():
                         partner_id=entity_id,
                         partner_type=entity_type,
                     )
+                safe_entity_url = html.escape(entity_url, quote=True)
+                safe_entity_title = html.escape(f"{entity_label}：{entity_name}")
                 st.markdown(
-                    f'<a href="{html.escape(entity_url, quote=True)}" target="_self" '
-                    'style="font-weight:700;text-decoration:none;">'
-                    f'{html.escape(entity_label)}：{html.escape(entity_name)}</a>',
+                    f'<div class="aoyama-attachment-card-entity">'
+                    f'<a href="{safe_entity_url}" target="_self" title="{safe_entity_title}">'
+                    f'{safe_entity_title}</a></div>',
                     unsafe_allow_html=True,
                 )
                 attachment_date = format_attachment_datetime(
                     attachment.get("created_at")
                 ).split(" ", 1)[0]
-                if attachment_date:
-                    st.caption(attachment_date)
-                if attachment.get("tags"):
-                    st.markdown(" ".join(f"`#{tag}`" for tag in attachment["tags"]))
+                st.markdown(
+                    '<div class="aoyama-attachment-card-date">'
+                    + (html.escape(attachment_date) if attachment_date else '&nbsp;')
+                    + '</div>',
+                    unsafe_allow_html=True,
+                )
+                attachment_tags = normalize_attachment_tags(attachment.get("tags") or [])
+                tags_html = "".join(
+                    f'<span class="aoyama-attachment-card-tag">#{html.escape(tag)}</span>'
+                    for tag in attachment_tags
+                )
+                st.markdown(
+                    '<div class="aoyama-attachment-card-tags">'
+                    + (tags_html if tags_html else '&nbsp;')
+                    + '</div>',
+                    unsafe_allow_html=True,
+                )
                 render_collapsible_attachment_remarks(
                     attachment.get("remarks")
                 )
