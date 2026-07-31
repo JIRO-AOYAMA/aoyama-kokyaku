@@ -443,6 +443,163 @@ def enable_mobile_camera_capture(uploader_label):
     components.html(script, height=0, scrolling=False)
 
 
+def enable_mobile_bulk_image_picker(uploader_label):
+    """スマホ用の独立した複数画像ピッカーからStreamlitへ選択結果を渡す。"""
+    label_json = json.dumps(str(uploader_label), ensure_ascii=False)
+    component_html = r"""<style>
+      html, body {
+        margin: 0;
+        padding: 0;
+        background: transparent;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      }
+      .aoyama-bulk-picker {
+        display: flex;
+        flex-direction: column;
+        gap: 0.28rem;
+      }
+      .aoyama-bulk-picker-button {
+        box-sizing: border-box;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        width: 100%;
+        min-height: 2.75rem;
+        padding: 0.65rem 0.9rem;
+        border: 1px solid rgba(49, 51, 63, 0.28);
+        border-radius: 0.5rem;
+        background: white;
+        color: rgb(49, 51, 63);
+        font-size: 0.95rem;
+        font-weight: 600;
+        cursor: pointer;
+        user-select: none;
+      }
+      .aoyama-bulk-picker-button:active {
+        background: rgba(49, 51, 63, 0.06);
+      }
+      .aoyama-bulk-picker-button input {
+        position: absolute;
+        width: 1px;
+        height: 1px;
+        opacity: 0;
+        pointer-events: none;
+      }
+      .aoyama-bulk-picker-status {
+        min-height: 1.15rem;
+        color: rgba(49, 51, 63, 0.68);
+        font-size: 0.78rem;
+        line-height: 1.35;
+      }
+    </style>
+    <div class="aoyama-bulk-picker">
+      <label class="aoyama-bulk-picker-button">
+        🖼 写真をまとめて選ぶ
+        <input id="aoyama-bulk-image-input" type="file" accept="image/*" multiple>
+      </label>
+      <div id="aoyama-bulk-image-status" class="aoyama-bulk-picker-status">
+        3枚以上も一度に選択できます
+      </div>
+    </div>
+    <script>
+    (() => {
+      const targetLabel = __TARGET_LABEL__;
+      const picker = document.getElementById('aoyama-bulk-image-input');
+      const status = document.getElementById('aoyama-bulk-image-status');
+      if (!picker || !status) return;
+
+      const normalize = (value) => String(value || '').replace(/\s+/g, ' ').trim();
+
+      const findTargetUploader = () => {
+        let parentDocument;
+        try {
+          parentDocument = window.parent.document;
+        } catch (_) {
+          return null;
+        }
+        const uploaders = Array.from(
+          parentDocument.querySelectorAll('[data-testid="stFileUploader"]')
+        );
+        return uploaders.find((node) => {
+          const label = node.querySelector('label');
+          const text = normalize(label ? label.textContent : node.textContent);
+          const visible = node.offsetParent !== null;
+          return visible && text.includes(targetLabel);
+        }) || uploaders.find((node) => {
+          const label = node.querySelector('label');
+          const text = normalize(label ? label.textContent : node.textContent);
+          return text.includes(targetLabel);
+        }) || null;
+      };
+
+      const prepareNativeUploader = () => {
+        const target = findTargetUploader();
+        if (!target) return null;
+        const nativeInput = target.querySelector('input[type="file"]');
+        if (!nativeInput) return null;
+        nativeInput.setAttribute('multiple', '');
+
+        const dropzone = target.querySelector('[data-testid="stFileUploaderDropzone"]');
+        if (dropzone) {
+          dropzone.style.display = 'none';
+        }
+        return nativeInput;
+      };
+
+      picker.addEventListener('change', () => {
+        const selectedFiles = Array.from(picker.files || []);
+        if (!selectedFiles.length) {
+          status.textContent = '写真が選択されていません';
+          return;
+        }
+
+        const nativeInput = prepareNativeUploader();
+        if (!nativeInput) {
+          status.textContent = '写真選択欄を確認できませんでした。画面を開き直してください。';
+          return;
+        }
+
+        try {
+          const parentWindow = window.parent;
+          const transfer = new parentWindow.DataTransfer();
+          selectedFiles.forEach((file) => transfer.items.add(file));
+
+          const filesSetter = Object.getOwnPropertyDescriptor(
+            parentWindow.HTMLInputElement.prototype,
+            'files'
+          );
+          if (filesSetter && typeof filesSetter.set === 'function') {
+            filesSetter.set.call(nativeInput, transfer.files);
+          } else {
+            nativeInput.files = transfer.files;
+          }
+
+          status.textContent = `${selectedFiles.length}枚をアプリへ渡しています…`;
+          nativeInput.dispatchEvent(new parentWindow.Event('input', {bubbles: true}));
+          nativeInput.dispatchEvent(new parentWindow.Event('change', {bubbles: true}));
+        } catch (_) {
+          status.textContent = '写真を渡せませんでした。もう一度選択してください。';
+        }
+      });
+
+      let attempts = 0;
+      const prepareWithRetry = () => {
+        if (prepareNativeUploader() || attempts >= 80) return;
+        attempts += 1;
+        window.setTimeout(prepareWithRetry, 100);
+      };
+      prepareWithRetry();
+
+      try {
+        const observer = new MutationObserver(() => prepareNativeUploader());
+        observer.observe(window.parent.document.body, {childList: true, subtree: true});
+        window.setTimeout(() => observer.disconnect(), 15000);
+      } catch (_) {}
+    })();
+    </script>""".replace('__TARGET_LABEL__', label_json)
+    components.html(component_html, height=76, scrolling=False)
+
+
 def read_onedrive_settings():
     """Streamlit SecretsからOneDrive接続設定を読む。"""
     try:
@@ -7223,12 +7380,17 @@ def render_customer_attachments_section(
                 # 写真ピッカーがStreamlitへ結果を返さない場合がある。
                 # スマホだけ汎用ファイル選択に切り替え、受け取り後に画像形式を厳密に確認する。
                 image_uploader_types = None if mobile_browser else ["jpg", "jpeg", "png", "webp"]
+                image_uploader_label = (
+                    "🖼 保存済み画像を選ぶ" if mobile_browser else "🖼 画像を選ぶ"
+                )
                 selected_image_files = st.file_uploader(
-                    "🖼 保存済み画像を選ぶ" if mobile_browser else "🖼 画像を選ぶ",
+                    image_uploader_label,
                     type=image_uploader_types,
                     accept_multiple_files=True,
                     key=f"onedrive_attachment_photo_uploader_{suffix}",
                 )
+                if mobile_browser:
+                    enable_mobile_bulk_image_picker(image_uploader_label)
                 photo_files = list(selected_image_files or [])
                 supported_image_mime_types = {"image/jpeg", "image/png", "image/webp"}
                 invalid_photo_files = [
