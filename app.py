@@ -351,6 +351,9 @@ ONEDRIVE_FIXED_TAGS = ("設備", "名刺", "納品場所", "商品", "トラブ�
 ONEDRIVE_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
 ONEDRIVE_PDF_EXTENSIONS = {".pdf"}
 ONEDRIVE_PAGE_SIZE = 12
+# Secretsのrefresh_token由来かを、サーバー内の一時トークンだけで識別する。
+# Microsoftのトークン本体やこの印はSupabase・OneDriveへ保存しない。
+ONEDRIVE_CONFIGURED_TOKEN_SOURCE_KEY = "_aoyama_configured_refresh_source"
 
 
 def is_mobile_browser():
@@ -425,6 +428,163 @@ def enable_mobile_camera_capture(uploader_label):
 })();
 </script>'''.replace('__TARGET_LABEL__', label_json)
     components.html(script, height=0, scrolling=False)
+
+
+def enable_mobile_bulk_image_picker(uploader_label):
+    """スマホ用の独立した複数画像ピッカーからStreamlitへ選択結果を渡す。"""
+    label_json = json.dumps(str(uploader_label), ensure_ascii=False)
+    component_html = r"""<style>
+      html, body {
+        margin: 0;
+        padding: 0;
+        background: transparent;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      }
+      .aoyama-bulk-picker {
+        display: flex;
+        flex-direction: column;
+        gap: 0.28rem;
+      }
+      .aoyama-bulk-picker-button {
+        box-sizing: border-box;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        width: 100%;
+        min-height: 2.75rem;
+        padding: 0.65rem 0.9rem;
+        border: 1px solid rgba(49, 51, 63, 0.28);
+        border-radius: 0.5rem;
+        background: white;
+        color: rgb(49, 51, 63);
+        font-size: 0.95rem;
+        font-weight: 600;
+        cursor: pointer;
+        user-select: none;
+      }
+      .aoyama-bulk-picker-button:active {
+        background: rgba(49, 51, 63, 0.06);
+      }
+      .aoyama-bulk-picker-button input {
+        position: absolute;
+        width: 1px;
+        height: 1px;
+        opacity: 0;
+        pointer-events: none;
+      }
+      .aoyama-bulk-picker-status {
+        min-height: 1.15rem;
+        color: rgba(49, 51, 63, 0.68);
+        font-size: 0.78rem;
+        line-height: 1.35;
+      }
+    </style>
+    <div class="aoyama-bulk-picker">
+      <label class="aoyama-bulk-picker-button">
+        🖼 写真をまとめて選ぶ
+        <input id="aoyama-bulk-image-input" type="file" accept="image/*" multiple>
+      </label>
+      <div id="aoyama-bulk-image-status" class="aoyama-bulk-picker-status">
+        3枚以上も一度に選択できます
+      </div>
+    </div>
+    <script>
+    (() => {
+      const targetLabel = __TARGET_LABEL__;
+      const picker = document.getElementById('aoyama-bulk-image-input');
+      const status = document.getElementById('aoyama-bulk-image-status');
+      if (!picker || !status) return;
+
+      const normalize = (value) => String(value || '').replace(/\s+/g, ' ').trim();
+
+      const findTargetUploader = () => {
+        let parentDocument;
+        try {
+          parentDocument = window.parent.document;
+        } catch (_) {
+          return null;
+        }
+        const uploaders = Array.from(
+          parentDocument.querySelectorAll('[data-testid="stFileUploader"]')
+        );
+        return uploaders.find((node) => {
+          const label = node.querySelector('label');
+          const text = normalize(label ? label.textContent : node.textContent);
+          const visible = node.offsetParent !== null;
+          return visible && text.includes(targetLabel);
+        }) || uploaders.find((node) => {
+          const label = node.querySelector('label');
+          const text = normalize(label ? label.textContent : node.textContent);
+          return text.includes(targetLabel);
+        }) || null;
+      };
+
+      const prepareNativeUploader = () => {
+        const target = findTargetUploader();
+        if (!target) return null;
+        const nativeInput = target.querySelector('input[type="file"]');
+        if (!nativeInput) return null;
+        nativeInput.setAttribute('multiple', '');
+
+        const dropzone = target.querySelector('[data-testid="stFileUploaderDropzone"]');
+        if (dropzone) {
+          dropzone.style.display = 'none';
+        }
+        return nativeInput;
+      };
+
+      picker.addEventListener('change', () => {
+        const selectedFiles = Array.from(picker.files || []);
+        if (!selectedFiles.length) {
+          status.textContent = '写真が選択されていません';
+          return;
+        }
+
+        const nativeInput = prepareNativeUploader();
+        if (!nativeInput) {
+          status.textContent = '写真選択欄を確認できませんでした。画面を開き直してください。';
+          return;
+        }
+
+        try {
+          const parentWindow = window.parent;
+          const transfer = new parentWindow.DataTransfer();
+          selectedFiles.forEach((file) => transfer.items.add(file));
+
+          const filesSetter = Object.getOwnPropertyDescriptor(
+            parentWindow.HTMLInputElement.prototype,
+            'files'
+          );
+          if (filesSetter && typeof filesSetter.set === 'function') {
+            filesSetter.set.call(nativeInput, transfer.files);
+          } else {
+            nativeInput.files = transfer.files;
+          }
+
+          status.textContent = `${selectedFiles.length}枚をアプリへ渡しています…`;
+          nativeInput.dispatchEvent(new parentWindow.Event('input', {bubbles: true}));
+          nativeInput.dispatchEvent(new parentWindow.Event('change', {bubbles: true}));
+        } catch (_) {
+          status.textContent = '写真を渡せませんでした。もう一度選択してください。';
+        }
+      });
+
+      let attempts = 0;
+      const prepareWithRetry = () => {
+        if (prepareNativeUploader() || attempts >= 80) return;
+        attempts += 1;
+        window.setTimeout(prepareWithRetry, 100);
+      };
+      prepareWithRetry();
+
+      try {
+        const observer = new MutationObserver(() => prepareNativeUploader());
+        observer.observe(window.parent.document.body, {childList: true, subtree: true});
+        window.setTimeout(() => observer.disconnect(), 15000);
+      } catch (_) {}
+    })();
+    </script>""".replace('__TARGET_LABEL__', label_json)
+    components.html(component_html, height=76, scrolling=False)
 
 
 def read_onedrive_settings():
@@ -1391,11 +1551,25 @@ def clear_onedrive_auth_state(clear_shared=False):
 
 
 def refresh_onedrive_access_token(token=None):
-    refresh_token = str((token or {}).get("refresh_token") or "").strip()
-    if not refresh_token:
-        refresh_token = read_onedrive_configured_refresh_token()
+    token_data = dict(token or {})
+    configured_refresh_token = read_onedrive_configured_refresh_token()
+    configured_source = bool(
+        token_data.get(ONEDRIVE_CONFIGURED_TOKEN_SOURCE_KEY)
+    )
+
+    # Secretsにrefresh_tokenがある場合は、その接続先を常に正として扱う。
+    # 一時的なMicrosoft再接続で別アカウントのトークンが混ざっても、保存先を変えない。
+    if configured_refresh_token and not configured_source:
+        refresh_token = configured_refresh_token
+        configured_source = True
+    else:
+        refresh_token = str(token_data.get("refresh_token") or "").strip()
+        if not refresh_token:
+            refresh_token = configured_refresh_token
+            configured_source = bool(configured_refresh_token)
     if not refresh_token:
         return None
+
     client_id, client_secret, redirect_uri = read_onedrive_settings()
     response = requests.post(
         ONEDRIVE_TOKEN_URL,
@@ -1414,16 +1588,24 @@ def refresh_onedrive_access_token(token=None):
     result = response.json()
     if not result.get("refresh_token"):
         result["refresh_token"] = refresh_token
+    result[ONEDRIVE_CONFIGURED_TOKEN_SOURCE_KEY] = configured_source
     save_onedrive_token_result(result)
     return result
 
 
 def get_onedrive_access_token():
-    # まずサーバー共有の認証結果を使い、通常利用者にはMicrosoftログインを要求しない。
+    configured_refresh_token = read_onedrive_configured_refresh_token()
+
+    # Secretsにrefresh_tokenがある時は、その値から取得したトークンだけを使う。
+    # これにより、保存時と後日の自動接続時でOneDriveアカウントが変わるのを防ぐ。
     token = get_onedrive_shared_token_result()
     if not isinstance(token, dict):
         session_token = st.session_state.get("onedrive_token_result")
         token = dict(session_token) if isinstance(session_token, dict) else None
+    if configured_refresh_token and not bool(
+        (token or {}).get(ONEDRIVE_CONFIGURED_TOKEN_SOURCE_KEY)
+    ):
+        token = None
 
     access_token = str((token or {}).get("access_token") or "").strip()
     expires_at = float((token or {}).get("expires_at") or 0)
@@ -1434,6 +1616,10 @@ def get_onedrive_access_token():
     store = get_onedrive_shared_token_store()
     with store["lock"]:
         current = store.get("token")
+        if configured_refresh_token and not bool(
+            (current or {}).get(ONEDRIVE_CONFIGURED_TOKEN_SOURCE_KEY)
+        ):
+            current = None
         if isinstance(current, dict):
             current_access_token = str(current.get("access_token") or "").strip()
             current_expires_at = float(current.get("expires_at") or 0)
@@ -1637,6 +1823,84 @@ def download_onedrive_file(access_token, item_id):
         expected=(200,),
     )
     return response.content
+
+
+def repair_onedrive_attachment_reference(access_token, attachment):
+    """保存済みパスからOneDriveの現在のfile_idを取り直し、記録を修復する。"""
+    if not isinstance(attachment, dict):
+        return ""
+    folder_path = clean_value(attachment.get("onedrive_path"), blank_text="").strip("/")
+    stored_name = clean_value(attachment.get("stored_name"), blank_text="").strip("/")
+    if not folder_path or not stored_name:
+        return ""
+
+    item = get_onedrive_path_item(
+        access_token,
+        f"{folder_path}/{stored_name}",
+    )
+    if not isinstance(item, dict) or item.get("folder"):
+        return ""
+    repaired_id = clean_value(item.get("id"), blank_text="")
+    if not repaired_id:
+        return ""
+
+    old_id = clean_value(attachment.get("file_id"), blank_text="")
+    updated = dict(attachment)
+    updated["file_id"] = repaired_id
+    updated["stored_name"] = clean_value(item.get("name"), blank_text="") or stored_name
+    updated["web_url"] = clean_value(item.get("webUrl"), blank_text="") or updated.get(
+        "web_url",
+        "",
+    )
+
+    metadata_id = clean_value(updated.get("id"), blank_text="")
+    field_name = clean_value(updated.get("field_name"), blank_text="")
+    if metadata_id and field_name and repaired_id != old_id:
+        update_customer_information(
+            metadata_id,
+            field_name,
+            serialize_onedrive_attachment(updated),
+        )
+    attachment.update(updated)
+    if old_id and old_id != repaired_id:
+        st.session_state.pop(f"onedrive_thumbnail_{old_id}", None)
+    return repaired_id
+
+
+def download_onedrive_attachment_file(access_token, attachment):
+    """file_idが古い時だけ保存済みパスで修復してから画像本体を読む。"""
+    item_id = clean_value((attachment or {}).get("file_id"), blank_text="")
+    if not item_id:
+        item_id = repair_onedrive_attachment_reference(access_token, attachment)
+    if not item_id:
+        raise RuntimeError("OneDriveファイルIDを確認できませんでした。")
+    try:
+        return download_onedrive_file(access_token, item_id)
+    except Exception as exc:
+        if not is_onedrive_not_found_error(exc):
+            raise
+        repaired_id = repair_onedrive_attachment_reference(access_token, attachment)
+        if not repaired_id or repaired_id == item_id:
+            raise
+        return download_onedrive_file(access_token, repaired_id)
+
+
+def download_onedrive_attachment_thumbnail(access_token, attachment):
+    """file_idが古い時だけ保存済みパスで修復してからサムネイルを読む。"""
+    item_id = clean_value((attachment or {}).get("file_id"), blank_text="")
+    if not item_id:
+        item_id = repair_onedrive_attachment_reference(access_token, attachment)
+    if not item_id:
+        return None
+    try:
+        return download_onedrive_thumbnail(access_token, item_id)
+    except Exception as exc:
+        if not is_onedrive_not_found_error(exc):
+            raise
+        repaired_id = repair_onedrive_attachment_reference(access_token, attachment)
+        if not repaired_id or repaired_id == item_id:
+            raise
+        return download_onedrive_thumbnail(access_token, repaired_id)
 
 
 def render_onedrive_pdf_inline(pdf_content, filename):
@@ -2294,17 +2558,21 @@ def render_onedrive_pdf_inline(pdf_content, filename):
         scrolling=False,
     )
 
-def download_onedrive_thumbnail(access_token, item_id):
+@st.cache_data(ttl=6 * 60 * 60, max_entries=1200, show_spinner=False)
+def download_onedrive_thumbnail(_access_token, item_id):
+    """一覧用の軽量サムネイルをアプリ全体で共有キャッシュする。"""
     response = onedrive_graph_request(
         "GET",
-        f"/me/drive/items/{urllib.parse.quote(str(item_id), safe='')}/thumbnails?$select=medium",
-        access_token,
+        f"/me/drive/items/{urllib.parse.quote(str(item_id), safe='')}/thumbnails?$select=small,medium",
+        _access_token,
         expected=(200,),
     )
     values = list(response.json().get("value", []))
     if not values:
         return None
-    url = str((values[0].get("medium") or {}).get("url") or "").strip()
+    thumbnail_set = values[0]
+    thumbnail_info = thumbnail_set.get("small") or thumbnail_set.get("medium") or {}
+    url = str(thumbnail_info.get("url") or "").strip()
     if not url:
         return None
     image_response = requests.get(url, timeout=ONEDRIVE_REQUEST_TIMEOUT)
@@ -6825,6 +7093,165 @@ def format_attachment_datetime(value):
         return text
 
 
+def render_collapsible_attachment_remarks(value):
+    """備考は通常2行まで表示し、長い場合だけ全文を折りたたんで表示する。"""
+    remarks = clean_value(value, blank_text="").strip()
+    if not remarks:
+        return
+
+    normalized = remarks.replace("\r\n", "\n").replace("\r", "\n")
+    visible_character_count = len(re.sub(r"\s+", "", normalized))
+    needs_collapse = len(normalized.split("\n")) > 2 or visible_character_count > 34
+    if not needs_collapse:
+        st.caption(normalized)
+        return
+
+    safe_remarks = html.escape(normalized).replace("\n", "<br>")
+    st.markdown(
+        f"""
+        <details class="aoyama-attachment-remarks">
+          <summary>
+            <span class="aoyama-attachment-remarks-preview">{safe_remarks}</span>
+            <span class="aoyama-attachment-remarks-toggle"></span>
+          </summary>
+          <div class="aoyama-attachment-remarks-full">{safe_remarks}</div>
+        </details>
+        <style>
+          details.aoyama-attachment-remarks {{
+            margin: 0.25rem 0 0.4rem 0;
+            color: rgba(49, 51, 63, 0.68);
+            font-size: 0.875rem;
+            line-height: 1.6;
+          }}
+          details.aoyama-attachment-remarks summary {{
+            cursor: pointer;
+            list-style: none;
+          }}
+          details.aoyama-attachment-remarks summary::-webkit-details-marker {{
+            display: none;
+          }}
+          .aoyama-attachment-remarks-preview {{
+            display: -webkit-box;
+            -webkit-box-orient: vertical;
+            -webkit-line-clamp: 2;
+            overflow: hidden;
+            overflow-wrap: anywhere;
+          }}
+          .aoyama-attachment-remarks-toggle {{
+            display: inline-block;
+            margin-top: 0.12rem;
+            color: rgb(0, 104, 201);
+            font-size: 0.82rem;
+            font-weight: 600;
+          }}
+          .aoyama-attachment-remarks-toggle::before {{
+            content: "続きを読む";
+          }}
+          details.aoyama-attachment-remarks[open] .aoyama-attachment-remarks-preview {{
+            display: none;
+          }}
+          details.aoyama-attachment-remarks[open] .aoyama-attachment-remarks-toggle::before {{
+            content: "閉じる";
+          }}
+          .aoyama-attachment-remarks-full {{
+            margin-top: 0.22rem;
+            overflow-wrap: anywhere;
+            white-space: normal;
+          }}
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+
+def render_attachment_card_layout_styles():
+    """写真・資料の一覧カードだけを、行内で上揃え・同じ高さに整える。"""
+    st.markdown(
+        """
+        <style>
+          .aoyama-attachment-card-marker {
+            display: none !important;
+          }
+
+          /* 既存のスマホ向け中央揃えを、このカード一覧だけ上書きする。 */
+          [data-testid="stHorizontalBlock"]:has(.aoyama-attachment-card-marker) {
+            align-items: stretch !important;
+          }
+          [data-testid="stHorizontalBlock"]:has(.aoyama-attachment-card-marker) > div {
+            align-self: stretch !important;
+            display: flex !important;
+            min-width: 0 !important;
+          }
+          [data-testid="stHorizontalBlock"]:has(.aoyama-attachment-card-marker)
+            > div > [data-testid="stVerticalBlock"] {
+            display: flex !important;
+            flex: 1 1 auto !important;
+            flex-direction: column !important;
+            width: 100% !important;
+            min-width: 0 !important;
+          }
+          [data-testid="stVerticalBlockBorderWrapper"]:has(.aoyama-attachment-card-marker) {
+            display: flex !important;
+            flex: 1 1 auto !important;
+            width: 100% !important;
+          }
+          [data-testid="stVerticalBlockBorderWrapper"]:has(.aoyama-attachment-card-marker)
+            > [data-testid="stVerticalBlock"] {
+            width: 100% !important;
+          }
+
+          .aoyama-attachment-card-entity {
+            min-height: 3.55rem;
+            margin: 0.08rem 0 0.2rem 0;
+            line-height: 1.45;
+            overflow: hidden;
+          }
+          .aoyama-attachment-card-entity a {
+            display: -webkit-box;
+            overflow: hidden;
+            color: rgb(0, 104, 201);
+            font-weight: 700;
+            text-decoration: none;
+            overflow-wrap: anywhere;
+            -webkit-box-orient: vertical;
+            -webkit-line-clamp: 2;
+          }
+          .aoyama-attachment-card-date {
+            min-height: 1.55rem;
+            color: rgba(49, 51, 63, 0.62);
+            font-size: 0.875rem;
+            line-height: 1.45;
+          }
+          .aoyama-attachment-card-tags {
+            min-height: 2.7rem;
+            margin: 0.08rem 0 0.16rem 0;
+            line-height: 1.75;
+            overflow-wrap: anywhere;
+          }
+          .aoyama-attachment-card-tag {
+            display: inline-block;
+            margin: 0 0.16rem 0.14rem 0;
+            padding: 0.04rem 0.28rem;
+            border-radius: 0.24rem;
+            background: rgba(22, 163, 74, 0.06);
+            color: rgb(20, 128, 59);
+            font-size: 0.82rem;
+            line-height: 1.45;
+            text-decoration: none;
+            cursor: pointer;
+          }
+          .aoyama-attachment-card-tag:hover,
+          .aoyama-attachment-card-tag:focus-visible {
+            background: rgba(22, 163, 74, 0.14);
+            color: rgb(16, 104, 48);
+            text-decoration: none;
+          }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
 def onedrive_attachment_rows_to_dataframe(rows):
     records = []
     for row in rows:
@@ -6983,15 +7410,43 @@ def render_customer_attachments_section(
                     st.error(f"OneDriveへの接続を開始できませんでした：{exc}")
             else:
                 st.markdown("#### 追加")
+                # Androidなどで3枚以上をまとめて選ぶと、拡張子フィルター付きの
+                # 写真ピッカーがStreamlitへ結果を返さない場合がある。
+                # スマホだけ汎用ファイル選択に切り替え、受け取り後に画像形式を厳密に確認する。
+                image_uploader_types = None if mobile_browser else ["jpg", "jpeg", "png", "webp"]
+                image_uploader_label = (
+                    "🖼 保存済み画像を選ぶ" if mobile_browser else "🖼 画像を選ぶ"
+                )
                 selected_image_files = st.file_uploader(
-                    "🖼 保存済み画像を選ぶ" if mobile_browser else "🖼 画像を選ぶ",
-                    type=["jpg", "jpeg", "png", "webp"],
+                    image_uploader_label,
+                    type=image_uploader_types,
                     accept_multiple_files=True,
                     key=f"onedrive_attachment_photo_uploader_{suffix}",
                 )
+                if mobile_browser:
+                    enable_mobile_bulk_image_picker(image_uploader_label)
                 photo_files = list(selected_image_files or [])
+                supported_image_mime_types = {"image/jpeg", "image/png", "image/webp"}
+                invalid_photo_files = [
+                    uploaded
+                    for uploaded in photo_files
+                    if (
+                        Path(str(getattr(uploaded, "name", "") or "")).suffix.lower()
+                        not in ONEDRIVE_IMAGE_EXTENSIONS
+                        and str(getattr(uploaded, "type", "") or "").lower()
+                        not in supported_image_mime_types
+                    )
+                ]
                 if photo_files:
                     st.caption(f"画像を{len(photo_files)}枚選択中")
+                if invalid_photo_files:
+                    invalid_names = "、".join(
+                        Path(str(getattr(uploaded, "name", "") or "名称未設定")).name
+                        for uploaded in invalid_photo_files
+                    )
+                    st.warning(
+                        "画像はJPG・JPEG・PNG・WEBPだけ選べます：" + invalid_names
+                    )
                 pdf_file = st.file_uploader(
                     "📄 PDFを選ぶ",
                     type=["pdf"],
@@ -7027,7 +7482,9 @@ def render_customer_attachments_section(
                     key=f"onedrive_attachment_upload_{suffix}",
                 ):
                     uploaded_files = photo_files if photo_files else ([pdf_file] if pdf_file is not None else [])
-                    if not uploaded_files:
+                    if invalid_photo_files:
+                        st.warning("対応していないファイルを外してから保存してください。")
+                    elif not uploaded_files:
                         st.warning("画像またはPDFを選んでください。")
                     else:
                         tags = list(selected_history_tags) + normalize_attachment_tags(new_tags_text)
@@ -7259,9 +7716,9 @@ def render_customer_attachments_section(
                                     thumb_key = f"onedrive_thumbnail_{thumbnail_item_id}"
                                     if not isinstance(st.session_state.get(thumb_key), bytes):
                                         try:
-                                            thumbnail = download_onedrive_thumbnail(
+                                            thumbnail = download_onedrive_attachment_thumbnail(
                                                 access_token,
-                                                thumbnail_item_id,
+                                                thumbnail_item,
                                             )
                                             if thumbnail:
                                                 st.session_state[thumb_key] = thumbnail
@@ -7307,9 +7764,9 @@ def render_customer_attachments_section(
                                                 missing_names.append(image_name)
                                                 continue
                                             try:
-                                                image_content = download_onedrive_file(
+                                                image_content = download_onedrive_attachment_file(
                                                     access_token,
-                                                    image_item_id,
+                                                    image_attachment,
                                                 )
                                                 image_items.append(
                                                     {
@@ -7363,8 +7820,9 @@ def render_customer_attachments_section(
                             )
                         if date_and_tags:
                             st.caption("　".join(date_and_tags))
-                        if attachment.get("remarks"):
-                            st.caption(attachment["remarks"])
+                        render_collapsible_attachment_remarks(
+                            attachment.get("remarks")
+                        )
 
                         if active_edit_id == group_ui_id:
                             current_tags = normalize_attachment_tags(attachment.get("tags") or [])
@@ -7487,6 +7945,16 @@ def show_attachment_search_page():
     st.header("🔎 写真・資料検索")
     st.caption("顧客・仕入先・運送会社の写真・PDFを検索します。タグ欄は文字を入力すると過去の候補が絞り込まれます。")
 
+    clicked_tag = clean_value(
+        get_query_value("attachment_tag", ""),
+        blank_text="",
+    ).strip()
+    clicked_tags = normalize_attachment_tags([clicked_tag]) if clicked_tag else []
+    if clicked_tags:
+        st.session_state["attachment_global_tag_filter"] = clicked_tags[:1]
+        update_query_params(attachment_tag=None)
+        st.rerun()
+
     if not has_supabase_config():
         st.warning("写真・資料検索にはSupabase設定が必要です。")
         return
@@ -7576,6 +8044,7 @@ def show_attachment_search_page():
         st.session_state[limit_key] = ONEDRIVE_PAGE_SIZE
 
     display_groups = group_onedrive_attachments_for_display(filtered)
+    render_attachment_card_layout_styles()
     st.caption(f"該当：{len(display_groups)}件")
     if not display_groups:
         st.info("条件に一致する写真・資料はありません。")
@@ -7608,6 +8077,10 @@ def show_attachment_search_page():
 
         with grid_columns[group_index % grid_column_count]:
             with st.container(border=True):
+                st.markdown(
+                    '<span class="aoyama-attachment-card-marker" aria-hidden="true"></span>',
+                    unsafe_allow_html=True,
+                )
                 preview_digest = hashlib.sha256(
                     f"global:{group_ui_id}".encode("utf-8")
                 ).digest()[:8]
@@ -7631,9 +8104,9 @@ def show_attachment_search_page():
                             thumb_key = f"onedrive_thumbnail_{thumbnail_item_id}"
                             if not isinstance(st.session_state.get(thumb_key), bytes):
                                 try:
-                                    thumbnail = download_onedrive_thumbnail(
+                                    thumbnail = download_onedrive_attachment_thumbnail(
                                         access_token,
-                                        thumbnail_item_id,
+                                        thumbnail_item,
                                     )
                                     if thumbnail:
                                         st.session_state[thumb_key] = thumbnail
@@ -7679,9 +8152,9 @@ def show_attachment_search_page():
                                         missing_names.append(image_name)
                                         continue
                                     try:
-                                        image_content = download_onedrive_file(
+                                        image_content = download_onedrive_attachment_file(
                                             access_token,
-                                            image_item_id,
+                                            image_attachment,
                                         )
                                         image_items.append(
                                             {
@@ -7728,21 +8201,40 @@ def show_attachment_search_page():
                         partner_id=entity_id,
                         partner_type=entity_type,
                     )
+                safe_entity_url = html.escape(entity_url, quote=True)
+                safe_entity_title = html.escape(entity_name)
                 st.markdown(
-                    f'<a href="{html.escape(entity_url, quote=True)}" target="_self" '
-                    'style="font-weight:700;text-decoration:none;">'
-                    f'{html.escape(entity_label)}：{html.escape(entity_name)}</a>',
+                    f'<div class="aoyama-attachment-card-entity">'
+                    f'<a href="{safe_entity_url}" target="_self" title="{safe_entity_title}">'
+                    f'{safe_entity_title}</a></div>',
                     unsafe_allow_html=True,
                 )
                 attachment_date = format_attachment_datetime(
                     attachment.get("created_at")
                 ).split(" ", 1)[0]
-                if attachment_date:
-                    st.caption(attachment_date)
-                if attachment.get("tags"):
-                    st.markdown(" ".join(f"`#{tag}`" for tag in attachment["tags"]))
-                if attachment.get("remarks"):
-                    st.caption(attachment["remarks"])
+                st.markdown(
+                    '<div class="aoyama-attachment-card-date">'
+                    + (html.escape(attachment_date) if attachment_date else '&nbsp;')
+                    + '</div>',
+                    unsafe_allow_html=True,
+                )
+                attachment_tags = normalize_attachment_tags(attachment.get("tags") or [])
+                tags_html = "".join(
+                    f'<a class="aoyama-attachment-card-tag" '
+                    f'href="{html.escape("?" + urllib.parse.urlencode({"page": "attachment_search", "attachment_tag": tag}), quote=True)}" '
+                    f'target="_self" title="#{html.escape(tag, quote=True)}で絞り込む">'
+                    f'#{html.escape(tag)}</a>'
+                    for tag in attachment_tags
+                )
+                st.markdown(
+                    '<div class="aoyama-attachment-card-tags">'
+                    + (tags_html if tags_html else '&nbsp;')
+                    + '</div>',
+                    unsafe_allow_html=True,
+                )
+                render_collapsible_attachment_remarks(
+                    attachment.get("remarks")
+                )
 
     if len(display_groups) > limit:
         if st.button(
