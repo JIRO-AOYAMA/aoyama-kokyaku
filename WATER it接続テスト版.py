@@ -2586,17 +2586,21 @@ def render_onedrive_pdf_inline(pdf_content, filename):
         scrolling=False,
     )
 
-def download_onedrive_thumbnail(access_token, item_id):
+@st.cache_data(ttl=6 * 60 * 60, max_entries=1200, show_spinner=False)
+def download_onedrive_thumbnail(_access_token, item_id):
+    """一覧用の軽量サムネイルをアプリ全体で共有キャッシュする。"""
     response = onedrive_graph_request(
         "GET",
-        f"/me/drive/items/{urllib.parse.quote(str(item_id), safe='')}/thumbnails?$select=medium",
-        access_token,
+        f"/me/drive/items/{urllib.parse.quote(str(item_id), safe='')}/thumbnails?$select=small,medium",
+        _access_token,
         expected=(200,),
     )
     values = list(response.json().get("value", []))
     if not values:
         return None
-    url = str((values[0].get("medium") or {}).get("url") or "").strip()
+    thumbnail_set = values[0]
+    thumbnail_info = thumbnail_set.get("small") or thumbnail_set.get("medium") or {}
+    url = str(thumbnail_info.get("url") or "").strip()
     if not url:
         return None
     image_response = requests.get(url, timeout=ONEDRIVE_REQUEST_TIMEOUT)
@@ -7292,6 +7296,14 @@ def render_attachment_card_layout_styles():
             color: rgb(20, 128, 59);
             font-size: 0.82rem;
             line-height: 1.45;
+            text-decoration: none;
+            cursor: pointer;
+          }
+          .aoyama-attachment-card-tag:hover,
+          .aoyama-attachment-card-tag:focus-visible {
+            background: rgba(22, 163, 74, 0.14);
+            color: rgb(16, 104, 48);
+            text-decoration: none;
           }
         </style>
         """,
@@ -7991,6 +8003,16 @@ def show_attachment_search_page():
     st.header("🔎 写真・資料検索")
     st.caption("顧客・仕入先・運送会社の写真・PDFを検索します。タグ欄は文字を入力すると過去の候補が絞り込まれます。")
 
+    clicked_tag = clean_value(
+        get_query_value("attachment_tag", ""),
+        blank_text="",
+    ).strip()
+    clicked_tags = normalize_attachment_tags([clicked_tag]) if clicked_tag else []
+    if clicked_tags:
+        st.session_state["attachment_global_tag_filter"] = clicked_tags[:1]
+        update_query_params(attachment_tag=None)
+        st.rerun()
+
     if not has_supabase_config():
         st.warning("写真・資料検索にはSupabase設定が必要です。")
         return
@@ -8256,7 +8278,10 @@ def show_attachment_search_page():
                 )
                 attachment_tags = normalize_attachment_tags(attachment.get("tags") or [])
                 tags_html = "".join(
-                    f'<span class="aoyama-attachment-card-tag">#{html.escape(tag)}</span>'
+                    f'<a class="aoyama-attachment-card-tag" '
+                    f'href="{html.escape("?" + urllib.parse.urlencode({"page": "attachment_search", "attachment_tag": tag}), quote=True)}" '
+                    f'target="_self" title="#{html.escape(tag, quote=True)}で絞り込む">'
+                    f'#{html.escape(tag)}</a>'
                     for tag in attachment_tags
                 )
                 st.markdown(
