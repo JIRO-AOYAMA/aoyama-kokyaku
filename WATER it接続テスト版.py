@@ -8238,7 +8238,7 @@ def show_attachment_search_page():
                         partner_type=entity_type,
                     )
                 safe_entity_url = html.escape(entity_url, quote=True)
-                safe_entity_title = html.escape(f"{entity_label}：{entity_name}")
+                safe_entity_title = html.escape(entity_name)
                 st.markdown(
                     f'<div class="aoyama-attachment-card-entity">'
                     f'<a href="{safe_entity_url}" target="_self" title="{safe_entity_title}">'
