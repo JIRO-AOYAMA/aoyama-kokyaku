@@ -6990,6 +6990,77 @@ def format_attachment_datetime(value):
         return text
 
 
+def render_collapsible_attachment_remarks(value):
+    """備考は通常2行まで表示し、長い場合だけ全文を折りたたんで表示する。"""
+    remarks = clean_value(value, blank_text="").strip()
+    if not remarks:
+        return
+
+    normalized = remarks.replace("\r\n", "\n").replace("\r", "\n")
+    visible_character_count = len(re.sub(r"\s+", "", normalized))
+    needs_collapse = len(normalized.split("\n")) > 2 or visible_character_count > 34
+    if not needs_collapse:
+        st.caption(normalized)
+        return
+
+    safe_remarks = html.escape(normalized).replace("\n", "<br>")
+    st.markdown(
+        f"""
+        <details class="aoyama-attachment-remarks">
+          <summary>
+            <span class="aoyama-attachment-remarks-preview">{safe_remarks}</span>
+            <span class="aoyama-attachment-remarks-toggle"></span>
+          </summary>
+          <div class="aoyama-attachment-remarks-full">{safe_remarks}</div>
+        </details>
+        <style>
+          details.aoyama-attachment-remarks {{
+            margin: 0.25rem 0 0.4rem 0;
+            color: rgba(49, 51, 63, 0.68);
+            font-size: 0.875rem;
+            line-height: 1.6;
+          }}
+          details.aoyama-attachment-remarks summary {{
+            cursor: pointer;
+            list-style: none;
+          }}
+          details.aoyama-attachment-remarks summary::-webkit-details-marker {{
+            display: none;
+          }}
+          .aoyama-attachment-remarks-preview {{
+            display: -webkit-box;
+            -webkit-box-orient: vertical;
+            -webkit-line-clamp: 2;
+            overflow: hidden;
+            overflow-wrap: anywhere;
+          }}
+          .aoyama-attachment-remarks-toggle {{
+            display: inline-block;
+            margin-top: 0.12rem;
+            color: rgb(0, 104, 201);
+            font-size: 0.82rem;
+            font-weight: 600;
+          }}
+          .aoyama-attachment-remarks-toggle::before {{
+            content: "続きを読む";
+          }}
+          details.aoyama-attachment-remarks[open] .aoyama-attachment-remarks-preview {{
+            display: none;
+          }}
+          details.aoyama-attachment-remarks[open] .aoyama-attachment-remarks-toggle::before {{
+            content: "閉じる";
+          }}
+          .aoyama-attachment-remarks-full {{
+            margin-top: 0.22rem;
+            overflow-wrap: anywhere;
+            white-space: normal;
+          }}
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 def onedrive_attachment_rows_to_dataframe(rows):
     records = []
     for row in rows:
@@ -7148,15 +7219,38 @@ def render_customer_attachments_section(
                     st.error(f"OneDriveへの接続を開始できませんでした：{exc}")
             else:
                 st.markdown("#### 追加")
+                # Androidなどで3枚以上をまとめて選ぶと、拡張子フィルター付きの
+                # 写真ピッカーがStreamlitへ結果を返さない場合がある。
+                # スマホだけ汎用ファイル選択に切り替え、受け取り後に画像形式を厳密に確認する。
+                image_uploader_types = None if mobile_browser else ["jpg", "jpeg", "png", "webp"]
                 selected_image_files = st.file_uploader(
                     "🖼 保存済み画像を選ぶ" if mobile_browser else "🖼 画像を選ぶ",
-                    type=["jpg", "jpeg", "png", "webp"],
+                    type=image_uploader_types,
                     accept_multiple_files=True,
                     key=f"onedrive_attachment_photo_uploader_{suffix}",
                 )
                 photo_files = list(selected_image_files or [])
+                supported_image_mime_types = {"image/jpeg", "image/png", "image/webp"}
+                invalid_photo_files = [
+                    uploaded
+                    for uploaded in photo_files
+                    if (
+                        Path(str(getattr(uploaded, "name", "") or "")).suffix.lower()
+                        not in ONEDRIVE_IMAGE_EXTENSIONS
+                        and str(getattr(uploaded, "type", "") or "").lower()
+                        not in supported_image_mime_types
+                    )
+                ]
                 if photo_files:
                     st.caption(f"画像を{len(photo_files)}枚選択中")
+                if invalid_photo_files:
+                    invalid_names = "、".join(
+                        Path(str(getattr(uploaded, "name", "") or "名称未設定")).name
+                        for uploaded in invalid_photo_files
+                    )
+                    st.warning(
+                        "画像はJPG・JPEG・PNG・WEBPだけ選べます：" + invalid_names
+                    )
                 pdf_file = st.file_uploader(
                     "📄 PDFを選ぶ",
                     type=["pdf"],
@@ -7192,7 +7286,9 @@ def render_customer_attachments_section(
                     key=f"onedrive_attachment_upload_{suffix}",
                 ):
                     uploaded_files = photo_files if photo_files else ([pdf_file] if pdf_file is not None else [])
-                    if not uploaded_files:
+                    if invalid_photo_files:
+                        st.warning("対応していないファイルを外してから保存してください。")
+                    elif not uploaded_files:
                         st.warning("画像またはPDFを選んでください。")
                     else:
                         tags = list(selected_history_tags) + normalize_attachment_tags(new_tags_text)
@@ -7528,8 +7624,9 @@ def render_customer_attachments_section(
                             )
                         if date_and_tags:
                             st.caption("　".join(date_and_tags))
-                        if attachment.get("remarks"):
-                            st.caption(attachment["remarks"])
+                        render_collapsible_attachment_remarks(
+                            attachment.get("remarks")
+                        )
 
                         if active_edit_id == group_ui_id:
                             current_tags = normalize_attachment_tags(attachment.get("tags") or [])
@@ -7906,8 +8003,9 @@ def show_attachment_search_page():
                     st.caption(attachment_date)
                 if attachment.get("tags"):
                     st.markdown(" ".join(f"`#{tag}`" for tag in attachment["tags"]))
-                if attachment.get("remarks"):
-                    st.caption(attachment["remarks"])
+                render_collapsible_attachment_remarks(
+                    attachment.get("remarks")
+                )
 
     if len(display_groups) > limit:
         if st.button(
