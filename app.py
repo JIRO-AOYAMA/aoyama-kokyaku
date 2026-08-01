@@ -1720,12 +1720,13 @@ def process_onedrive_callback_if_present():
 
 def onedrive_graph_request(method, path, access_token, expected=(200,), **kwargs):
     headers = dict(kwargs.pop("headers", {}) or {})
+    request_timeout = kwargs.pop("_request_timeout", ONEDRIVE_REQUEST_TIMEOUT)
     headers["Authorization"] = f"Bearer {access_token}"
     response = requests.request(
         method,
         ONEDRIVE_GRAPH_BASE + path,
         headers=headers,
-        timeout=ONEDRIVE_REQUEST_TIMEOUT,
+        timeout=request_timeout,
         **kwargs,
     )
     if response.status_code not in expected:
@@ -2005,8 +2006,174 @@ def onedrive_next_link_to_path(next_link):
     return relative
 
 
-def list_onedrive_folder_children(access_token, folder_id, max_pages=5):
-    """検索インデックスを使わず、指定フォルダーの子項目を直接取得する。"""
+@st.cache_resource(show_spinner=False)
+def get_onedrive_camera_folder_hint_store():
+    """同じOneDriveで直前に見つけた写真フォルダーを、再検索用に短く保持する。"""
+    return {"lock": threading.Lock(), "folders": {}}
+
+
+def get_onedrive_camera_folder_hints(camera_roll_id):
+    """セッション内とアプリ内キャッシュから、優先して調べるフォルダーIDを返す。"""
+    clean_camera_roll_id = clean_value(camera_roll_id, blank_text="")
+    if not clean_camera_roll_id:
+        return []
+
+    session_key = "_onedrive_camera_folder_hints_" + hashlib.sha256(
+        clean_camera_roll_id.encode("utf-8")
+    ).hexdigest()[:16]
+    session_hints = st.session_state.get(session_key, [])
+    if not isinstance(session_hints, list):
+        session_hints = []
+
+    shared_hints = []
+    store = get_onedrive_camera_folder_hint_store()
+    try:
+        with store["lock"]:
+            shared_hints = list(store["folders"].get(clean_camera_roll_id, []))
+    except Exception:
+        shared_hints = []
+
+    result = []
+    for folder_id in list(session_hints) + list(shared_hints):
+        clean_folder_id = clean_value(folder_id, blank_text="")
+        if clean_folder_id and clean_folder_id not in result:
+            result.append(clean_folder_id)
+    return result[:4]
+
+
+def remember_onedrive_camera_folder_hint(camera_roll_id, folder_id):
+    """一致した元写真の親フォルダーを、次回の高速検索用に記憶する。"""
+    clean_camera_roll_id = clean_value(camera_roll_id, blank_text="")
+    clean_folder_id = clean_value(folder_id, blank_text="")
+    if not clean_camera_roll_id or not clean_folder_id:
+        return
+
+    session_key = "_onedrive_camera_folder_hints_" + hashlib.sha256(
+        clean_camera_roll_id.encode("utf-8")
+    ).hexdigest()[:16]
+    current = st.session_state.get(session_key, [])
+    if not isinstance(current, list):
+        current = []
+    session_hints = [clean_folder_id] + [
+        value for value in current if clean_value(value, blank_text="") != clean_folder_id
+    ]
+    st.session_state[session_key] = session_hints[:4]
+
+    store = get_onedrive_camera_folder_hint_store()
+    try:
+        with store["lock"]:
+            shared = list(store["folders"].get(clean_camera_roll_id, []))
+            shared = [clean_folder_id] + [
+                value for value in shared if clean_value(value, blank_text="") != clean_folder_id
+            ]
+            store["folders"][clean_camera_roll_id] = shared[:4]
+    except Exception:
+        pass
+
+
+def get_recent_camera_candidate_cache(camera_roll_id):
+    """同じ保存操作中に取得済みの候補一覧を再利用する。"""
+    cache = st.session_state.get("_onedrive_camera_candidate_cache")
+    if not isinstance(cache, dict):
+        return []
+    if clean_value(cache.get("camera_roll_id"), blank_text="") != clean_value(
+        camera_roll_id,
+        blank_text="",
+    ):
+        return []
+    try:
+        cached_at = float(cache.get("cached_at") or 0)
+    except Exception:
+        cached_at = 0
+    if time.time() - cached_at > 120:
+        return []
+    items = cache.get("items")
+    return list(items) if isinstance(items, list) else []
+
+
+def set_recent_camera_candidate_cache(camera_roll_id, items):
+    """候補一覧を2分だけセッションへ保持し、複数枚保存時の再走査を避ける。"""
+    st.session_state["_onedrive_camera_candidate_cache"] = {
+        "camera_roll_id": clean_value(camera_roll_id, blank_text=""),
+        "cached_at": time.time(),
+        "items": list(items) if isinstance(items, list) else [],
+    }
+
+
+def get_camera_candidate_fingerprint(item_id):
+    """直前に照合したOneDrive画像の小さな比較情報を再利用する。"""
+    clean_item_id = clean_value(item_id, blank_text="")
+    cache = st.session_state.get("_onedrive_camera_fingerprint_cache")
+    if not clean_item_id or not isinstance(cache, dict):
+        return None
+    entry = cache.get(clean_item_id)
+    if not isinstance(entry, dict):
+        return None
+    try:
+        cached_at = float(entry.get("cached_at") or 0)
+    except Exception:
+        cached_at = 0
+    if time.time() - cached_at > 120:
+        return None
+    return entry
+
+
+def set_camera_candidate_fingerprint(item_id, content):
+    """画像本体は保持せず、ハッシュと縮小画素だけを2分間保持する。"""
+    clean_item_id = clean_value(item_id, blank_text="")
+    if not clean_item_id or not content:
+        return None
+    entry = {
+        "cached_at": time.time(),
+        "size": len(content),
+        "sha256": hashlib.sha256(content).digest(),
+        "normalized_sha256": hashlib.sha256(
+            normalize_image_content_for_comparison(content)
+        ).digest(),
+        "visual_signature": build_image_visual_signature(content),
+    }
+    cache = st.session_state.get("_onedrive_camera_fingerprint_cache")
+    if not isinstance(cache, dict):
+        cache = {}
+    cache[clean_item_id] = entry
+    # 写真本体は保持しないが、セッションが長時間続いても増え続けないよう上限を設ける。
+    if len(cache) > 40:
+        ordered = sorted(
+            cache.items(),
+            key=lambda pair: float((pair[1] or {}).get("cached_at") or 0),
+            reverse=True,
+        )[:40]
+        cache = dict(ordered)
+    st.session_state["_onedrive_camera_fingerprint_cache"] = cache
+    return entry
+
+
+def remove_recent_camera_candidate_cache_item(item_id):
+    """移動済みの写真を候補キャッシュから外す。"""
+    clean_item_id = clean_value(item_id, blank_text="")
+    cache = st.session_state.get("_onedrive_camera_candidate_cache")
+    if not clean_item_id or not isinstance(cache, dict):
+        return
+    items = cache.get("items")
+    if not isinstance(items, list):
+        return
+    cache["items"] = [
+        item
+        for item in items
+        if clean_value((item or {}).get("id"), blank_text="") != clean_item_id
+    ]
+    cache["cached_at"] = time.time()
+    st.session_state["_onedrive_camera_candidate_cache"] = cache
+
+
+def list_onedrive_folder_children(
+    access_token,
+    folder_id,
+    max_pages=1,
+    page_size=200,
+    request_timeout=10,
+):
+    """検索インデックスを使わず、指定フォルダーの新しい項目を直接取得する。"""
     clean_folder_id = clean_value(folder_id, blank_text="")
     if not clean_folder_id:
         return []
@@ -2017,22 +2184,28 @@ def list_onedrive_folder_children(access_token, folder_id, max_pages=5):
             "id,name,size,file,folder,parentReference,webUrl,image,photo,"
             "createdDateTime,lastModifiedDateTime"
         ),
-        "$top": "200",
+        "$top": str(max(1, min(int(page_size or 200), 200))),
         "$orderby": "lastModifiedDateTime desc",
     }
     items = []
     page_count = 0
 
-    while target and page_count < max_pages:
+    while target and page_count < max(1, int(max_pages or 1)):
         if page_count == 0:
             response = onedrive_graph_request(
                 "GET",
                 target,
                 access_token,
                 params=params,
+                _request_timeout=request_timeout,
             )
         else:
-            response = onedrive_graph_request("GET", target, access_token)
+            response = onedrive_graph_request(
+                "GET",
+                target,
+                access_token,
+                _request_timeout=request_timeout,
+            )
         payload = response.json()
         if not isinstance(payload, dict):
             break
@@ -2045,14 +2218,34 @@ def list_onedrive_folder_children(access_token, folder_id, max_pages=5):
     return items
 
 
+def onedrive_camera_folder_priority(name):
+    """Androidの写真バックアップで使われやすいフォルダー名を先に調べる。"""
+    normalized = unicodedata.normalize("NFKC", str(name or "")).casefold()
+    priority_tokens = (
+        "camera",
+        "camera roll",
+        "dcim",
+        "samsung",
+        "gallery",
+        "pictures",
+        "photos",
+        "カメラ",
+        "写真",
+        "画像",
+    )
+    return 0 if any(token in normalized for token in priority_tokens) else 1
+
+
 def collect_onedrive_camera_backup_images(
     access_token,
     camera_roll,
-    max_folders=80,
-    max_items=1600,
+    preferred_folder_ids=None,
+    max_folders=30,
+    max_items=800,
     max_depth=4,
+    max_seconds=8,
 ):
-    """Camera RollとPictures配下を直接たどり、画像候補を新しい順で返す。"""
+    """候補フォルダーを新しい順・優先順で短時間だけたどる。"""
     camera_roll = camera_roll if isinstance(camera_roll, dict) else {}
     camera_roll_id = clean_value(camera_roll.get("id"), blank_text="")
     parent_reference = camera_roll.get("parentReference") or {}
@@ -2060,22 +2253,58 @@ def collect_onedrive_camera_backup_images(
     if not camera_roll_id:
         return []
 
-    queue = [(camera_roll_id, 0)]
+    queue = []
+    queued_folders = set()
+
+    def enqueue(folder_id, depth, priority=False):
+        clean_folder_id = clean_value(folder_id, blank_text="")
+        if not clean_folder_id or clean_folder_id in queued_folders:
+            return
+        queued_folders.add(clean_folder_id)
+        entry = (clean_folder_id, int(depth or 0))
+        if priority:
+            queue.insert(0, entry)
+        else:
+            queue.append(entry)
+
+    for folder_id in preferred_folder_ids or []:
+        enqueue(folder_id, 0, priority=True)
+    enqueue(camera_roll_id, 0, priority=not bool(preferred_folder_ids))
     if camera_parent_id and camera_parent_id != camera_roll_id:
-        queue.append((camera_parent_id, 0))
+        enqueue(camera_parent_id, 0, priority=False)
 
     seen_folders = set()
     seen_items = set()
     images = []
-    app_root_token = "/" + str(ONEDRIVE_ROOT_FOLDER).strip("/").casefold()
+    app_root_name = str(ONEDRIVE_ROOT_FOLDER).strip("/").casefold()
+    app_root_token = "/" + app_root_name
+    started_at = time.monotonic()
 
     while queue and len(seen_folders) < max_folders and len(seen_items) < max_items:
+        if time.monotonic() - started_at >= max_seconds:
+            break
+
         folder_id, depth = queue.pop(0)
         if not folder_id or folder_id in seen_folders:
             continue
         seen_folders.add(folder_id)
 
-        for item in list_onedrive_folder_children(access_token, folder_id):
+        remaining_seconds = max_seconds - (time.monotonic() - started_at)
+        request_timeout = max(3, min(8, int(remaining_seconds) + 1))
+        try:
+            folder_items = list_onedrive_folder_children(
+                access_token,
+                folder_id,
+                max_pages=1,
+                page_size=200,
+                request_timeout=request_timeout,
+            )
+        except Exception:
+            continue
+
+        priority_folders = []
+        normal_folders = []
+        for item in folder_items:
             item_id = clean_value(item.get("id"), blank_text="")
             if not item_id or item_id in seen_items:
                 continue
@@ -2090,12 +2319,18 @@ def collect_onedrive_camera_backup_images(
             if parent_path.endswith(app_root_token) or app_root_token + "/" in parent_path:
                 continue
 
+            name = Path(str(item.get("name") or "")).name
             if item.get("folder"):
+                if name.casefold() == app_root_name:
+                    continue
                 if depth < max_depth:
-                    queue.append((item_id, depth + 1))
+                    target = (item_id, depth + 1)
+                    if onedrive_camera_folder_priority(name) == 0:
+                        priority_folders.append(target)
+                    else:
+                        normal_folders.append(target)
                 continue
 
-            name = Path(str(item.get("name") or "")).name
             suffix = Path(name).suffix.casefold()
             mime_type = clean_value(
                 (item.get("file") or {}).get("mimeType"),
@@ -2108,6 +2343,16 @@ def collect_onedrive_camera_backup_images(
             )
             if is_image:
                 images.append(item)
+
+        # 優先フォルダーは次の周回で先に調べる。通常フォルダーは後ろへ回す。
+        for child_id, child_depth in reversed(priority_folders):
+            enqueue(child_id, child_depth, priority=True)
+        for child_id, child_depth in normal_folders:
+            enqueue(child_id, child_depth, priority=False)
+
+        # 新しい画像を十分取得できたら、無制限にフォルダーを広げない。
+        if len(images) >= 260 and len(seen_folders) >= 3:
+            break
 
     images.sort(
         key=lambda item: str(
@@ -2131,30 +2376,15 @@ def onedrive_image_dimensions(item):
     return (width, height) if width > 0 and height > 0 else None
 
 
-def find_matching_onedrive_camera_roll_file(
+def match_onedrive_photo_candidates(
     access_token,
-    uploaded_name,
+    candidates,
+    original_name,
     content,
+    max_downloads=12,
+    max_seconds=6,
 ):
-    """OneDriveの写真バックアップ内で同じ写真を安全に1枚だけ特定する。"""
-    original_name = Path(str(uploaded_name or "")).name
-    if not original_name or not content:
-        return None
-
-    camera_roll = get_onedrive_camera_roll_folder(access_token) or {}
-    if not clean_value(camera_roll.get("id"), blank_text=""):
-        raise RuntimeError(
-            "OneDriveの写真バックアップ用フォルダーを確認できませんでした。"
-            "二重保存を防ぐため、新しいコピーは作成していません。"
-        )
-
-    # Graphのsearchは新規バックアップ直後や、Android側と選択画面側で名前が違う場合に
-    # 候補を返さないことがあるため、Camera RollとPictures配下を直接一覧取得する。
-    all_candidates = collect_onedrive_camera_backup_images(
-        access_token,
-        camera_roll,
-    )
-
+    """取得済み候補から、完全一致または厳しい画素一致の写真を1枚だけ返す。"""
     uploaded_size = len(content)
     uploaded_sha1 = hashlib.sha1(content).hexdigest().upper()
     uploaded_sha256 = hashlib.sha256(content).digest()
@@ -2174,7 +2404,9 @@ def find_matching_onedrive_camera_roll_file(
     recent_dimension_candidates = []
     recent_unknown_dimension_candidates = []
 
-    for candidate in all_candidates:
+    for candidate in candidates or []:
+        if not isinstance(candidate, dict) or candidate.get("folder"):
+            continue
         candidate_name = Path(str(candidate.get("name") or "")).name
         if candidate_name.casefold() == original_name.casefold():
             exact_name_candidates.append(candidate)
@@ -2188,74 +2420,98 @@ def find_matching_onedrive_camera_roll_file(
 
         candidate_dimensions = onedrive_image_dimensions(candidate)
         if uploaded_dimensions and candidate_dimensions:
-            if candidate_dimensions == uploaded_dimensions or candidate_dimensions == uploaded_dimensions[::-1]:
+            if (
+                candidate_dimensions == uploaded_dimensions
+                or candidate_dimensions == uploaded_dimensions[::-1]
+            ):
                 recent_dimension_candidates.append(candidate)
         elif modified_at is not None:
             recent_unknown_dimension_candidates.append(candidate)
 
-    # 名前が同じ候補を最優先し、名前が違う場合は最近14日以内かつ同じ画素寸法を比較する。
-    # image facetがない候補は負荷と誤判定を避けるため、新しい順の少数だけ補助的に確認する。
-    candidates = []
+    selected_candidates = []
     seen_candidate_ids = set()
     for group, limit in (
-        (exact_name_candidates, 80),
-        (recent_dimension_candidates, 80),
-        (recent_unknown_dimension_candidates, 20),
+        (exact_name_candidates, 20),
+        (recent_dimension_candidates, 12),
+        (recent_unknown_dimension_candidates, 4),
     ):
         for candidate in group[:limit]:
             candidate_id = clean_value(candidate.get("id"), blank_text="")
             if candidate_id and candidate_id not in seen_candidate_ids:
                 seen_candidate_ids.add(candidate_id)
-                candidates.append(candidate)
+                selected_candidates.append(candidate)
 
-    downloaded_content = {}
-
-    def get_candidate_content(candidate):
-        candidate_id = clean_value(candidate.get("id"), blank_text="")
-        if candidate_id not in downloaded_content:
-            downloaded_content[candidate_id] = download_onedrive_file(
-                access_token,
-                candidate_id,
-            )
-        return downloaded_content[candidate_id]
-
-    raw_matches = []
-    normalized_matches = []
-    visual_matches = []
-
-    for candidate in candidates:
+    # Graphが返すSHA1で一致する場合は、画像をダウンロードせず判定できる。
+    graph_hash_matches = []
+    for candidate in selected_candidates:
         try:
             candidate_size = int(candidate.get("size") or 0)
         except Exception:
             candidate_size = 0
         hashes = ((candidate.get("file") or {}).get("hashes") or {})
         candidate_sha1 = clean_value(hashes.get("sha1Hash"), blank_text="").upper()
-
-        # 最も強い判定：容量とファイルハッシュが完全一致。
         if candidate_size == uploaded_size and candidate_sha1 == uploaded_sha1:
-            raw_matches.append(candidate)
+            graph_hash_matches.append(candidate)
+    if len(graph_hash_matches) == 1:
+        return graph_hash_matches[0]
+    if len(graph_hash_matches) > 1:
+        raise RuntimeError(
+            "OneDriveの写真バックアップに同じ写真が複数見つかりました（完全一致）。"
+            "誤った写真を移動しないよう保存を停止しました。"
+        )
+
+    raw_matches = []
+    normalized_matches = []
+    visual_matches = []
+    started_at = time.monotonic()
+    download_count = 0
+
+    for candidate in selected_candidates:
+        if time.monotonic() - started_at >= max_seconds:
+            break
+        candidate_id = clean_value(candidate.get("id"), blank_text="")
+        if not candidate_id:
+            continue
+
+        fingerprint = get_camera_candidate_fingerprint(candidate_id)
+        if fingerprint is None:
+            if download_count >= max_downloads:
+                break
+            try:
+                candidate_content = onedrive_graph_request(
+                    "GET",
+                    f"/me/drive/items/{urllib.parse.quote(candidate_id, safe='')}/content",
+                    access_token,
+                    expected=(200,),
+                    _request_timeout=8,
+                ).content
+            except Exception:
+                continue
+            download_count += 1
+            fingerprint = set_camera_candidate_fingerprint(
+                candidate_id,
+                candidate_content,
+            )
+        if not isinstance(fingerprint, dict):
             continue
 
         try:
-            candidate_content = get_candidate_content(candidate)
+            candidate_size = int(candidate.get("size") or fingerprint.get("size") or 0)
         except Exception:
-            continue
-
-        if candidate_size == uploaded_size and hashlib.sha256(candidate_content).digest() == uploaded_sha256:
+            candidate_size = 0
+        if (
+            candidate_size == uploaded_size
+            and fingerprint.get("sha256") == uploaded_sha256
+        ):
             raw_matches.append(candidate)
             continue
 
-        # EXIFなどの付帯情報だけが違う場合は、画像本体のバイト列で一致させる。
-        candidate_normalized_sha256 = hashlib.sha256(
-            normalize_image_content_for_comparison(candidate_content)
-        ).digest()
-        if candidate_normalized_sha256 == uploaded_normalized_sha256:
+        if fingerprint.get("normalized_sha256") == uploaded_normalized_sha256:
             normalized_matches.append(candidate)
             continue
 
-        # Androidのファイル選択時に名前変更・JPEG再圧縮があっても、画素が一致すれば同じ写真とする。
         if uploaded_visual_signature is not None:
-            candidate_visual_signature = build_image_visual_signature(candidate_content)
+            candidate_visual_signature = fingerprint.get("visual_signature")
             if image_visual_signatures_match(
                 uploaded_visual_signature,
                 candidate_visual_signature,
@@ -2274,12 +2530,112 @@ def find_matching_onedrive_camera_roll_file(
                 f"OneDriveの写真バックアップに同じ写真が複数見つかりました（{match_level}）。"
                 "誤った写真を移動しないよう保存を停止しました。"
             )
+    return None
+
+
+def find_matching_onedrive_camera_roll_file(
+    access_token,
+    uploaded_name,
+    content,
+):
+    """重複を作らず、短時間の優先検索でOneDrive上の元写真を特定する。"""
+    original_name = Path(str(uploaded_name or "")).name
+    if not original_name or not content:
+        return None
+
+    camera_roll = get_onedrive_camera_roll_folder(access_token) or {}
+    camera_roll_id = clean_value(camera_roll.get("id"), blank_text="")
+    if not camera_roll_id:
+        raise RuntimeError(
+            "OneDriveの写真バックアップ用フォルダーを確認できませんでした。"
+            "二重保存を防ぐため、新しいコピーは作成していません。"
+        )
+
+    # 同じ保存操作で取得済みの一覧があれば、再走査せず先に照合する。
+    cached_candidates = get_recent_camera_candidate_cache(camera_roll_id)
+    if cached_candidates:
+        matched = match_onedrive_photo_candidates(
+            access_token,
+            cached_candidates,
+            original_name,
+            content,
+            max_downloads=10,
+            max_seconds=5,
+        )
+        if matched is not None:
+            source_parent_id = clean_value(
+                (matched.get("parentReference") or {}).get("id"),
+                blank_text="",
+            )
+            remember_onedrive_camera_folder_hint(camera_roll_id, source_parent_id)
+            remove_recent_camera_candidate_cache_item(matched.get("id"))
+            return matched
+
+    folder_hints = get_onedrive_camera_folder_hints(camera_roll_id)
+
+    # 前回見つかったフォルダーがある場合は、まずそこだけを短時間で確認する。
+    if folder_hints:
+        fast_candidates = collect_onedrive_camera_backup_images(
+            access_token,
+            camera_roll,
+            preferred_folder_ids=folder_hints,
+            max_folders=5,
+            max_items=350,
+            max_depth=1,
+            max_seconds=4,
+        )
+        matched = match_onedrive_photo_candidates(
+            access_token,
+            fast_candidates,
+            original_name,
+            content,
+            max_downloads=8,
+            max_seconds=4,
+        )
+        if matched is not None:
+            source_parent_id = clean_value(
+                (matched.get("parentReference") or {}).get("id"),
+                blank_text="",
+            )
+            remember_onedrive_camera_folder_hint(camera_roll_id, source_parent_id)
+            set_recent_camera_candidate_cache(camera_roll_id, fast_candidates)
+            remove_recent_camera_candidate_cache_item(matched.get("id"))
+            return matched
+
+    # 初回だけは候補フォルダーを優先順で調べるが、時間・件数・ページ数に上限を設ける。
+    broad_candidates = collect_onedrive_camera_backup_images(
+        access_token,
+        camera_roll,
+        preferred_folder_ids=folder_hints,
+        max_folders=30,
+        max_items=800,
+        max_depth=4,
+        max_seconds=8,
+    )
+    set_recent_camera_candidate_cache(camera_roll_id, broad_candidates)
+    matched = match_onedrive_photo_candidates(
+        access_token,
+        broad_candidates,
+        original_name,
+        content,
+        max_downloads=12,
+        max_seconds=6,
+    )
+    if matched is not None:
+        source_parent_id = clean_value(
+            (matched.get("parentReference") or {}).get("id"),
+            blank_text="",
+        )
+        remember_onedrive_camera_folder_hint(camera_roll_id, source_parent_id)
+        remove_recent_camera_candidate_cache_item(matched.get("id"))
+        return matched
 
     raise RuntimeError(
         "OneDriveの写真バックアップに同じ写真が見つかりませんでした。"
-        "バックアップ済みでも、端末側とOneDrive側で写真の内容が変換されている可能性があります。"
         "二重保存を防ぐため、新しいコピーは作成していません。"
+        "バックアップ完了後にもう一度試してください。"
     )
+
 
 def move_onedrive_item(access_token, item_id, parent_id, filename):
     """同じOneDrive内でファイルを移動し、必要なら同時に名前を変更する。"""
