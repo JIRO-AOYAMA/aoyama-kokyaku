@@ -17462,7 +17462,7 @@ def render_trade_partner_related_section(
 
     with st.expander(f"＋ {add_label}"):
         add_excluded_headers = {id_field, "取引先ID", "会社名（確認用）"}
-        if sheet_name == TRADE_PARTNER_CONTACT_SHEET:
+        if sheet_name in {TRADE_PARTNER_CONTACT_SHEET, TRADE_PARTNER_PRODUCT_SHEET}:
             add_excluded_headers.add("会社名")
         editable_headers = [
             header for header in headers
@@ -17470,7 +17470,7 @@ def render_trade_partner_related_section(
         ]
         with st.form(f"add_{sheet_name}_{partner_id}"):
             values = {"取引先ID": partner_id}
-            if sheet_name == TRADE_PARTNER_CONTACT_SHEET:
+            if sheet_name in {TRADE_PARTNER_CONTACT_SHEET, TRADE_PARTNER_PRODUCT_SHEET}:
                 values["会社名"] = company_name
             for header in editable_headers:
                 values[header] = st.text_input(
