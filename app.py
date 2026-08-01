@@ -18599,8 +18599,9 @@ def show_trade_notes_page():
     # st.tabs は削除確認などで再実行されるたびに先頭の「顧客」へ戻るため、
     # 選択値を session_state に保持できる横並びラジオで区分を切り替える。
     # これにより、仕入先や運送会社のメモを続けて削除しても同じ区分を維持する。
-    category_labels = ["顧客", "仕入先", "運送会社"]
+    category_labels = ["すべて", "顧客", "仕入先", "運送会社"]
     category_by_label = {
+        "すべて": "all",
         "顧客": "customer",
         "仕入先": "supplier",
         "運送会社": "carrier",
@@ -18617,12 +18618,14 @@ def show_trade_notes_page():
     filtered = []
     for note in notes:
         parsed = parse_trade_partner_note_key(note.get("customer_name"))
-        if category == "customer" and parsed is None:
+        if category == "all":
+            filtered.append(note)
+        elif category == "customer" and parsed is None:
             filtered.append(note)
         elif parsed and parsed["partner_type"] == category:
             filtered.append(note)
 
-    if category == "customer":
+    if category in {"all", "customer"}:
         try:
             past_product_items = load_all_past_product_notes_from_supabase()
         except Exception as exc:
