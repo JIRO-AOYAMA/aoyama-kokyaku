@@ -1806,6 +1806,166 @@ def upload_onedrive_file(access_token, folder_path, filename, content, content_t
     return response.json()
 
 
+def get_onedrive_camera_roll_folder(access_token):
+    """OneDriveのカメラバックアップ用フォルダを取得する。"""
+    response = onedrive_graph_request(
+        "GET",
+        "/me/drive/special/cameraroll",
+        access_token,
+        expected=(200, 404),
+        params={"$select": "id,name,parentReference"},
+    )
+    if response.status_code == 404:
+        return None
+    item = response.json()
+    return item if isinstance(item, dict) else None
+
+
+def normalize_onedrive_item_path(value):
+    """Graphが返すOneDrive内パスを比較用に正規化する。"""
+    return urllib.parse.unquote(str(value or "")).replace("\\", "/").rstrip("/").casefold()
+
+
+def find_matching_onedrive_camera_roll_file(
+    access_token,
+    uploaded_name,
+    content,
+):
+    """アップロード内容と完全一致するカメラロール内の1ファイルを返す。"""
+    original_name = Path(str(uploaded_name or "")).name
+    if not original_name or not content:
+        return None
+
+    camera_roll = get_onedrive_camera_roll_folder(access_token)
+    if not camera_roll:
+        raise RuntimeError(
+            "OneDriveのカメラバックアップ用フォルダを確認できませんでした。"
+            "二重保存を防ぐため、新しいコピーは作成していません。"
+        )
+
+    camera_roll_id = clean_value(camera_roll.get("id"), blank_text="")
+    camera_roll_name = clean_value(camera_roll.get("name"), blank_text="")
+    camera_parent_path = clean_value(
+        (camera_roll.get("parentReference") or {}).get("path"),
+        blank_text="",
+    )
+    camera_roll_path = normalize_onedrive_item_path(
+        f"{camera_parent_path}/{camera_roll_name}"
+    )
+    if not camera_roll_id or not camera_roll_path:
+        raise RuntimeError(
+            "OneDriveのカメラバックアップ用フォルダ情報を確認できませんでした。"
+            "二重保存を防ぐため、新しいコピーは作成していません。"
+        )
+
+    escaped_query = urllib.parse.quote(original_name.replace("'", "''"), safe="")
+    response = onedrive_graph_request(
+        "GET",
+        f"/me/drive/root/search(q='{escaped_query}')",
+        access_token,
+        params={
+            "$select": "id,name,size,file,folder,parentReference,webUrl",
+            "$top": "200",
+        },
+    )
+    payload = response.json()
+    candidates = payload.get("value", []) if isinstance(payload, dict) else []
+    uploaded_size = len(content)
+    uploaded_sha1 = hashlib.sha1(content).hexdigest().upper()
+    exact_matches = []
+
+    for candidate in candidates:
+        if not isinstance(candidate, dict) or candidate.get("folder"):
+            continue
+        if Path(str(candidate.get("name") or "")).name.casefold() != original_name.casefold():
+            continue
+        try:
+            candidate_size = int(candidate.get("size") or 0)
+        except Exception:
+            candidate_size = 0
+        if candidate_size != uploaded_size:
+            continue
+
+        parent_reference = candidate.get("parentReference") or {}
+        parent_path = normalize_onedrive_item_path(parent_reference.get("path"))
+        if not (
+            parent_path == camera_roll_path
+            or parent_path.startswith(camera_roll_path + "/")
+        ):
+            continue
+
+        candidate_id = clean_value(candidate.get("id"), blank_text="")
+        source_parent_id = clean_value(parent_reference.get("id"), blank_text="")
+        if not candidate_id or not source_parent_id:
+            continue
+
+        hashes = ((candidate.get("file") or {}).get("hashes") or {})
+        candidate_sha1 = clean_value(hashes.get("sha1Hash"), blank_text="").upper()
+        if candidate_sha1:
+            if candidate_sha1 != uploaded_sha1:
+                continue
+        else:
+            try:
+                candidate_content = download_onedrive_file(access_token, candidate_id)
+            except Exception:
+                continue
+            if hashlib.sha256(candidate_content).digest() != hashlib.sha256(content).digest():
+                continue
+
+        exact_matches.append(candidate)
+
+    if not exact_matches:
+        raise RuntimeError(
+            "OneDriveのカメラバックアップに同じ写真がまだ見つかりません。"
+            "スマホのOneDriveでバックアップ完了を確認してから、もう一度保存してください。"
+            "二重保存を防ぐため、新しいコピーは作成していません。"
+        )
+    if len(exact_matches) > 1:
+        raise RuntimeError(
+            "OneDriveのカメラバックアップに同じ写真が複数見つかったため、"
+            "誤った写真を移動しないよう保存を停止しました。"
+        )
+    return exact_matches[0]
+
+
+def move_onedrive_item(access_token, item_id, parent_id, filename):
+    """同じOneDrive内でファイルを移動し、必要なら同時に名前を変更する。"""
+    clean_name = re.sub(r'[\\/:*?"<>|]', "_", str(filename or "")).strip().rstrip(".")
+    if not item_id or not parent_id or not clean_name:
+        raise RuntimeError("OneDriveの移動先情報が不足しています。")
+    response = onedrive_graph_request(
+        "PATCH",
+        f"/me/drive/items/{urllib.parse.quote(str(item_id), safe='')}",
+        access_token,
+        expected=(200,),
+        headers={"Content-Type": "application/json"},
+        json={
+            "parentReference": {"id": str(parent_id)},
+            "name": clean_name,
+        },
+    )
+    return response.json()
+
+
+def move_onedrive_file_to_folder(
+    access_token,
+    item_id,
+    folder_path,
+    filename,
+):
+    """保存先フォルダを確保してから、既存ファイルをそこへ移動する。"""
+    target_folder = ensure_onedrive_folder_path(access_token, folder_path)
+    target_folder_id = clean_value(target_folder.get("id"), blank_text="")
+    if not target_folder_id:
+        raise RuntimeError("OneDriveの移動先フォルダIDを取得できませんでした。")
+    return move_onedrive_item(
+        access_token,
+        item_id,
+        target_folder_id,
+        filename,
+    )
+
+
 def delete_onedrive_file(access_token, item_id):
     onedrive_graph_request(
         "DELETE",
@@ -6948,6 +7108,7 @@ def save_entity_onedrive_attachment(
     group_id="",
     group_index=0,
     group_size=1,
+    move_from_camera_roll=False,
 ):
     entity_type = normalize_attachment_entity_type(entity_type)
     entity_name = clean_value(entity_name, blank_text="").strip()
@@ -6975,13 +7136,41 @@ def save_entity_onedrive_attachment(
     original_name = Path(str(uploaded_name or "file")).name
     timestamp = get_jst_now().strftime("%Y%m%d_%H%M%S")
     stored_name = f"{timestamp}_{uuid.uuid4().hex[:8]}_{original_name}"
-    uploaded_item = upload_onedrive_file(
-        access_token,
-        folder_path,
-        stored_name,
-        content,
-        mime_type,
-    )
+    moved_source = None
+    if file_kind == "image" and move_from_camera_roll:
+        source_item = find_matching_onedrive_camera_roll_file(
+            access_token,
+            original_name,
+            content,
+        )
+        source_parent_reference = source_item.get("parentReference") or {}
+        source_item_id = clean_value(source_item.get("id"), blank_text="")
+        source_parent_id = clean_value(source_parent_reference.get("id"), blank_text="")
+        source_name = clean_value(source_item.get("name"), blank_text="") or original_name
+        if not source_item_id or not source_parent_id:
+            raise RuntimeError(
+                "OneDriveの元写真の保存場所を確認できませんでした。"
+                "誤移動を防ぐため保存を停止しました。"
+            )
+        uploaded_item = move_onedrive_file_to_folder(
+            access_token,
+            source_item_id,
+            folder_path,
+            stored_name,
+        )
+        moved_source = {
+            "item_id": source_item_id,
+            "parent_id": source_parent_id,
+            "name": source_name,
+        }
+    else:
+        uploaded_item = upload_onedrive_file(
+            access_token,
+            folder_path,
+            stored_name,
+            content,
+            mime_type,
+        )
     file_id = clean_value(uploaded_item.get("id"), blank_text="")
     if not file_id:
         raise RuntimeError("OneDriveから保存済みファイルIDを取得できませんでした。")
@@ -7025,11 +7214,26 @@ def save_entity_onedrive_attachment(
             serialize_onedrive_attachment(attachment),
             int(time.time()),
         )
-    except Exception:
-        try:
-            delete_onedrive_file(access_token, file_id)
-        except Exception:
-            pass
+    except Exception as exc:
+        if moved_source:
+            try:
+                move_onedrive_item(
+                    access_token,
+                    moved_source["item_id"],
+                    moved_source["parent_id"],
+                    moved_source["name"],
+                )
+            except Exception as rollback_exc:
+                raise RuntimeError(
+                    "写真はOneDrive内で移動されましたが、アプリへの登録に失敗し、"
+                    "元のカメラロールへ戻せませんでした。"
+                    f"OneDriveで「{stored_name}」を確認してください。"
+                ) from rollback_exc
+        else:
+            try:
+                delete_onedrive_file(access_token, file_id)
+            except Exception:
+                pass
         raise
     return attachment
 
@@ -7425,6 +7629,11 @@ def render_customer_attachments_section(
                 )
                 if mobile_browser:
                     enable_mobile_bulk_image_picker(image_uploader_label)
+                    st.caption(
+                        "選んだ画像は新しいコピーを作らず、OneDriveのカメラバックアップにある"
+                        "同じ写真をこの取引先の写真フォルダへ移動します。"
+                        "バックアップ前の写真は二重保存を防ぐため保存しません。"
+                    )
                 photo_files = list(selected_image_files or [])
                 supported_image_mime_types = {"image/jpeg", "image/png", "image/webp"}
                 invalid_photo_files = [
@@ -7508,6 +7717,7 @@ def render_customer_attachments_section(
                                         group_id=image_group_id,
                                         group_index=upload_index if image_group_id else 0,
                                         group_size=image_group_size if image_group_id else 1,
+                                        move_from_camera_roll=bool(mobile_browser and photo_files),
                                     )
                                     saved_items.append(saved)
                                     remember_change_history_warning(
