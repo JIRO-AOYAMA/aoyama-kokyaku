@@ -1976,83 +1976,184 @@ def image_visual_signatures_match(left, right):
     return mean_absolute_difference <= 4.0 and hash_distance <= 8
 
 
+def parse_onedrive_datetime(value):
+    """Microsoft Graphの日付文字列をUTCのdatetimeへ変換する。"""
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        parsed = datetime.fromisoformat(text)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def onedrive_next_link_to_path(next_link):
+    """Graphの@odata.nextLinkをonedrive_graph_request用の相対パスへ戻す。"""
+    parsed = urllib.parse.urlparse(str(next_link or ""))
+    path = parsed.path or ""
+    marker = "/v1.0"
+    if marker not in path:
+        return ""
+    relative = path.split(marker, 1)[1]
+    if parsed.query:
+        relative += "?" + parsed.query
+    return relative
+
+
+def list_onedrive_folder_children(access_token, folder_id, max_pages=5):
+    """検索インデックスを使わず、指定フォルダーの子項目を直接取得する。"""
+    clean_folder_id = clean_value(folder_id, blank_text="")
+    if not clean_folder_id:
+        return []
+
+    target = f"/me/drive/items/{urllib.parse.quote(clean_folder_id, safe='')}/children"
+    params = {
+        "$select": (
+            "id,name,size,file,folder,parentReference,webUrl,image,photo,"
+            "createdDateTime,lastModifiedDateTime"
+        ),
+        "$top": "200",
+        "$orderby": "lastModifiedDateTime desc",
+    }
+    items = []
+    page_count = 0
+
+    while target and page_count < max_pages:
+        if page_count == 0:
+            response = onedrive_graph_request(
+                "GET",
+                target,
+                access_token,
+                params=params,
+            )
+        else:
+            response = onedrive_graph_request("GET", target, access_token)
+        payload = response.json()
+        if not isinstance(payload, dict):
+            break
+        page_items = payload.get("value", [])
+        if isinstance(page_items, list):
+            items.extend(item for item in page_items if isinstance(item, dict))
+        target = onedrive_next_link_to_path(payload.get("@odata.nextLink"))
+        page_count += 1
+
+    return items
+
+
+def collect_onedrive_camera_backup_images(
+    access_token,
+    camera_roll,
+    max_folders=80,
+    max_items=1600,
+    max_depth=4,
+):
+    """Camera RollとPictures配下を直接たどり、画像候補を新しい順で返す。"""
+    camera_roll = camera_roll if isinstance(camera_roll, dict) else {}
+    camera_roll_id = clean_value(camera_roll.get("id"), blank_text="")
+    parent_reference = camera_roll.get("parentReference") or {}
+    camera_parent_id = clean_value(parent_reference.get("id"), blank_text="")
+    if not camera_roll_id:
+        return []
+
+    queue = [(camera_roll_id, 0)]
+    if camera_parent_id and camera_parent_id != camera_roll_id:
+        queue.append((camera_parent_id, 0))
+
+    seen_folders = set()
+    seen_items = set()
+    images = []
+    app_root_token = "/" + str(ONEDRIVE_ROOT_FOLDER).strip("/").casefold()
+
+    while queue and len(seen_folders) < max_folders and len(seen_items) < max_items:
+        folder_id, depth = queue.pop(0)
+        if not folder_id or folder_id in seen_folders:
+            continue
+        seen_folders.add(folder_id)
+
+        for item in list_onedrive_folder_children(access_token, folder_id):
+            item_id = clean_value(item.get("id"), blank_text="")
+            if not item_id or item_id in seen_items:
+                continue
+            seen_items.add(item_id)
+            if len(seen_items) > max_items:
+                break
+
+            parent_path = normalize_onedrive_item_path(
+                (item.get("parentReference") or {}).get("path")
+            )
+            # すでにアプリの保存先へ移した写真は、移動元候補にしない。
+            if parent_path.endswith(app_root_token) or app_root_token + "/" in parent_path:
+                continue
+
+            if item.get("folder"):
+                if depth < max_depth:
+                    queue.append((item_id, depth + 1))
+                continue
+
+            name = Path(str(item.get("name") or "")).name
+            suffix = Path(name).suffix.casefold()
+            mime_type = clean_value(
+                (item.get("file") or {}).get("mimeType"),
+                blank_text="",
+            ).casefold()
+            is_image = bool(
+                item.get("image")
+                or mime_type.startswith("image/")
+                or suffix in {".jpg", ".jpeg", ".png", ".webp", ".heic", ".heif"}
+            )
+            if is_image:
+                images.append(item)
+
+    images.sort(
+        key=lambda item: str(
+            item.get("lastModifiedDateTime")
+            or item.get("createdDateTime")
+            or ""
+        ),
+        reverse=True,
+    )
+    return images
+
+
+def onedrive_image_dimensions(item):
+    """Graphのimage facetから画像サイズを取得する。"""
+    image_info = item.get("image") or {}
+    try:
+        width = int(image_info.get("width") or 0)
+        height = int(image_info.get("height") or 0)
+    except Exception:
+        return None
+    return (width, height) if width > 0 and height > 0 else None
+
+
 def find_matching_onedrive_camera_roll_file(
     access_token,
     uploaded_name,
     content,
 ):
-    """OneDrive内で同じ写真を安全に1枚だけ特定する。"""
+    """OneDriveの写真バックアップ内で同じ写真を安全に1枚だけ特定する。"""
     original_name = Path(str(uploaded_name or "")).name
     if not original_name or not content:
         return None
 
     camera_roll = get_onedrive_camera_roll_folder(access_token) or {}
-    camera_roll_name = clean_value(camera_roll.get("name"), blank_text="")
-    camera_parent_path = clean_value(
-        (camera_roll.get("parentReference") or {}).get("path"),
-        blank_text="",
-    )
-    camera_roll_path = normalize_onedrive_item_path(
-        f"{camera_parent_path}/{camera_roll_name}"
-    ) if camera_roll_name else ""
-    camera_backup_parent_path = normalize_onedrive_item_path(camera_parent_path)
-    app_root_token = "/" + str(ONEDRIVE_ROOT_FOLDER).strip("/").casefold()
+    if not clean_value(camera_roll.get("id"), blank_text=""):
+        raise RuntimeError(
+            "OneDriveの写真バックアップ用フォルダーを確認できませんでした。"
+            "二重保存を防ぐため、新しいコピーは作成していません。"
+        )
 
-    escaped_query = urllib.parse.quote(original_name.replace("'", "''"), safe="")
-    response = onedrive_graph_request(
-        "GET",
-        f"/me/drive/root/search(q='{escaped_query}')",
+    # Graphのsearchは新規バックアップ直後や、Android側と選択画面側で名前が違う場合に
+    # 候補を返さないことがあるため、Camera RollとPictures配下を直接一覧取得する。
+    all_candidates = collect_onedrive_camera_backup_images(
         access_token,
-        params={
-            "$select": (
-                "id,name,size,file,folder,parentReference,webUrl,image,photo,"
-                "createdDateTime,lastModifiedDateTime"
-            ),
-            "$top": "200",
-        },
+        camera_roll,
     )
-    payload = response.json()
-    search_results = payload.get("value", []) if isinstance(payload, dict) else []
-    candidates = []
-
-    for candidate in search_results:
-        if not isinstance(candidate, dict) or candidate.get("folder"):
-            continue
-        if Path(str(candidate.get("name") or "")).name.casefold() != original_name.casefold():
-            continue
-
-        parent_reference = candidate.get("parentReference") or {}
-        parent_path = normalize_onedrive_item_path(parent_reference.get("path"))
-        candidate_id = clean_value(candidate.get("id"), blank_text="")
-        source_parent_id = clean_value(parent_reference.get("id"), blank_text="")
-        if not candidate_id or not source_parent_id or not parent_path:
-            continue
-
-        # すでに取引先カルテ内へ保存済みの写真は、移動元候補にしない。
-        if parent_path.endswith(app_root_token) or app_root_token + "/" in parent_path:
-            continue
-
-        # OneDrive Androidの「元のフォルダーを保持」が有効な場合、Camera Roll直下ではなく
-        # Pictures配下の端末別フォルダーへ入るため、Camera Rollの親配下まで対象にする。
-        if camera_roll_path or camera_backup_parent_path:
-            in_camera_roll = bool(
-                camera_roll_path
-                and (
-                    parent_path == camera_roll_path
-                    or parent_path.startswith(camera_roll_path + "/")
-                )
-            )
-            in_camera_backup_parent = bool(
-                camera_backup_parent_path
-                and (
-                    parent_path == camera_backup_parent_path
-                    or parent_path.startswith(camera_backup_parent_path + "/")
-                )
-            )
-            if not (in_camera_roll or in_camera_backup_parent):
-                continue
-
-        candidates.append(candidate)
 
     uploaded_size = len(content)
     uploaded_sha1 = hashlib.sha1(content).hexdigest().upper()
@@ -2061,6 +2162,52 @@ def find_matching_onedrive_camera_roll_file(
         normalize_image_content_for_comparison(content)
     ).digest()
     uploaded_visual_signature = build_image_visual_signature(content)
+    uploaded_dimensions = (
+        uploaded_visual_signature.get("size")
+        if uploaded_visual_signature is not None
+        else None
+    )
+
+    now_utc = datetime.now(timezone.utc)
+    recent_cutoff = now_utc - timedelta(days=14)
+    exact_name_candidates = []
+    recent_dimension_candidates = []
+    recent_unknown_dimension_candidates = []
+
+    for candidate in all_candidates:
+        candidate_name = Path(str(candidate.get("name") or "")).name
+        if candidate_name.casefold() == original_name.casefold():
+            exact_name_candidates.append(candidate)
+            continue
+
+        modified_at = parse_onedrive_datetime(
+            candidate.get("lastModifiedDateTime") or candidate.get("createdDateTime")
+        )
+        if modified_at is not None and modified_at < recent_cutoff:
+            continue
+
+        candidate_dimensions = onedrive_image_dimensions(candidate)
+        if uploaded_dimensions and candidate_dimensions:
+            if candidate_dimensions == uploaded_dimensions or candidate_dimensions == uploaded_dimensions[::-1]:
+                recent_dimension_candidates.append(candidate)
+        elif modified_at is not None:
+            recent_unknown_dimension_candidates.append(candidate)
+
+    # 名前が同じ候補を最優先し、名前が違う場合は最近14日以内かつ同じ画素寸法を比較する。
+    # image facetがない候補は負荷と誤判定を避けるため、新しい順の少数だけ補助的に確認する。
+    candidates = []
+    seen_candidate_ids = set()
+    for group, limit in (
+        (exact_name_candidates, 80),
+        (recent_dimension_candidates, 80),
+        (recent_unknown_dimension_candidates, 20),
+    ):
+        for candidate in group[:limit]:
+            candidate_id = clean_value(candidate.get("id"), blank_text="")
+            if candidate_id and candidate_id not in seen_candidate_ids:
+                seen_candidate_ids.add(candidate_id)
+                candidates.append(candidate)
+
     downloaded_content = {}
 
     def get_candidate_content(candidate):
@@ -2106,7 +2253,7 @@ def find_matching_onedrive_camera_roll_file(
             normalized_matches.append(candidate)
             continue
 
-        # スマホのファイル選択時にJPEGが再圧縮された場合は、縮小画素を厳密に比較する。
+        # Androidのファイル選択時に名前変更・JPEG再圧縮があっても、画素が一致すれば同じ写真とする。
         if uploaded_visual_signature is not None:
             candidate_visual_signature = build_image_visual_signature(candidate_content)
             if image_visual_signatures_match(
@@ -2129,11 +2276,10 @@ def find_matching_onedrive_camera_roll_file(
             )
 
     raise RuntimeError(
-        "OneDriveの写真バックアップに同じ写真がまだ見つかりません。"
-        "スマホのOneDriveでバックアップ完了を確認してから、もう一度保存してください。"
+        "OneDriveの写真バックアップに同じ写真が見つかりませんでした。"
+        "バックアップ済みでも、端末側とOneDrive側で写真の内容が変換されている可能性があります。"
         "二重保存を防ぐため、新しいコピーは作成していません。"
     )
-
 
 def move_onedrive_item(access_token, item_id, parent_id, filename):
     """同じOneDrive内でファイルを移動し、必要なら同時に名前を変更する。"""
