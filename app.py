@@ -31,6 +31,12 @@ from openpyxl import load_workbook
 from openpyxl.styles import PatternFill
 
 try:
+    from PIL import Image, ImageOps
+except ImportError:
+    Image = None
+    ImageOps = None
+
+try:
     from st_keyup import st_keyup
 except ImportError:
     st_keyup = None
@@ -1826,24 +1832,161 @@ def normalize_onedrive_item_path(value):
     return urllib.parse.unquote(str(value or "")).replace("\\", "/").rstrip("/").casefold()
 
 
+def normalize_image_content_for_comparison(content):
+    """画像メタデータを除いた比較用バイト列を返す。解析できない形式は元データを返す。"""
+    data = bytes(content or b"")
+    if not data:
+        return b""
+
+    # JPEG: EXIF・XMP・ICC・コメント等のAPP/COMセグメントだけを除外する。
+    if data.startswith(b"\xff\xd8"):
+        output = bytearray(data[:2])
+        position = 2
+        try:
+            while position < len(data):
+                marker_start = position
+                if data[position] != 0xFF:
+                    return data
+                while position < len(data) and data[position] == 0xFF:
+                    position += 1
+                if position >= len(data):
+                    return data
+                marker = data[position]
+                position += 1
+
+                # SOI/EOI/TEM/RSTは長さを持たない。
+                if marker in {0xD8, 0xD9, 0x01} or 0xD0 <= marker <= 0xD7:
+                    output.extend(data[marker_start:position])
+                    if marker == 0xD9:
+                        break
+                    continue
+
+                if position + 2 > len(data):
+                    return data
+                segment_length = int.from_bytes(data[position:position + 2], "big")
+                segment_end = position + segment_length
+                if segment_length < 2 or segment_end > len(data):
+                    return data
+
+                # SOS以降は圧縮画像本体なので、そのまま残す。
+                if marker == 0xDA:
+                    output.extend(data[marker_start:segment_end])
+                    output.extend(data[segment_end:])
+                    break
+
+                is_metadata = 0xE0 <= marker <= 0xEF or marker == 0xFE
+                if not is_metadata:
+                    output.extend(data[marker_start:segment_end])
+                position = segment_end
+            return bytes(output)
+        except Exception:
+            return data
+
+    # PNG: 表示に必須のcritical chunkだけを残す。
+    png_signature = b"\x89PNG\r\n\x1a\n"
+    if data.startswith(png_signature):
+        output = bytearray(png_signature)
+        position = len(png_signature)
+        try:
+            while position + 12 <= len(data):
+                chunk_length = int.from_bytes(data[position:position + 4], "big")
+                chunk_end = position + 12 + chunk_length
+                if chunk_end > len(data):
+                    return data
+                chunk_type = data[position + 4:position + 8]
+                # PNGでは先頭文字が大文字のchunkがcritical。
+                if chunk_type and 65 <= chunk_type[0] <= 90:
+                    output.extend(data[position:chunk_end])
+                position = chunk_end
+                if chunk_type == b"IEND":
+                    break
+            return bytes(output)
+        except Exception:
+            return data
+
+    # WebP: EXIF/XMP/ICCだけを除き、画像データchunkを比較する。
+    if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        output = bytearray(b"WEBP")
+        position = 12
+        try:
+            while position + 8 <= len(data):
+                chunk_type = data[position:position + 4]
+                chunk_length = int.from_bytes(data[position + 4:position + 8], "little")
+                padded_length = chunk_length + (chunk_length % 2)
+                chunk_end = position + 8 + padded_length
+                if chunk_end > len(data):
+                    return data
+                if chunk_type not in {b"EXIF", b"XMP ", b"ICCP"}:
+                    output.extend(chunk_type)
+                    output.extend(data[position + 8:position + 8 + chunk_length])
+                position = chunk_end
+            return bytes(output)
+        except Exception:
+            return data
+
+    return data
+
+
+def build_image_visual_signature(content):
+    """同じ写真の再圧縮・EXIF差を判定するための小さな画素署名を作る。"""
+    if Image is None or not content:
+        return None
+    try:
+        with Image.open(BytesIO(content)) as source_image:
+            source_image.load()
+            image = ImageOps.exif_transpose(source_image) if ImageOps is not None else source_image.copy()
+            image = image.convert("RGB")
+            width, height = image.size
+            if width <= 0 or height <= 0:
+                return None
+            resampling = getattr(getattr(Image, "Resampling", Image), "LANCZOS")
+            color_bytes = image.resize((32, 32), resampling).tobytes()
+            grayscale_values = list(
+                image.convert("L").resize((16, 16), resampling).tobytes()
+            )
+            average = sum(grayscale_values) / max(1, len(grayscale_values))
+            average_hash = tuple(value >= average for value in grayscale_values)
+            return {
+                "size": (int(width), int(height)),
+                "color": color_bytes,
+                "average_hash": average_hash,
+            }
+    except Exception:
+        return None
+
+
+def image_visual_signatures_match(left, right):
+    """縦横サイズと縮小画素が十分近い場合だけ、同じ写真と判定する。"""
+    if not left or not right or left.get("size") != right.get("size"):
+        return False
+    left_color = left.get("color") or b""
+    right_color = right.get("color") or b""
+    if not left_color or len(left_color) != len(right_color):
+        return False
+    mean_absolute_difference = sum(
+        abs(left_value - right_value)
+        for left_value, right_value in zip(left_color, right_color)
+    ) / len(left_color)
+    left_hash = left.get("average_hash") or ()
+    right_hash = right.get("average_hash") or ()
+    if len(left_hash) != len(right_hash):
+        return False
+    hash_distance = sum(a != b for a, b in zip(left_hash, right_hash))
+    # JPEG再圧縮やEXIF除去は許容するが、似た別写真を拾わないよう厳しめにする。
+    return mean_absolute_difference <= 4.0 and hash_distance <= 8
+
+
 def find_matching_onedrive_camera_roll_file(
     access_token,
     uploaded_name,
     content,
 ):
-    """アップロード内容と完全一致するカメラロール内の1ファイルを返す。"""
+    """OneDrive内で同じ写真を安全に1枚だけ特定する。"""
     original_name = Path(str(uploaded_name or "")).name
     if not original_name or not content:
         return None
 
-    camera_roll = get_onedrive_camera_roll_folder(access_token)
-    if not camera_roll:
-        raise RuntimeError(
-            "OneDriveのカメラバックアップ用フォルダを確認できませんでした。"
-            "二重保存を防ぐため、新しいコピーは作成していません。"
-        )
-
-    camera_roll_id = clean_value(camera_roll.get("id"), blank_text="")
+    camera_roll = get_onedrive_camera_roll_folder(access_token) or {}
     camera_roll_name = clean_value(camera_roll.get("name"), blank_text="")
     camera_parent_path = clean_value(
         (camera_roll.get("parentReference") or {}).get("path"),
@@ -1851,12 +1994,9 @@ def find_matching_onedrive_camera_roll_file(
     )
     camera_roll_path = normalize_onedrive_item_path(
         f"{camera_parent_path}/{camera_roll_name}"
-    )
-    if not camera_roll_id or not camera_roll_path:
-        raise RuntimeError(
-            "OneDriveのカメラバックアップ用フォルダ情報を確認できませんでした。"
-            "二重保存を防ぐため、新しいコピーは作成していません。"
-        )
+    ) if camera_roll_name else ""
+    camera_backup_parent_path = normalize_onedrive_item_path(camera_parent_path)
+    app_root_token = "/" + str(ONEDRIVE_ROOT_FOLDER).strip("/").casefold()
 
     escaped_query = urllib.parse.quote(original_name.replace("'", "''"), safe="")
     response = onedrive_graph_request(
@@ -1864,68 +2004,135 @@ def find_matching_onedrive_camera_roll_file(
         f"/me/drive/root/search(q='{escaped_query}')",
         access_token,
         params={
-            "$select": "id,name,size,file,folder,parentReference,webUrl",
+            "$select": (
+                "id,name,size,file,folder,parentReference,webUrl,image,photo,"
+                "createdDateTime,lastModifiedDateTime"
+            ),
             "$top": "200",
         },
     )
     payload = response.json()
-    candidates = payload.get("value", []) if isinstance(payload, dict) else []
-    uploaded_size = len(content)
-    uploaded_sha1 = hashlib.sha1(content).hexdigest().upper()
-    exact_matches = []
+    search_results = payload.get("value", []) if isinstance(payload, dict) else []
+    candidates = []
 
-    for candidate in candidates:
+    for candidate in search_results:
         if not isinstance(candidate, dict) or candidate.get("folder"):
             continue
         if Path(str(candidate.get("name") or "")).name.casefold() != original_name.casefold():
             continue
+
+        parent_reference = candidate.get("parentReference") or {}
+        parent_path = normalize_onedrive_item_path(parent_reference.get("path"))
+        candidate_id = clean_value(candidate.get("id"), blank_text="")
+        source_parent_id = clean_value(parent_reference.get("id"), blank_text="")
+        if not candidate_id or not source_parent_id or not parent_path:
+            continue
+
+        # すでに取引先カルテ内へ保存済みの写真は、移動元候補にしない。
+        if parent_path.endswith(app_root_token) or app_root_token + "/" in parent_path:
+            continue
+
+        # OneDrive Androidの「元のフォルダーを保持」が有効な場合、Camera Roll直下ではなく
+        # Pictures配下の端末別フォルダーへ入るため、Camera Rollの親配下まで対象にする。
+        if camera_roll_path or camera_backup_parent_path:
+            in_camera_roll = bool(
+                camera_roll_path
+                and (
+                    parent_path == camera_roll_path
+                    or parent_path.startswith(camera_roll_path + "/")
+                )
+            )
+            in_camera_backup_parent = bool(
+                camera_backup_parent_path
+                and (
+                    parent_path == camera_backup_parent_path
+                    or parent_path.startswith(camera_backup_parent_path + "/")
+                )
+            )
+            if not (in_camera_roll or in_camera_backup_parent):
+                continue
+
+        candidates.append(candidate)
+
+    uploaded_size = len(content)
+    uploaded_sha1 = hashlib.sha1(content).hexdigest().upper()
+    uploaded_sha256 = hashlib.sha256(content).digest()
+    uploaded_normalized_sha256 = hashlib.sha256(
+        normalize_image_content_for_comparison(content)
+    ).digest()
+    uploaded_visual_signature = build_image_visual_signature(content)
+    downloaded_content = {}
+
+    def get_candidate_content(candidate):
+        candidate_id = clean_value(candidate.get("id"), blank_text="")
+        if candidate_id not in downloaded_content:
+            downloaded_content[candidate_id] = download_onedrive_file(
+                access_token,
+                candidate_id,
+            )
+        return downloaded_content[candidate_id]
+
+    raw_matches = []
+    normalized_matches = []
+    visual_matches = []
+
+    for candidate in candidates:
         try:
             candidate_size = int(candidate.get("size") or 0)
         except Exception:
             candidate_size = 0
-        if candidate_size != uploaded_size:
-            continue
-
-        parent_reference = candidate.get("parentReference") or {}
-        parent_path = normalize_onedrive_item_path(parent_reference.get("path"))
-        if not (
-            parent_path == camera_roll_path
-            or parent_path.startswith(camera_roll_path + "/")
-        ):
-            continue
-
-        candidate_id = clean_value(candidate.get("id"), blank_text="")
-        source_parent_id = clean_value(parent_reference.get("id"), blank_text="")
-        if not candidate_id or not source_parent_id:
-            continue
-
         hashes = ((candidate.get("file") or {}).get("hashes") or {})
         candidate_sha1 = clean_value(hashes.get("sha1Hash"), blank_text="").upper()
-        if candidate_sha1:
-            if candidate_sha1 != uploaded_sha1:
-                continue
-        else:
-            try:
-                candidate_content = download_onedrive_file(access_token, candidate_id)
-            except Exception:
-                continue
-            if hashlib.sha256(candidate_content).digest() != hashlib.sha256(content).digest():
-                continue
 
-        exact_matches.append(candidate)
+        # 最も強い判定：容量とファイルハッシュが完全一致。
+        if candidate_size == uploaded_size and candidate_sha1 == uploaded_sha1:
+            raw_matches.append(candidate)
+            continue
 
-    if not exact_matches:
-        raise RuntimeError(
-            "OneDriveのカメラバックアップに同じ写真がまだ見つかりません。"
-            "スマホのOneDriveでバックアップ完了を確認してから、もう一度保存してください。"
-            "二重保存を防ぐため、新しいコピーは作成していません。"
-        )
-    if len(exact_matches) > 1:
-        raise RuntimeError(
-            "OneDriveのカメラバックアップに同じ写真が複数見つかったため、"
-            "誤った写真を移動しないよう保存を停止しました。"
-        )
-    return exact_matches[0]
+        try:
+            candidate_content = get_candidate_content(candidate)
+        except Exception:
+            continue
+
+        if candidate_size == uploaded_size and hashlib.sha256(candidate_content).digest() == uploaded_sha256:
+            raw_matches.append(candidate)
+            continue
+
+        # EXIFなどの付帯情報だけが違う場合は、画像本体のバイト列で一致させる。
+        candidate_normalized_sha256 = hashlib.sha256(
+            normalize_image_content_for_comparison(candidate_content)
+        ).digest()
+        if candidate_normalized_sha256 == uploaded_normalized_sha256:
+            normalized_matches.append(candidate)
+            continue
+
+        # スマホのファイル選択時にJPEGが再圧縮された場合は、縮小画素を厳密に比較する。
+        if uploaded_visual_signature is not None:
+            candidate_visual_signature = build_image_visual_signature(candidate_content)
+            if image_visual_signatures_match(
+                uploaded_visual_signature,
+                candidate_visual_signature,
+            ):
+                visual_matches.append(candidate)
+
+    for match_level, matches in (
+        ("完全一致", raw_matches),
+        ("画像本体一致", normalized_matches),
+        ("画素一致", visual_matches),
+    ):
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            raise RuntimeError(
+                f"OneDriveの写真バックアップに同じ写真が複数見つかりました（{match_level}）。"
+                "誤った写真を移動しないよう保存を停止しました。"
+            )
+
+    raise RuntimeError(
+        "OneDriveの写真バックアップに同じ写真がまだ見つかりません。"
+        "スマホのOneDriveでバックアップ完了を確認してから、もう一度保存してください。"
+        "二重保存を防ぐため、新しいコピーは作成していません。"
+    )
 
 
 def move_onedrive_item(access_token, item_id, parent_id, filename):
