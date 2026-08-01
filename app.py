@@ -5853,17 +5853,8 @@ def update_workbook_bytes(original_content, customer_name, product_name, propose
             # 既存データで本数またはkg/本が数値でない場合は、従来どおり他項目の保存を続ける。
             pass
 
-        customer_ws = workbook[SHEET_NAME]
-        customer_rows = find_sheet1_customer_rows(workbook, customer_name)
-        if not customer_rows:
-            raise ValueError("Sheet1のB列数式が参照する顧客名に一致する行が見つかりません。")
-        for row in customer_rows:
-            for label, column in {"住所": SHEET1_ADDRESS_COLUMN, "マップ位置": SHEET1_MAP_COLUMN}.items():
-                cell = customer_ws.cell(row, column)
-                new_value = proposed[label]
-                if not same_excel_value(cell.value, new_value):
-                    cell.value = new_value
-                    changed_cells.append((SHEET_NAME, row, column, new_value))
+        # 商品・在庫の保存では住所とマップ位置を変更しない。
+        # 住所・マップ位置は専用の編集処理だけで保存する。
 
         if not changed_cells:
             raise ValueError("変更された項目がありません。")
@@ -11936,8 +11927,6 @@ def render_customer_excel_editor(customer_name, product_name, current):
                     parse_optional_date(delivery_date)
                     if str(delivery_date).strip() else current.get("配達日")
                 ),
-                "住所": current.get("住所"),
-                "マップ位置": current.get("マップ位置"),
             }
             changes = {
                 label: (current.get(label), proposed[label])
