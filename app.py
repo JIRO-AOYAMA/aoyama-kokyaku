@@ -4693,6 +4693,36 @@ st.markdown(
         overflow-wrap: anywhere;
     }
 
+
+    /* 顧客・仕入先・運送会社の詳細へ移動する名前リンクだけをカード表示にする。 */
+    a.entity-select-card-link:not(.app-nav-link):not(.customer-directory-item) {
+        display: inline-flex;
+        align-items: center;
+        max-width: 100%;
+        box-sizing: border-box;
+        padding: 0.3rem 0.58rem;
+        margin: 0.08rem 0;
+        border: 1px solid rgba(15, 23, 42, 0.12);
+        border-radius: 10px;
+        background: rgba(255, 255, 255, 0.96);
+        color: #2563eb !important;
+        box-shadow: 0 3px 10px rgba(15, 23, 42, 0.06);
+        line-height: 1.35;
+        overflow-wrap: anywhere;
+        white-space: normal;
+        text-decoration: none !important;
+        transition: border-color 0.14s ease, background 0.14s ease, box-shadow 0.14s ease;
+    }
+    a.entity-select-card-link:not(.app-nav-link):not(.customer-directory-item):hover {
+        border-color: rgba(37, 99, 235, 0.38);
+        background: #eff6ff;
+        box-shadow: 0 6px 16px rgba(37, 99, 235, 0.10);
+        text-decoration: none !important;
+    }
+    .dispatch-name a.entity-select-card-link {
+        width: 100%;
+    }
+
     .stTextInput input {
         border-radius: 14px !important;
         border: 1px solid rgba(15, 23, 42, 0.13) !important;
@@ -11652,6 +11682,8 @@ def render_page_link(
         partner_type=partner_type,
         partner_search=partner_search,
     )
+    if page in {"detail", "partner_detail"}:
+        class_name = f"{class_name} entity-select-card-link".strip()
     return f'<a class="{class_name}" href="{url}" target="_self">{html.escape(str(label))}</a>'
 
 def sync_page_from_query_params():
@@ -13283,6 +13315,7 @@ def build_customer_detail_link(customer_name, label=None, class_name="dispatch-m
 
     link_label = label or customer
     url = make_app_url(page="detail", customer=customer)
+    class_name = f"{class_name} entity-select-card-link".strip()
     return f'<a class="{class_name}" href="{url}" target="_self">{escape_html(link_label)}</a>'
 
 
