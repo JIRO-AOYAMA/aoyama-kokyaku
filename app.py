@@ -18914,7 +18914,7 @@ def show_top_home():
         st.markdown(render_page_link("📝 メモ帳", page="trade_notes"), unsafe_allow_html=True)
     col5, col6 = st.columns(2)
     with col5:
-        st.markdown(render_page_link("🔎 写真・資料検索", page="attachment_search"), unsafe_allow_html=True)
+        st.markdown(render_page_link("🔎 写真・PDF検索", page="attachment_search"), unsafe_allow_html=True)
     with col6:
         st.markdown(render_page_link("🕘 配車変更確認", page="change_history"), unsafe_allow_html=True)
     col7, col8 = st.columns(2)
