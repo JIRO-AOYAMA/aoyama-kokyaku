@@ -18584,7 +18584,7 @@ def render_trade_note_card(note, category, partner_names=None):
 
 def show_trade_notes_page():
     show_top_home_link()
-    st.header("📝 取引先メモ")
+    st.header("📝 メモ帳")
     show_note_delete_success_message()
     notes = load_notes_from_supabase()
     try:
@@ -18878,7 +18878,7 @@ def show_top_home():
     with col3:
         st.markdown(render_page_link("🚚 運送会社", page="carrier_home"), unsafe_allow_html=True)
     with col4:
-        st.markdown(render_page_link("📝 取引先メモ", page="trade_notes"), unsafe_allow_html=True)
+        st.markdown(render_page_link("📝 メモ帳", page="trade_notes"), unsafe_allow_html=True)
     col5, col6 = st.columns(2)
     with col5:
         st.markdown(render_page_link("🔎 写真・資料検索", page="attachment_search"), unsafe_allow_html=True)
@@ -19593,7 +19593,7 @@ with st.sidebar:
     st.markdown(render_page_link("👥 顧客", page="customer_home"), unsafe_allow_html=True)
     st.markdown(render_page_link("🏢 仕入先", page="supplier_home"), unsafe_allow_html=True)
     st.markdown(render_page_link("🚚 運送会社", page="carrier_home"), unsafe_allow_html=True)
-    st.markdown(render_page_link("📝 取引先メモ", page="trade_notes"), unsafe_allow_html=True)
+    st.markdown(render_page_link("📝 メモ帳", page="trade_notes"), unsafe_allow_html=True)
 
     if current_page in customer_pages:
         st.markdown("---")
