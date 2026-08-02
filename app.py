@@ -286,7 +286,8 @@ MAP_LOCATION_COLUMN_CANDIDATES = [
 HOTEL_INFORMATION_STORAGE_CUSTOMER = "__HOTEL_STAY_INFORMATION__"
 HOTEL_INFORMATION_FIELD_PREFIX = "__hotel_stay_information__:"
 HOTEL_INFORMATION_VERSION = 1
-HOTEL_INFORMATION_REQUIRED_FIELDS = ("ホテル名", "住所", "Googleマップ")
+HOTEL_INFORMATION_REQUIRED_FIELDS = ("ホテル名",)
+HOTEL_INFORMATION_FIXED_FIELDS = ("ホテル名", "地域", "住所", "Googleマップ")
 
 
 # =========================
@@ -360,6 +361,7 @@ ONEDRIVE_ROOT_FOLDER = "取引先カルテ"
 ONEDRIVE_CUSTOMER_FOLDER = "顧客"
 ONEDRIVE_SUPPLIER_FOLDER = "仕入先"
 ONEDRIVE_CARRIER_FOLDER = "運送会社"
+ONEDRIVE_HOTEL_FOLDER = "ホテル"
 ONEDRIVE_ATTACHMENT_PREFIX = "__onedrive_attachment__:"
 ONEDRIVE_ATTACHMENT_VERSION = 1
 ONEDRIVE_FIXED_TAGS = ("設備", "名刺", "納品場所", "商品", "トラブル")
@@ -7544,7 +7546,7 @@ def normalize_hotel_custom_fields(values):
         normalized_name = field_name.casefold()
         if normalized_name in seen_names:
             continue
-        if field_name in HOTEL_INFORMATION_REQUIRED_FIELDS:
+        if field_name in HOTEL_INFORMATION_FIXED_FIELDS:
             continue
         seen_names.add(normalized_name)
         result.append({"name": field_name, "value": content})
@@ -7562,17 +7564,30 @@ def parse_hotel_information_item(item):
     if not isinstance(payload, dict):
         return None
     hotel_name = clean_value(payload.get("hotel_name"), blank_text="").strip()
+    region = clean_value(payload.get("region"), blank_text="").strip()
+    raw_custom_fields = payload.get("custom_fields")
+    # 地域が自由項目だった旧データは、表示を失わず新しい地域欄へ引き継ぐ。
+    if not region and isinstance(raw_custom_fields, list):
+        for field in raw_custom_fields:
+            if not isinstance(field, dict):
+                continue
+            if clean_value(field.get("name"), blank_text="").strip().casefold() != "地域".casefold():
+                continue
+            region = clean_value(field.get("value"), blank_text="").strip()
+            if region:
+                break
     address = clean_value(payload.get("address"), blank_text="").strip()
     google_map = clean_value(payload.get("google_map"), blank_text="").strip()
-    if not hotel_name or not address or not google_map:
+    if not hotel_name:
         return None
     return {
         "id": clean_value(item.get("id"), blank_text=""),
         "field_name": clean_value(item.get("field_name"), blank_text=""),
         "hotel_name": hotel_name,
+        "region": region,
         "address": address,
         "google_map": google_map,
-        "custom_fields": normalize_hotel_custom_fields(payload.get("custom_fields")),
+        "custom_fields": normalize_hotel_custom_fields(raw_custom_fields),
         "created_at": clean_value(item.get("created_at"), blank_text=""),
         "updated_at": clean_value(item.get("updated_at"), blank_text=""),
     }
@@ -7593,11 +7608,12 @@ def load_hotel_information_records():
     return records
 
 
-def encode_hotel_information_content(hotel_name, address, google_map, custom_fields):
+def encode_hotel_information_content(hotel_name, region, address, google_map, custom_fields):
     return json.dumps(
         {
             "version": HOTEL_INFORMATION_VERSION,
             "hotel_name": str(hotel_name).strip(),
+            "region": str(region or "").strip(),
             "address": str(address).strip(),
             "google_map": str(google_map).strip(),
             "custom_fields": normalize_hotel_custom_fields(custom_fields),
@@ -7607,9 +7623,10 @@ def encode_hotel_information_content(hotel_name, address, google_map, custom_fie
     )
 
 
-def save_hotel_information_record(record, hotel_name, address, google_map, custom_fields):
+def save_hotel_information_record(record, hotel_name, region, address, google_map, custom_fields):
     content = encode_hotel_information_content(
         hotel_name,
+        region,
         address,
         google_map,
         custom_fields,
@@ -7647,6 +7664,7 @@ def show_hotel_information_editor_dialog(record=None):
     state_prefix = f"hotel_information_editor_{state_suffix}_"
     initialized_key = state_prefix + "initialized"
     hotel_name_key = state_prefix + "hotel_name"
+    region_key = state_prefix + "region"
     address_key = state_prefix + "address"
     google_map_key = state_prefix + "google_map"
     count_key = state_prefix + "custom_count"
@@ -7656,6 +7674,7 @@ def show_hotel_information_editor_dialog(record=None):
         st.session_state[hotel_name_key] = clean_value(
             record.get("hotel_name"), blank_text=""
         )
+        st.session_state[region_key] = clean_value(record.get("region"), blank_text="")
         st.session_state[address_key] = clean_value(record.get("address"), blank_text="")
         st.session_state[google_map_key] = clean_value(
             record.get("google_map"), blank_text=""
@@ -7666,11 +7685,16 @@ def show_hotel_information_editor_dialog(record=None):
             st.session_state[state_prefix + f"custom_value_{index}"] = field["value"]
         st.session_state[initialized_key] = True
 
-    st.caption("必須項目はホテル名・住所・Googleマップです。その他は自由に追加できます。")
+    st.caption("必須項目はホテル名だけです。住所・Googleマップやその他の項目は、あとから追加できます。")
     st.text_input("ホテル名（必須）", key=hotel_name_key)
-    st.text_area("住所（必須）", key=address_key, height=90)
     st.text_input(
-        "Googleマップ（必須）",
+        "地域（任意）",
+        key=region_key,
+        placeholder="例：札幌、帯広、名古屋",
+    )
+    st.text_area("住所（任意）", key=address_key, height=90)
+    st.text_input(
+        "Googleマップ（任意）",
         key=google_map_key,
         placeholder="共有URL・緯度経度・施設名のいずれでも入力できます",
     )
@@ -7731,13 +7755,12 @@ def show_hotel_information_editor_dialog(record=None):
         return
 
     hotel_name = str(st.session_state.get(hotel_name_key, "")).strip()
+    region = str(st.session_state.get(region_key, "")).strip()
     address = str(st.session_state.get(address_key, "")).strip()
     google_map = str(st.session_state.get(google_map_key, "")).strip()
     missing = [
         label for label, value in (
             ("ホテル名", hotel_name),
-            ("住所", address),
-            ("Googleマップ", google_map),
         ) if not value
     ]
     if missing:
@@ -7758,8 +7781,8 @@ def show_hotel_information_editor_dialog(record=None):
         if not field_name or not value:
             st.error(f"自由項目 {index + 1}は、項目名と内容の両方を入力してください。")
             return
-        if field_name in HOTEL_INFORMATION_REQUIRED_FIELDS:
-            st.error(f"「{field_name}」は上の必須項目にあるため、自由項目には登録できません。")
+        if field_name in HOTEL_INFORMATION_FIXED_FIELDS:
+            st.error(f"「{field_name}」は上の固定項目にあるため、自由項目には登録できません。")
             return
         normalized_name = field_name.casefold()
         if normalized_name in custom_names:
@@ -7772,6 +7795,7 @@ def show_hotel_information_editor_dialog(record=None):
         message = save_hotel_information_record(
             record,
             hotel_name,
+            region,
             address,
             google_map,
             custom_fields,
@@ -7828,7 +7852,7 @@ def render_hotel_information_field(field_name, content):
 
 def show_hotel_information_page():
     st.header("🏨 ホテル・宿泊先情報")
-    st.caption("ホテル名・住所・Googleマップは必須です。その他の項目は自由に追加できます。")
+    st.caption("ホテル名だけ必須です。住所・Googleマップやその他の項目は、あとから追加できます。")
 
     if not has_supabase_config():
         st.warning("ホテル・宿泊先情報を使うには、現在のSupabase設定が必要です。")
@@ -7857,17 +7881,62 @@ def show_hotel_information_page():
         st.info("ホテル・宿泊先情報はまだありません。")
         return
 
+    query_param = clean_value(
+        get_query_value("hotel_search", ""),
+        blank_text="",
+    ).strip()
+    query_key = "hotel_information_search"
+    query_source_key = "hotel_information_search_source"
+    if query_param and st.session_state.get(query_source_key) != query_param:
+        st.session_state[query_key] = query_param
+        st.session_state[query_source_key] = query_param
+    query = st.text_input(
+        "ホテル名・地域を検索",
+        key=query_key,
+        placeholder="ホテル名または地域の一部を入力",
+    )
+    normalized_query = clean_value(query, blank_text="").strip().casefold()
+    query_terms = [
+        term for term in re.split(r"[\s　]+", normalized_query) if term
+    ]
+    filtered_records = []
     for record in records:
+        searchable = " ".join(
+            [
+                clean_value(record.get("hotel_name"), blank_text=""),
+                clean_value(record.get("region"), blank_text=""),
+                clean_value(record.get("address"), blank_text=""),
+            ]
+        ).casefold()
+        if query_terms and not all(term in searchable for term in query_terms):
+            continue
+        filtered_records.append(record)
+
+    st.caption(f"該当：{len(filtered_records)}件")
+    if not filtered_records:
+        st.info("ホテル名・地域に一致する宿泊先はありません。")
+        return
+
+    for record in filtered_records:
         record_id = clean_value(record.get("id"), blank_text="")
         card_suffix = hashlib.sha256(record_id.encode("utf-8")).hexdigest()[:16]
         with st.container(border=True, key=f"hotel_information_card_{card_suffix}"):
             st.subheader(f"🏨 {record['hotel_name']}")
+            if clean_value(record.get("region"), blank_text="").strip():
+                render_hotel_information_field("地域", record["region"])
             render_hotel_information_field("住所", record["address"])
             show_google_maps_button(
                 build_google_maps_url(record.get("google_map") or record.get("address"))
             )
             for field in record.get("custom_fields", []):
                 render_hotel_information_field(field["name"], field["value"])
+
+            # 顧客・仕入先・運送会社と同じOneDrive/Supabaseのルールで管理する。
+            render_customer_attachments_section(
+                record["hotel_name"],
+                record_id,
+                entity_type="hotel",
+            )
 
             edit_col, delete_col = st.columns(2)
             with edit_col:
@@ -7919,7 +7988,7 @@ def normalize_attachment_tags(values):
 
 def normalize_attachment_entity_type(value):
     text = clean_value(value, blank_text="").strip().lower()
-    return text if text in {"customer", "supplier", "carrier"} else "customer"
+    return text if text in {"customer", "supplier", "carrier", "hotel"} else "customer"
 
 
 def attachment_entity_label(entity_type):
@@ -7927,6 +7996,7 @@ def attachment_entity_label(entity_type):
         "customer": "顧客",
         "supplier": "仕入先",
         "carrier": "運送会社",
+        "hotel": "ホテル",
     }[normalize_attachment_entity_type(entity_type)]
 
 
@@ -7935,6 +8005,7 @@ def attachment_entity_folder(entity_type):
         "customer": ONEDRIVE_CUSTOMER_FOLDER,
         "supplier": ONEDRIVE_SUPPLIER_FOLDER,
         "carrier": ONEDRIVE_CARRIER_FOLDER,
+        "hotel": ONEDRIVE_HOTEL_FOLDER,
     }[normalize_attachment_entity_type(entity_type)]
 
 
@@ -8630,6 +8701,8 @@ def build_attachment_onedrive_sign_in_url(entity_type, entity_id, entity_name):
     entity_type = normalize_attachment_entity_type(entity_type)
     if entity_type == "customer":
         return build_onedrive_sign_in_url("detail", entity_name)
+    if entity_type == "hotel":
+        return build_onedrive_sign_in_url("hotel_information")
     return build_onedrive_sign_in_url(
         "partner_detail",
         partner_id=entity_id,
@@ -9280,9 +9353,9 @@ def render_customer_attachments_section(
 
 
 def show_attachment_search_page():
-    """顧客・仕入先・運送会社の写真・資料を横断検索する。"""
+    """顧客・仕入先・運送会社・ホテルの写真・資料を横断検索する。"""
     st.header("🔎 写真・資料検索")
-    st.caption("顧客・仕入先・運送会社の写真・PDFを検索します。タグ欄は文字を入力すると過去の候補が絞り込まれます。")
+    st.caption("顧客・仕入先・運送会社・ホテルの写真・PDFを検索します。タグ欄は文字を入力すると過去の候補が絞り込まれます。")
 
     clicked_tag = clean_value(
         get_query_value("attachment_tag", ""),
@@ -9326,7 +9399,7 @@ def show_attachment_search_page():
         )
     entity_filter = st.selectbox(
         "取引先種別",
-        ["すべて", "顧客", "仕入先", "運送会社"],
+        ["すべて", "顧客", "仕入先", "運送会社", "ホテル"],
         key="attachment_global_entity_filter",
     )
     type_filter = st.selectbox(
@@ -9534,6 +9607,11 @@ def show_attachment_search_page():
 
                 if entity_type == "customer":
                     entity_url = make_app_url(page="detail", customer=entity_name)
+                elif entity_type == "hotel":
+                    entity_url = make_app_url(
+                        page="hotel_information",
+                        hotel_search=entity_name,
+                    )
                 else:
                     entity_url = make_app_url(
                         page="partner_detail",
@@ -12038,6 +12116,7 @@ def make_app_url(
     partner_id=None,
     partner_type=None,
     partner_search=None,
+    hotel_search=None,
 ):
     """ブラウザの戻るボタンで戻れるように、通常リンク用URLを作る。"""
     params = {"page": page}
@@ -12055,6 +12134,8 @@ def make_app_url(
         params["partner_type"] = str(partner_type)
     if partner_search:
         params["partner_search"] = str(partner_search)
+    if hotel_search:
+        params["hotel_search"] = str(hotel_search)
     return "?" + urllib.parse.urlencode(params)
 
 
@@ -12068,6 +12149,7 @@ def render_page_link(
     partner_id=None,
     partner_type=None,
     partner_search=None,
+    hotel_search=None,
     class_name="app-nav-link",
 ):
     """st.buttonではなくHTMLリンクで画面遷移する。これによりブラウザ戻るが効く。"""
@@ -12080,6 +12162,7 @@ def render_page_link(
         partner_id=partner_id,
         partner_type=partner_type,
         partner_search=partner_search,
+        hotel_search=hotel_search,
     )
     if page in {"detail", "partner_detail"}:
         class_name = f"{class_name} entity-select-card-link".strip()
