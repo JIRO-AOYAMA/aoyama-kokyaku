@@ -280,6 +280,15 @@ MAP_LOCATION_COLUMN_CANDIDATES = [
 ]
 
 
+# ホテル・宿泊先情報は、既存のcustomer_informationテーブル内に
+# 通常の顧客情報と衝突しない内部レコードとして保存する。
+# 新しいSupabaseテーブルやSecretsは不要。
+HOTEL_INFORMATION_STORAGE_CUSTOMER = "__HOTEL_STAY_INFORMATION__"
+HOTEL_INFORMATION_FIELD_PREFIX = "__hotel_stay_information__:"
+HOTEL_INFORMATION_VERSION = 1
+HOTEL_INFORMATION_REQUIRED_FIELDS = ("ホテル名", "住所", "Googleマップ")
+
+
 # =========================
 # WATER it接続（読み取り専用）
 # =========================
@@ -4600,6 +4609,22 @@ st.markdown(
         background: linear-gradient(180deg, #ffffff 0%, #eff6ff 100%);
     }
 
+
+    /* ホーム画面のホテル・宿泊先情報だけを、横幅いっぱいの長いカードにする。 */
+    .hotel-home-card-link {
+        min-height: 4.5rem;
+        justify-content: flex-start;
+        padding-left: 1.25rem;
+        font-size: 1.08rem;
+        background: linear-gradient(135deg, #ffffff 0%, #fff7ed 100%);
+        border-color: rgba(234, 88, 12, 0.18);
+    }
+    .hotel-home-card-link:hover {
+        border-color: rgba(234, 88, 12, 0.36);
+        background: linear-gradient(135deg, #ffffff 0%, #ffedd5 100%);
+        box-shadow: 0 14px 32px rgba(234, 88, 12, 0.12);
+    }
+
     [data-testid="stSidebar"] .app-nav-link {
         justify-content: flex-start;
         min-height: 2.9rem;
@@ -7488,6 +7513,380 @@ def delete_customer_information(item_id):
         raise RuntimeError("顧客情報の削除中にSupabaseへ接続できませんでした。") from exc
     check_customer_information_response("削除", response, (200, 204))
     clear_customer_information_cache()
+
+
+# =========================
+# ホテル・宿泊先情報（Supabase保存）
+# =========================
+def make_hotel_information_field_name():
+    return HOTEL_INFORMATION_FIELD_PREFIX + uuid.uuid4().hex
+
+
+def is_hotel_information_item(item):
+    return clean_value(item.get("field_name"), blank_text="").startswith(
+        HOTEL_INFORMATION_FIELD_PREFIX
+    )
+
+
+def normalize_hotel_custom_fields(values):
+    """自由項目を、項目名と内容を持つ安定したリストへ整形する。"""
+    result = []
+    if not isinstance(values, list):
+        return result
+    seen_names = set()
+    for value in values:
+        if not isinstance(value, dict):
+            continue
+        field_name = clean_value(value.get("name"), blank_text="").strip()
+        content = clean_value(value.get("value"), blank_text="").strip()
+        if not field_name or not content:
+            continue
+        normalized_name = field_name.casefold()
+        if normalized_name in seen_names:
+            continue
+        if field_name in HOTEL_INFORMATION_REQUIRED_FIELDS:
+            continue
+        seen_names.add(normalized_name)
+        result.append({"name": field_name, "value": content})
+    return result
+
+
+def parse_hotel_information_item(item):
+    """customer_informationの内部レコードをホテル表示用へ変換する。"""
+    if not isinstance(item, dict) or not is_hotel_information_item(item):
+        return None
+    try:
+        payload = json.loads(str(item.get("content") or "{}"))
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    hotel_name = clean_value(payload.get("hotel_name"), blank_text="").strip()
+    address = clean_value(payload.get("address"), blank_text="").strip()
+    google_map = clean_value(payload.get("google_map"), blank_text="").strip()
+    if not hotel_name or not address or not google_map:
+        return None
+    return {
+        "id": clean_value(item.get("id"), blank_text=""),
+        "field_name": clean_value(item.get("field_name"), blank_text=""),
+        "hotel_name": hotel_name,
+        "address": address,
+        "google_map": google_map,
+        "custom_fields": normalize_hotel_custom_fields(payload.get("custom_fields")),
+        "created_at": clean_value(item.get("created_at"), blank_text=""),
+        "updated_at": clean_value(item.get("updated_at"), blank_text=""),
+    }
+
+
+def load_hotel_information_records():
+    """ホテル情報だけを新しい順に読み込む。"""
+    items = load_customer_information(HOTEL_INFORMATION_STORAGE_CUSTOMER)
+    records = []
+    for item in items:
+        parsed = parse_hotel_information_item(item)
+        if parsed is not None:
+            records.append(parsed)
+    records.sort(
+        key=lambda record: str(record.get("updated_at") or record.get("created_at") or ""),
+        reverse=True,
+    )
+    return records
+
+
+def encode_hotel_information_content(hotel_name, address, google_map, custom_fields):
+    return json.dumps(
+        {
+            "version": HOTEL_INFORMATION_VERSION,
+            "hotel_name": str(hotel_name).strip(),
+            "address": str(address).strip(),
+            "google_map": str(google_map).strip(),
+            "custom_fields": normalize_hotel_custom_fields(custom_fields),
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+
+def save_hotel_information_record(record, hotel_name, address, google_map, custom_fields):
+    content = encode_hotel_information_content(
+        hotel_name,
+        address,
+        google_map,
+        custom_fields,
+    )
+    record = record if isinstance(record, dict) else {}
+    item_id = clean_value(record.get("id"), blank_text="")
+    field_name = clean_value(record.get("field_name"), blank_text="")
+    if item_id and field_name:
+        update_customer_information(item_id, field_name, content)
+        return "ホテル情報を更新しました。"
+    insert_customer_information(
+        HOTEL_INFORMATION_STORAGE_CUSTOMER,
+        None,
+        make_hotel_information_field_name(),
+        content,
+        0,
+    )
+    return "ホテル情報を追加しました。"
+
+
+def clear_hotel_information_editor_state(state_prefix):
+    keys = [
+        key for key in list(st.session_state.keys())
+        if str(key).startswith(state_prefix)
+    ]
+    for key in keys:
+        st.session_state.pop(key, None)
+
+
+@st.dialog("ホテル・宿泊先情報")
+def show_hotel_information_editor_dialog(record=None):
+    record = record if isinstance(record, dict) else {}
+    item_id = clean_value(record.get("id"), blank_text="")
+    state_suffix = item_id or "new"
+    state_prefix = f"hotel_information_editor_{state_suffix}_"
+    initialized_key = state_prefix + "initialized"
+    hotel_name_key = state_prefix + "hotel_name"
+    address_key = state_prefix + "address"
+    google_map_key = state_prefix + "google_map"
+    count_key = state_prefix + "custom_count"
+
+    if not st.session_state.get(initialized_key):
+        custom_fields = normalize_hotel_custom_fields(record.get("custom_fields"))
+        st.session_state[hotel_name_key] = clean_value(
+            record.get("hotel_name"), blank_text=""
+        )
+        st.session_state[address_key] = clean_value(record.get("address"), blank_text="")
+        st.session_state[google_map_key] = clean_value(
+            record.get("google_map"), blank_text=""
+        )
+        st.session_state[count_key] = max(1, len(custom_fields))
+        for index, field in enumerate(custom_fields):
+            st.session_state[state_prefix + f"custom_name_{index}"] = field["name"]
+            st.session_state[state_prefix + f"custom_value_{index}"] = field["value"]
+        st.session_state[initialized_key] = True
+
+    st.caption("必須項目はホテル名・住所・Googleマップです。その他は自由に追加できます。")
+    st.text_input("ホテル名（必須）", key=hotel_name_key)
+    st.text_area("住所（必須）", key=address_key, height=90)
+    st.text_input(
+        "Googleマップ（必須）",
+        key=google_map_key,
+        placeholder="共有URL・緯度経度・施設名のいずれでも入力できます",
+    )
+
+    st.markdown("#### 自由項目")
+    if st.button(
+        "＋ 自由項目を追加",
+        key=state_prefix + "add_custom_field",
+        use_container_width=True,
+    ):
+        current_count = max(1, int(st.session_state.get(count_key, 1)))
+        st.session_state[state_prefix + f"custom_name_{current_count}"] = ""
+        st.session_state[state_prefix + f"custom_value_{current_count}"] = ""
+        st.session_state[count_key] = current_count + 1
+
+    custom_count = max(1, int(st.session_state.get(count_key, 1)))
+    for index in range(custom_count):
+        name_key = state_prefix + f"custom_name_{index}"
+        value_key = state_prefix + f"custom_value_{index}"
+        if name_key not in st.session_state:
+            st.session_state[name_key] = ""
+        if value_key not in st.session_state:
+            st.session_state[value_key] = ""
+        with st.container(border=True):
+            st.text_input(
+                f"自由項目 {index + 1}：項目名",
+                key=name_key,
+                placeholder="例：バイク駐車場",
+            )
+            st.text_area(
+                f"自由項目 {index + 1}：内容",
+                key=value_key,
+                placeholder="例：屋根付き・大型可・1泊500円・事前連絡必要",
+                height=90,
+            )
+    st.caption("自由項目を削除するときは、その項目名と内容を両方空欄にして保存してください。")
+
+    save_col, cancel_col = st.columns(2)
+    with save_col:
+        save_clicked = st.button(
+            "保存",
+            key=state_prefix + "save",
+            type="primary",
+            use_container_width=True,
+        )
+    with cancel_col:
+        cancel_clicked = st.button(
+            "キャンセル",
+            key=state_prefix + "cancel",
+            use_container_width=True,
+        )
+
+    if cancel_clicked:
+        clear_hotel_information_editor_state(state_prefix)
+        st.rerun()
+
+    if not save_clicked:
+        return
+
+    hotel_name = str(st.session_state.get(hotel_name_key, "")).strip()
+    address = str(st.session_state.get(address_key, "")).strip()
+    google_map = str(st.session_state.get(google_map_key, "")).strip()
+    missing = [
+        label for label, value in (
+            ("ホテル名", hotel_name),
+            ("住所", address),
+            ("Googleマップ", google_map),
+        ) if not value
+    ]
+    if missing:
+        st.error("必須項目を入力してください：" + "、".join(missing))
+        return
+
+    custom_fields = []
+    custom_names = set()
+    for index in range(custom_count):
+        field_name = str(
+            st.session_state.get(state_prefix + f"custom_name_{index}", "")
+        ).strip()
+        value = str(
+            st.session_state.get(state_prefix + f"custom_value_{index}", "")
+        ).strip()
+        if not field_name and not value:
+            continue
+        if not field_name or not value:
+            st.error(f"自由項目 {index + 1}は、項目名と内容の両方を入力してください。")
+            return
+        if field_name in HOTEL_INFORMATION_REQUIRED_FIELDS:
+            st.error(f"「{field_name}」は上の必須項目にあるため、自由項目には登録できません。")
+            return
+        normalized_name = field_name.casefold()
+        if normalized_name in custom_names:
+            st.error(f"自由項目「{field_name}」が重複しています。")
+            return
+        custom_names.add(normalized_name)
+        custom_fields.append({"name": field_name, "value": value})
+
+    try:
+        message = save_hotel_information_record(
+            record,
+            hotel_name,
+            address,
+            google_map,
+            custom_fields,
+        )
+        clear_hotel_information_editor_state(state_prefix)
+        st.session_state["hotel_information_message"] = message
+        st.rerun()
+    except Exception as exc:
+        st.error(str(exc))
+
+
+@st.dialog("ホテル情報を削除")
+def confirm_hotel_information_delete_dialog(record):
+    hotel_name = clean_value(record.get("hotel_name"), blank_text="ホテル")
+    item_id = clean_value(record.get("id"), blank_text="")
+    st.warning(f"「{hotel_name}」を削除します。")
+    st.caption("この操作は元に戻せません。")
+    delete_col, cancel_col = st.columns(2)
+    with delete_col:
+        if st.button(
+            "削除する",
+            key=f"hotel_information_delete_yes_{item_id}",
+            type="primary",
+            use_container_width=True,
+        ):
+            try:
+                delete_customer_information(item_id)
+                st.session_state["hotel_information_message"] = "ホテル情報を削除しました。"
+                st.rerun()
+            except Exception as exc:
+                st.error(str(exc))
+    with cancel_col:
+        if st.button(
+            "キャンセル",
+            key=f"hotel_information_delete_no_{item_id}",
+            use_container_width=True,
+        ):
+            st.rerun()
+
+
+def render_hotel_information_field(field_name, content):
+    safe_name = html.escape(clean_value(field_name, blank_text=""))
+    safe_content = html.escape(clean_value(content, blank_text="")).replace("\n", "<br>")
+    st.markdown(
+        (
+            '<div class="customer-information-row">'
+            f'<div class="customer-information-label">{safe_name}</div>'
+            f'<div class="customer-information-content">{safe_content}</div>'
+            '</div>'
+        ),
+        unsafe_allow_html=True,
+    )
+
+
+def show_hotel_information_page():
+    st.header("🏨 ホテル・宿泊先情報")
+    st.caption("ホテル名・住所・Googleマップは必須です。その他の項目は自由に追加できます。")
+
+    if not has_supabase_config():
+        st.warning("ホテル・宿泊先情報を使うには、現在のSupabase設定が必要です。")
+        return
+
+    if st.button(
+        "＋ ホテルを追加",
+        key="hotel_information_add_button",
+        type="primary",
+        use_container_width=True,
+    ):
+        clear_hotel_information_editor_state("hotel_information_editor_new_")
+        show_hotel_information_editor_dialog()
+
+    message = st.session_state.pop("hotel_information_message", None)
+    if message:
+        st.success(message)
+
+    try:
+        records = load_hotel_information_records()
+    except Exception as exc:
+        st.error(str(exc))
+        return
+
+    if not records:
+        st.info("ホテル・宿泊先情報はまだありません。")
+        return
+
+    for record in records:
+        record_id = clean_value(record.get("id"), blank_text="")
+        card_suffix = hashlib.sha256(record_id.encode("utf-8")).hexdigest()[:16]
+        with st.container(border=True, key=f"hotel_information_card_{card_suffix}"):
+            st.subheader(f"🏨 {record['hotel_name']}")
+            render_hotel_information_field("住所", record["address"])
+            show_google_maps_button(
+                build_google_maps_url(record.get("google_map") or record.get("address"))
+            )
+            for field in record.get("custom_fields", []):
+                render_hotel_information_field(field["name"], field["value"])
+
+            edit_col, delete_col = st.columns(2)
+            with edit_col:
+                if st.button(
+                    "編集",
+                    key=f"hotel_information_edit_{record_id}",
+                    use_container_width=True,
+                ):
+                    clear_hotel_information_editor_state(
+                        f"hotel_information_editor_{record_id}_"
+                    )
+                    show_hotel_information_editor_dialog(record)
+            with delete_col:
+                if st.button(
+                    "削除",
+                    key=f"hotel_information_delete_{record_id}",
+                    use_container_width=True,
+                ):
+                    confirm_hotel_information_delete_dialog(record)
 
 
 def make_onedrive_attachment_field_name():
@@ -11706,6 +12105,7 @@ def sync_page_from_query_params():
         "water_it_test",
         "notes",
         "trade_notes",
+        "hotel_information",
         "detail",
         "supplier_home",
         "supplier_list",
@@ -18927,6 +19327,15 @@ def show_top_home():
             label += f"（未確認 {alert_count}）"
         st.markdown(render_page_link(label, page="login_history"), unsafe_allow_html=True)
 
+    st.markdown(
+        render_page_link(
+            "🏨 ホテル・宿泊先情報",
+            page="hotel_information",
+            class_name="app-nav-link hotel-home-card-link",
+        ),
+        unsafe_allow_html=True,
+    )
+
     render_home_todo_section()
 
 
@@ -19774,6 +20183,9 @@ try:
 
     elif st.session_state["page"] == "trade_notes":
         show_trade_notes_page()
+
+    elif st.session_state["page"] == "hotel_information":
+        show_hotel_information_page()
 
     elif st.session_state["page"] == "change_history":
         show_change_history_page()
