@@ -7891,9 +7891,9 @@ def show_hotel_information_page():
         st.session_state[query_key] = query_param
         st.session_state[query_source_key] = query_param
     query = st.text_input(
-        "ホテル名・地域を検索",
+        "ホテル名・地域・住所・自由項目を検索",
         key=query_key,
-        placeholder="ホテル名または地域の一部を入力",
+        placeholder="ホテル名・地域・住所・項目名・内容の一部を入力",
     )
     normalized_query = clean_value(query, blank_text="").strip().casefold()
     query_terms = [
@@ -7901,11 +7901,22 @@ def show_hotel_information_page():
     ]
     filtered_records = []
     for record in records:
+        custom_field_search_values = []
+        for field in record.get("custom_fields", []):
+            if not isinstance(field, dict):
+                continue
+            custom_field_search_values.extend(
+                [
+                    clean_value(field.get("name"), blank_text=""),
+                    clean_value(field.get("value"), blank_text=""),
+                ]
+            )
         searchable = " ".join(
             [
                 clean_value(record.get("hotel_name"), blank_text=""),
                 clean_value(record.get("region"), blank_text=""),
                 clean_value(record.get("address"), blank_text=""),
+                *custom_field_search_values,
             ]
         ).casefold()
         if query_terms and not all(term in searchable for term in query_terms):
@@ -7914,7 +7925,7 @@ def show_hotel_information_page():
 
     st.caption(f"該当：{len(filtered_records)}件")
     if not filtered_records:
-        st.info("ホテル名・地域に一致する宿泊先はありません。")
+        st.info("検索条件に一致する宿泊先はありません。")
         return
 
     for record in filtered_records:
