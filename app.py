@@ -258,6 +258,9 @@ LOGIN_COOKIES = EncryptedCookieManager(
     password=LOGIN_TOKEN_SECRET or "__LOGIN_TOKEN_SECRET_NOT_CONFIGURED__",
 )
 if not LOGIN_COOKIES.ready():
+    st.warning("ログイン機能を準備しています。画面が進まない場合は、下のボタンを1回押してください。")
+    if st.button("ログイン画面を再読み込み", type="primary", key="retry_login_cookie_setup"):
+        st.rerun()
     st.stop()
 SUPABASE_URL = st.secrets.get("SUPABASE_URL", "")
 SUPABASE_SECRET_KEY = st.secrets.get("SUPABASE_SECRET_KEY", "")
