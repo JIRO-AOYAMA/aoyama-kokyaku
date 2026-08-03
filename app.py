@@ -78,7 +78,7 @@ FULL_DATA_BACKUP_DROPBOX_FOLDER = st.secrets.get(
 )
 DROPBOX_FAST_CACHE_FILE = "/1共有　青山商店　本社/配車表-北海道-/顧客検索キャッシュ.json"
 # Excelの列構成や読み込み処理を変更した時は、この番号を上げて古いJSONを無効化する。
-DROPBOX_FAST_CACHE_VERSION = 2
+DROPBOX_FAST_CACHE_VERSION = 3
 DISPATCH_DROPBOX_DEFAULT_FILE_PATH = "/1共有　青山商店　本社/配車表-次郎-/配車表1.xlsm"
 DISPATCH_DROPBOX_FILE_PATH = st.secrets.get(
     "DISPATCH_DROPBOX_FILE_PATH",
@@ -11781,10 +11781,11 @@ def render_customer_information_card(customer_name, customer_key=None):
 # =========================
 def calculate_delivery_values(delivery_row_values):
     """
-    最新の入力値から、次回配達予定と残数をアプリ表示用に計算する。
+    Excelの最新入力値から、次回配達予定と今日時点の残数をアプリ側で計算する。
 
-    Excel内の数式セルは変更しない。PCでExcelを編集した場合も、保存された
-    配達日・配達数量・使用数量/日などの最新入力値を読み、同じ計算を行う。
+    残数はExcelの残数セルや数式結果を参照せず、日本時間の今日を基準に、
+    配達数量－（配達日から今日までの経過日数×使用数量/日）をkg/本で割る。
+    計算結果が0未満の場合も、在庫不足が分かるようマイナスのまま返す。
     """
     def column_value(column_number):
         index = column_number - 1
@@ -11794,29 +11795,37 @@ def calculate_delivery_values(delivery_row_values):
     kg_per_bottle = column_value(9)
     delivery_date = column_value(10)
     stored_delivery_quantity = column_value(11)
-    remaining = column_value(15)
+
+    delivery_day = to_date(delivery_date)
+    next_delivery = None
+    remaining = None
+
+    try:
+        delivery_quantity = float(stored_delivery_quantity)
+        daily_usage = float(usage)
+        if not all(math.isfinite(value) for value in (delivery_quantity, daily_usage)):
+            raise ValueError("次回配達予定の計算に使用する数値が有限値ではありません。")
+        if daily_usage == 0:
+            raise ValueError("使用数量/日は0以外である必要があります。")
+    except Exception:
+        return None, None
 
     # ExcelのL列と同じく、K列「配達数量」を使って次回配達予定を計算する。
-    effective_delivery_quantity = stored_delivery_quantity
+    if delivery_day is not None:
+        next_delivery = delivery_day + timedelta(
+            days=math.floor(delivery_quantity / daily_usage)
+        )
 
-    next_delivery = None
-    try:
-        if delivery_date is not None:
-            next_delivery = delivery_date + timedelta(
-                days=math.floor(float(effective_delivery_quantity) / float(usage))
-            )
-    except Exception:
-        next_delivery = None
-
-    if isinstance(remaining, str) and remaining.startswith("="):
-        remaining = None
-
-    try:
-        if remaining is None and next_delivery is not None:
-            target_date = next_delivery.date() if isinstance(next_delivery, datetime) else next_delivery
-            remaining = (target_date - date.today()).days * float(usage) / float(kg_per_bottle)
-    except Exception:
-        remaining = None
+        try:
+            bottle_weight = float(kg_per_bottle)
+            if not math.isfinite(bottle_weight) or bottle_weight == 0:
+                raise ValueError("kg/本は0以外の有限値である必要があります。")
+            today = get_jst_now().date()
+            elapsed_days = (today - delivery_day).days
+            remaining_kg = delivery_quantity - (elapsed_days * daily_usage)
+            remaining = remaining_kg / bottle_weight
+        except Exception:
+            remaining = None
 
     return next_delivery, remaining
 
@@ -11923,6 +11932,7 @@ def rebuild_sheet1_from_formula_references(excel_source):
                     "本数": delivery_values[7] if len(delivery_values) >= 8 else None,
                     "kg/本": delivery_values[8] if len(delivery_values) >= 9 else None,
                     "配達日": delivery_values[9] if len(delivery_values) >= 10 else None,
+                    "_配達数量": delivery_values[10] if len(delivery_values) >= 11 else None,
                 }
             )
         return pd.DataFrame(rows)
@@ -12025,6 +12035,28 @@ def normalize_excel_table(excel_source):
     return df
 
 
+def recalculate_customer_inventory_for_today(df):
+    """表示用データの次回配達予定と残数を、日本時間の今日で再計算する。"""
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return df
+
+    required_columns = {"使用数量/日", "kg/本", "配達日", "_配達数量"}
+    if not required_columns.issubset(df.columns):
+        return df
+
+    recalculated = df.copy()
+    for index, row in recalculated.iterrows():
+        delivery_values = [None] * 11
+        delivery_values[6] = row.get("使用数量/日")
+        delivery_values[8] = row.get("kg/本")
+        delivery_values[9] = row.get("配達日")
+        delivery_values[10] = row.get("_配達数量")
+        next_delivery, remaining = calculate_delivery_values(delivery_values)
+        recalculated.at[index, "次回配達予定"] = next_delivery
+        recalculated.at[index, "残数"] = remaining
+    return recalculated
+
+
 @st.cache_data(ttl=60, show_spinner=False)
 def load_fast_dropbox_data():
     """通常表示は小さなJSONを使い、Excelが変わった時だけ再生成する。"""
@@ -12045,7 +12077,7 @@ def load_fast_dropbox_data():
             ):
                 records = payload.get("records", [])
                 if isinstance(records, list) and records:
-                    return pd.DataFrame(records)
+                    return recalculate_customer_inventory_for_today(pd.DataFrame(records))
         except Exception:
             pass
 
