@@ -12952,13 +12952,147 @@ def show_customer_directory(df=None):
 
 
 # =========================
+# 全ページ共通の顧客検索
+# =========================
+GLOBAL_CUSTOMER_SEARCH_RESULT_LIMIT = 10
+GLOBAL_CUSTOMER_SEARCH_ROUTE_KEY = "_global_customer_search_route"
+GLOBAL_CUSTOMER_SEARCH_LIVE_KEY = "global_customer_search_live"
+GLOBAL_CUSTOMER_SEARCH_INPUT_KEY = "global_customer_search_input"
+
+
+def normalize_customer_search_terms(keyword):
+    """顧客検索文字を、全角・半角スペース区切りのAND検索語へ整形する。"""
+    normalized = clean_value(keyword, blank_text="").strip().casefold()
+    return [term for term in re.split(r"[\s　]+", normalized) if term]
+
+
+def find_customer_search_candidates(df, keyword):
+    """顧客名・ひらがな・地域を対象に、全検索語を含む顧客を返す。"""
+    columns = ["顧客名", "ひらがな", "地域"]
+    if not isinstance(df, pd.DataFrame) or not set(columns).issubset(df.columns):
+        return pd.DataFrame(columns=columns)
+
+    terms = normalize_customer_search_terms(keyword)
+    if not terms:
+        return pd.DataFrame(columns=columns)
+
+    customers = df[columns].copy()
+    for column in columns:
+        customers[column] = customers[column].apply(
+            lambda value: clean_value(value, blank_text="").strip()
+        )
+    customers = customers[customers["顧客名"] != ""]
+    searchable = customers.apply(
+        lambda row: " ".join(
+            [row["顧客名"], row["ひらがな"], row["地域"]]
+        ).casefold(),
+        axis=1,
+    )
+    matched = customers[
+        searchable.apply(lambda value: all(term in value for term in terms))
+    ].drop_duplicates(
+        subset=["顧客名"],
+        keep="first",
+    )
+    return matched.reset_index(drop=True)
+
+
+def render_customer_search_candidate_cards(customers, limit=None):
+    """顧客検索候補を、顧客詳細へ直接移動できるカードで表示する。"""
+    visible = customers if limit is None else customers.head(int(limit))
+    parts = ['<div class="customer-directory">']
+    for _, row in visible.iterrows():
+        name = clean_value(row.get("顧客名"), blank_text="").strip()
+        if not name:
+            continue
+        region = clean_value(row.get("地域"), blank_text="未設定").strip() or "未設定"
+        url = html.escape(make_app_url(page="detail", customer=name), quote=True)
+        parts.append(
+            (
+                f'<a class="customer-directory-item" href="{url}" target="_self">'
+                f'<span class="customer-directory-name">{html.escape(name)}</span>'
+                f'<span class="customer-directory-meta">地域：{html.escape(region)}</span>'
+                '</a>'
+            )
+        )
+    parts.append("</div>")
+    st.markdown("".join(parts), unsafe_allow_html=True)
+
+
+def clear_global_customer_search_when_route_changes():
+    """別画面・別顧客へ移動した後は、共通検索欄を空に戻す。"""
+    route = (
+        st.session_state.get("page", "home"),
+        st.session_state.get("selected_customer"),
+        st.session_state.get("selected_partner_id"),
+        st.session_state.get("selected_partner_type"),
+    )
+    previous_route = st.session_state.get(GLOBAL_CUSTOMER_SEARCH_ROUTE_KEY)
+    if previous_route is not None and previous_route != route:
+        st.session_state.pop(GLOBAL_CUSTOMER_SEARCH_LIVE_KEY, None)
+        st.session_state.pop(GLOBAL_CUSTOMER_SEARCH_INPUT_KEY, None)
+    st.session_state[GLOBAL_CUSTOMER_SEARCH_ROUTE_KEY] = route
+
+
+def render_global_customer_search():
+    """どの機能ページからでも使える、入力欄常設型の顧客検索。"""
+    clear_global_customer_search_when_route_changes()
+
+    if st_keyup is not None:
+        keyword = str(
+            st_keyup(
+                "🔍 顧客名・ひらがな・地域で検索",
+                value="",
+                placeholder="例：三谷、みたに、帯広、帯広 牧場",
+                debounce=250,
+                key=GLOBAL_CUSTOMER_SEARCH_LIVE_KEY,
+            )
+            or ""
+        ).strip()
+    else:
+        keyword = st.text_input(
+            "🔍 顧客名・ひらがな・地域で検索",
+            value="",
+            placeholder="例：三谷、みたに、帯広、帯広 牧場",
+            key=GLOBAL_CUSTOMER_SEARCH_INPUT_KEY,
+            help=VOICE_INPUT_HELP,
+        ).strip()
+
+    if not keyword:
+        return
+
+    try:
+        with st.spinner("顧客を検索しています…"):
+            customers = find_customer_search_candidates(load_data(), keyword)
+    except Exception as exc:
+        st.warning(f"顧客検索を読み込めませんでした：{exc}")
+        return
+
+    if customers.empty:
+        st.warning("該当する顧客がありません。")
+        return
+
+    total = len(customers)
+    if total > GLOBAL_CUSTOMER_SEARCH_RESULT_LIMIT:
+        st.caption(
+            f"候補：{total}件（先頭{GLOBAL_CUSTOMER_SEARCH_RESULT_LIMIT}件を表示）"
+        )
+    else:
+        st.caption(f"候補：{total}件")
+    render_customer_search_candidate_cards(
+        customers,
+        limit=GLOBAL_CUSTOMER_SEARCH_RESULT_LIMIT,
+    )
+
+
+# =========================
 # 顧客検索
 # =========================
 def show_customer_search(df=None, show_home_link=False):
     st.subheader("🔍 顧客検索")
     if show_home_link:
         show_back_home_button("customer_back_home")
-    st.caption(f"🎤 {VOICE_INPUT_HELP} 漢字の顧客名でも検索できます。")
+    st.caption(f"🎤 {VOICE_INPUT_HELP} 顧客名・ひらがな・地域を、スペース区切りで絞り込めます。")
 
     page_name = "customer" if show_home_link else "customer_home"
 
@@ -12966,9 +13100,9 @@ def show_customer_search(df=None, show_home_link=False):
     if st_keyup is not None:
         keyword = str(
             st_keyup(
-                "ひらがな・漢字で検索",
+                "顧客名・ひらがな・地域で検索",
                 value=default_keyword,
-                placeholder="入力すると候補がすぐ表示されます",
+                placeholder="例：三谷、みたに、帯広、帯広 牧場",
                 debounce=250,
                 key="customer_search_live",
             )
@@ -12977,9 +13111,9 @@ def show_customer_search(df=None, show_home_link=False):
     else:
         # 追加部品がまだインストールされていない環境でもアプリを止めない。
         keyword = st.text_input(
-            "ひらがな・漢字で検索",
+            "顧客名・ひらがな・地域で検索",
             value=default_keyword,
-            placeholder="例：こ、こも、むら",
+            placeholder="例：三谷、みたに、帯広、帯広 牧場",
             key="customer_search_input",
             help=VOICE_INPUT_HELP,
         ).strip()
@@ -12990,7 +13124,7 @@ def show_customer_search(df=None, show_home_link=False):
         update_query_params(page=page_name, customer_search=None)
 
     if not keyword:
-        st.info("顧客名のひらがなを入力してください。")
+        st.info("顧客名・ひらがな・地域を入力してください。")
         return
 
     # ログイン直後はExcelを読まず、実際に検索が始まった時だけ取得する。
@@ -12998,16 +13132,11 @@ def show_customer_search(df=None, show_home_link=False):
         with st.spinner("顧客データを読み込んでいます…"):
             df = load_data()
 
-    hit = df[
-        df["ひらがな"].str.startswith(keyword, na=False)
-        | df["顧客名"].str.contains(keyword, na=False, regex=False)
-    ]
+    customers = find_customer_search_candidates(df, keyword)
 
-    if hit.empty:
+    if customers.empty:
         st.warning("該当する顧客がありません。")
         return
-
-    customers = hit[["顧客名", "地域"]].drop_duplicates().reset_index(drop=True)
     line_by_customer = load_line_statuses_from_supabase()
 
     st.write(f"候補：{len(customers)}件")
@@ -20256,6 +20385,11 @@ global_delete_restore_requested = bool(
     st.session_state.pop(GLOBAL_DELETE_SCROLL_RESTORE_KEY, False)
 )
 
+# 専用の顧客検索ページ以外では、すべての画面上部に共通検索欄を表示する。
+# 専用ページには同じ検索機能があるため、入力欄が二重にならないよう除外する。
+if current_page != "customer":
+    render_global_customer_search()
+
 # 各機能ページから、区分メニューを経由せずトップへ直接戻れるようにする。
 # 顧客・仕入先・運送会社の各ホームと取引先メモは、従来から同じリンクを
 # 表示しているため、二重表示にならないようここでは除外する。
@@ -20275,7 +20409,6 @@ try:
 
     elif st.session_state["page"] == "customer_home":
         show_home_menu()
-        show_customer_search()
 
     elif st.session_state["page"] == "customer":
         show_customer_search(show_home_link=True)
