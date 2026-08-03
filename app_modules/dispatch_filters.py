@@ -1,10 +1,16 @@
 """配車表の絞り込みに使う純粋な処理。"""
 
+import re
 from datetime import date, timedelta
 
 import pandas as pd
 
-from .dispatch_excel import normalize_dispatch_text
+
+def normalize_dispatch_text(value):
+    """絞り込み用に前後空白と連続空白をそろえる。"""
+    if value is None or pd.isna(value):
+        return ""
+    return re.sub(r"\s+", " ", str(value).replace("\u3000", " ")).strip()
 
 
 def dispatch_filter_options(series):
