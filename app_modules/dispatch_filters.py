@@ -4,7 +4,7 @@ from datetime import date, timedelta
 
 import pandas as pd
 
-from app_modules.dispatch_excel import normalize_dispatch_text
+from .dispatch_excel import normalize_dispatch_text
 
 
 def dispatch_filter_options(series):
