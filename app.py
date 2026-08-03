@@ -246,6 +246,11 @@ LOGIN_TOKEN_VERSION = 1
 LOGIN_TOKEN_AUDIENCE = "aoyama-kokyaku"
 LOGIN_TOKEN_CLOCK_SKEW_SECONDS = 30
 
+# Temporary startup probe for the isolated performance-test deployment.
+# It intentionally stops before cookie initialization and before any customer data is loaded.
+st.success("テスト画面の起動を確認できました。顧客データはまだ読み込んでいません。")
+st.stop()
+
 if EncryptedCookieManager is None:
     st.error(
         "ログイン用Cookie機能が読み込めません。requirements.txt に "
