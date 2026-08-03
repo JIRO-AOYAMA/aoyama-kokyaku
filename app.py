@@ -19395,7 +19395,6 @@ def show_login_history_page():
 
 
 def show_top_home():
-    st.subheader("取引先を選択")
     col1, col2 = st.columns(2)
     with col1:
         st.markdown(render_page_link("👥 顧客", page="customer_home"), unsafe_allow_html=True)
@@ -19410,7 +19409,7 @@ def show_top_home():
     with col5:
         st.markdown(render_page_link("🔎 写真・PDF検索", page="attachment_search"), unsafe_allow_html=True)
     with col6:
-        st.markdown(render_page_link("🕘 配車変更確認", page="change_history"), unsafe_allow_html=True)
+        st.markdown(render_page_link("🕘 変更確認", page="change_history"), unsafe_allow_html=True)
     col7, col8 = st.columns(2)
     with col7:
         st.markdown(render_page_link("📄 商品見積り履歴", page="estimates"), unsafe_allow_html=True)
