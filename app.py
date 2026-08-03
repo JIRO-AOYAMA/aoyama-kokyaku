@@ -19,6 +19,7 @@ import uuid
 import zipfile
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from functools import wraps
 from io import BytesIO
 from pathlib import Path
 from xml.etree import ElementTree as ET
@@ -59,6 +60,70 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="collapsed",
 )
+
+
+# =========================
+# テストブランチ用の速度診断
+# =========================
+PERFORMANCE_TIMINGS_KEY = "_performance_timings"
+
+
+def performance_diagnostics_enabled():
+    """URLに perf=1 がある時だけ速度診断を有効にする。"""
+    try:
+        value = st.query_params.get("perf", "")
+    except Exception:
+        return False
+    if isinstance(value, list):
+        value = value[0] if value else ""
+    return str(value).strip().lower() in {"1", "true", "on", "yes"}
+
+
+def reset_performance_timings():
+    if performance_diagnostics_enabled():
+        st.session_state[PERFORMANCE_TIMINGS_KEY] = []
+
+
+def record_performance_timing(label, elapsed_seconds):
+    if not performance_diagnostics_enabled():
+        return
+    timings = st.session_state.setdefault(PERFORMANCE_TIMINGS_KEY, [])
+    timings.append(
+        {
+            "処理": str(label),
+            "秒": round(max(float(elapsed_seconds), 0.0), 3),
+        }
+    )
+
+
+def performance_timed(label):
+    """通常動作を変えず、perf=1 の時だけ関数の所要時間を記録する。"""
+    def decorator(function):
+        @wraps(function)
+        def wrapper(*args, **kwargs):
+            if not performance_diagnostics_enabled():
+                return function(*args, **kwargs)
+            started_at = time.perf_counter()
+            try:
+                return function(*args, **kwargs)
+            finally:
+                record_performance_timing(label, time.perf_counter() - started_at)
+
+        return wrapper
+
+    return decorator
+
+
+def render_performance_diagnostics():
+    if not performance_diagnostics_enabled():
+        return
+    timings = st.session_state.get(PERFORMANCE_TIMINGS_KEY, [])
+    with st.expander("⏱ 速度診断（テスト用）", expanded=True):
+        st.caption("この表示はURLに perf=1 がある時だけ出ます。保存処理には影響しません。")
+        if timings:
+            st.dataframe(pd.DataFrame(timings), use_container_width=True, hide_index=True)
+        else:
+            st.info("計測対象の処理はありませんでした。")
 
 EXCEL_FILE = "配車予定 次郎_修正版.xlsm"
 SHEET_NAME = "Sheet1"
@@ -6984,6 +7049,7 @@ def show_customer_notes(customer_name):
         render_note_delete_controls(note)
 
 
+@performance_timed("顧客メモ画面")
 def show_notes_page(df):
     show_back_home_button("notes_back_home")
 
@@ -12057,6 +12123,7 @@ def recalculate_customer_inventory_for_today(df):
     return recalculated
 
 
+@performance_timed("顧客データ：Dropbox・軽量キャッシュ")
 @st.cache_data(ttl=60, show_spinner=False)
 def load_fast_dropbox_data():
     """通常表示は小さなJSONを使い、Excelが変わった時だけ再生成する。"""
@@ -12108,6 +12175,7 @@ def load_fast_dropbox_data():
     return df
 
 
+@performance_timed("顧客データ：全体")
 @st.cache_data(ttl=60)
 def load_data():
     """
@@ -12163,6 +12231,8 @@ def make_app_url(
 ):
     """ブラウザの戻るボタンで戻れるように、通常リンク用URLを作る。"""
     params = {"page": page}
+    if performance_diagnostics_enabled():
+        params["perf"] = "1"
     if customer:
         params["customer"] = str(customer)
     if customer_search:
@@ -12666,6 +12736,7 @@ def render_customer_map_editor(customer_name, current):
             st.error(f"保存できませんでした：{exc}")
 
 
+@performance_timed("顧客詳細画面")
 def show_customer_detail(df, customer_name):
     detail = df[df["顧客名"] == customer_name].copy()
 
@@ -12869,6 +12940,7 @@ def get_customer_directory_group(value):
     return "その他"
 
 
+@performance_timed("顧客名一覧画面")
 def show_customer_directory(df=None):
     st.subheader("👥 顧客名一覧")
     show_back_home_button("customer_directory_back_home")
@@ -13034,6 +13106,7 @@ def clear_global_customer_search_when_route_changes():
     st.session_state[GLOBAL_CUSTOMER_SEARCH_ROUTE_KEY] = route
 
 
+@performance_timed("共通顧客検索欄")
 def render_global_customer_search():
     """どの機能ページからでも使える、入力欄常設型の顧客検索。"""
     clear_global_customer_search_when_route_changes()
@@ -13088,6 +13161,7 @@ def render_global_customer_search():
 # =========================
 # 顧客検索
 # =========================
+@performance_timed("顧客検索画面")
 def show_customer_search(df=None, show_home_link=False):
     st.subheader("🔍 顧客検索")
     if show_home_link:
@@ -13393,6 +13467,7 @@ def render_product_search_results(product_rows, product_name, keyword):
             )
 
 
+@performance_timed("商品検索画面")
 def show_product_search(df=None):
     st.subheader("🔎 商品検索")
     show_back_home_button("product_back_home")
@@ -13457,6 +13532,7 @@ def show_product_search(df=None):
 # =========================
 # 地域検索
 # =========================
+@performance_timed("地域検索画面")
 def show_region_search(df):
     st.subheader("📍 地域検索")
     show_back_home_button("region_back_home")
@@ -14136,6 +14212,7 @@ def show_month_dispatch_calendar(rows_by_day, month_start):
 
     st.markdown(table_html, unsafe_allow_html=True)
 
+@performance_timed("配車カレンダー画面")
 def show_dispatch_calendar(df):
     st.markdown("---")
     st.header("🗓 配車カレンダー")
@@ -14755,6 +14832,7 @@ def show_dispatch_table_month_switcher(df, selected_month, key_suffix="top"):
         )
 
 
+@performance_timed("配車表画面")
 def show_dispatch_board():
     st.markdown("---")
     st.header("🚚 配車表")
@@ -16554,6 +16632,7 @@ def render_soluble_water_it_summary(location, context):
             except Exception as exc:
                 st.error(f"Excelへ反映できませんでした：{exc}")
 
+@performance_timed("ソリュブル在庫画面")
 def show_soluble_inventory_page():
     st.markdown("---")
     st.header("🧪 ソリュブル在庫")
@@ -18734,6 +18813,7 @@ def render_trade_partner_directory_cards(rows, partner_type):
     st.markdown("".join(parts), unsafe_allow_html=True)
 
 
+@performance_timed("取引先ホーム画面")
 def show_trade_partner_home(partner_type):
     show_top_home_link()
     label = trade_partner_type_label(partner_type)
@@ -18771,6 +18851,7 @@ def show_trade_partner_home(partner_type):
         )
 
 
+@performance_timed("取引先一覧画面")
 def show_trade_partner_directory(partner_type):
     show_trade_partner_home_link(partner_type)
     if partner_type == "supplier":
@@ -18789,6 +18870,7 @@ def show_trade_partner_directory(partner_type):
     render_trade_partner_directory_cards(rows, partner_type)
 
 
+@performance_timed("取引先検索画面")
 def show_trade_partner_search(partner_type):
     show_trade_partner_home_link(partner_type)
     label = trade_partner_type_label(partner_type)
@@ -19270,6 +19352,7 @@ def render_trade_note_card(note, category, partner_names=None):
     )
 
 
+@performance_timed("取引先メモ画面")
 def show_trade_notes_page():
     show_top_home_link()
     st.header("📝 メモ帳")
@@ -19352,6 +19435,7 @@ def show_trade_notes_page():
 
 
 
+@performance_timed("Supabase：ログイン確認")
 @st.cache_data(ttl=15, show_spinner=False)
 def load_login_browsers_from_supabase():
     if not has_login_audit_config():
@@ -19555,6 +19639,7 @@ def show_login_history_page():
                 st.caption(f"Microsoftアカウント表示名：{account_label}")
 
 
+@performance_timed("トップ画面")
 def show_top_home():
     col1, col2 = st.columns(2)
     with col1:
@@ -19596,6 +19681,7 @@ def show_top_home():
 # =========================
 # ホームメニュー
 # =========================
+@performance_timed("顧客メニュー画面")
 def show_home_menu():
     show_top_home_link()
     st.subheader("顧客メニュー")
@@ -20263,6 +20349,8 @@ if "selected_partner_type" not in st.session_state:
 handle_customer_query_param()
 
 current_page = st.session_state.get("page", "home")
+reset_performance_timings()
+performance_page_started_at = time.perf_counter()
 customer_pages = {
     "customer_home", "customer_list", "customer", "region", "product", "calendar",
     "dispatch_table", "soluble_inventory", "water_it_test", "notes", "detail",
@@ -20510,6 +20598,12 @@ except Exception as e:
     st.stop()
 
 render_global_delete_scroll_keeper(restore=global_delete_restore_requested)
+
+record_performance_timing(
+    f"画面全体：{current_page}",
+    time.perf_counter() - performance_page_started_at,
+)
+render_performance_diagnostics()
 
 st.caption(
     "※ 顧客情報は配車予定 次郎.xlsm、仕入先・運送会社は取引先カルテ.xlsxを読み込んで表示しています。"
