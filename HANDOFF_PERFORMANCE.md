@@ -15,11 +15,13 @@
 - 通常のURLでは診断処理は無効で、Excel・Supabaseの保存処理は未変更。
 - テスト環境の起動時に発生した配車モジュールの再読込エラーに対し、`dispatch_filters.py`からモジュール間の再importをなくし、同じ正規化処理をファイル内へ配置。
 - 新規環境のStreamlit 1.60.0でCookie準備待ちの白画面になったため、テストブランチだけ直前版`1.59.2`へ固定して比較中。
+- The isolated app `aoyama-kokyaku-cszjcu4w4rmykjojby9wxm.streamlit.app` stayed blank even after `app.py` was replaced with a minimal three-widget page and the app was rebooted. This rules out the customer app code and points to a broken Streamlit app instance/deployment.
+- The full diagnostic `app.py` was restored exactly from commit `cd0150f` in restore commit `43c56c8`.
 - OneDrive内の旧`.py`は使用しない。
 
 ## 次に行うこと
 
-1. 速度診断入りのテストブランチをテスト用Streamlitへ接続する。
+1. Do not reuse the blank Streamlit app instance. Create a fresh test app from `perf/phase1-measurement-20260804`, then verify that the Microsoft login screen appears before copying production Secrets.
 2. URL末尾に`&perf=1`を付け、Dropbox、Excel解析、Supabase、主要画面の処理時間を確認する。
 3. 既存機能を確認してから、最も効果の大きい改善を1件だけ実施する。
 
