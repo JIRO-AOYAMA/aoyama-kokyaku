@@ -7633,6 +7633,79 @@ def check_customer_information_response(action, response, success_codes):
     raise RuntimeError(message)
 
 
+def is_regular_customer_information_item(item):
+    """顧客情報カードへ表示する通常項目かどうかを、従来と同じ除外規則で判定する。"""
+    return not (
+        is_past_product_note_item(item)
+        or is_estimate_item(item)
+        or is_carrier_freight_item(item)
+        or is_onedrive_attachment_item(item)
+    )
+
+
+@performance_timed("顧客情報：存在索引")
+@st.cache_data(ttl=300, show_spinner=False)
+def load_customer_information_presence_index():
+    """通常の顧客情報が存在する顧客だけを、小さい索引としてSupabaseから読む。"""
+    if not has_supabase_config():
+        raise RuntimeError("Supabase設定がありません。")
+
+    key_values = set()
+    name_values = set()
+    page_size = 1000
+    offset = 0
+    while True:
+        params = {
+            "select": "id,customer_key,customer_name,field_name",
+            "order": "id.asc",
+            "limit": str(page_size),
+            "offset": str(offset),
+        }
+        try:
+            response = requests.get(
+                get_supabase_customer_information_url(),
+                headers=get_supabase_headers(),
+                params=params,
+                timeout=30,
+            )
+        except Exception as exc:
+            raise RuntimeError("顧客情報の索引読み込み中にSupabaseへ接続できませんでした。") from exc
+        check_customer_information_response("読み込み", response, (200,))
+        page = response.json()
+        if not isinstance(page, list):
+            raise RuntimeError("Supabaseから返った顧客情報索引の形式が正しくありません。")
+
+        for item in page:
+            if not isinstance(item, dict) or not is_regular_customer_information_item(item):
+                continue
+            item_key = clean_value(item.get("customer_key"), blank_text="").strip()
+            item_name = clean_value(item.get("customer_name"), blank_text="").strip()
+            if item_key:
+                key_values.add(item_key)
+            elif item_name:
+                name_values.add(item_name)
+
+        if len(page) < page_size:
+            break
+        offset += page_size
+
+    return {
+        "customer_keys": tuple(sorted(key_values)),
+        "customer_names": tuple(sorted(name_values)),
+    }
+
+
+def customer_has_regular_information(customer_name, customer_key=None):
+    """存在索引だけで、顧客情報カード用の通常項目があるか確認する。"""
+    index = load_customer_information_presence_index()
+    if customer_key:
+        target = clean_value(customer_key, blank_text="").strip()
+        return target in set(index.get("customer_keys", ()))
+    target = clean_value(customer_name, blank_text="").strip()
+    return target in set(index.get("customer_names", ()))
+
+
+@performance_timed("顧客情報：詳細取得")
 @st.cache_data(ttl=30, show_spinner=False)
 def load_customer_information(customer_name, customer_key=None):
     """件数上限を設けず、Supabaseからページ単位で顧客情報を読む。"""
@@ -7667,6 +7740,10 @@ def load_customer_information(customer_name, customer_key=None):
 
 def clear_customer_information_cache():
     load_customer_information.clear()
+    try:
+        load_customer_information_presence_index.clear()
+    except Exception:
+        pass
     global_attachment_loader = globals().get("load_all_onedrive_attachments_from_supabase")
     if global_attachment_loader is not None:
         try:
@@ -11944,17 +12021,26 @@ def render_customer_information_card(customer_name, customer_key=None):
             return
 
         try:
-            items = load_customer_information(customer_name, customer_key)
-            items = [
-                item for item in items
-                if not is_past_product_note_item(item)
-                and not is_estimate_item(item)
-                and not is_carrier_freight_item(item)
-                and not is_onedrive_attachment_item(item)
-            ]
-        except Exception as exc:
-            st.warning(str(exc))
-            return
+            has_regular_items = customer_has_regular_information(
+                customer_name,
+                customer_key,
+            )
+        except Exception:
+            # 索引確認に失敗した場合は、表示欠落を避けるため従来どおり詳細取得へ戻す。
+            has_regular_items = None
+
+        if has_regular_items is False:
+            items = []
+        else:
+            try:
+                items = load_customer_information(customer_name, customer_key)
+                items = [
+                    item for item in items
+                    if is_regular_customer_information_item(item)
+                ]
+            except Exception as exc:
+                st.warning(str(exc))
+                return
 
         success_key = f"customer_information_success_{state_suffix}"
         success_message = st.session_state.pop(success_key, None)
