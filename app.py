@@ -19,6 +19,7 @@ import uuid
 import zipfile
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import wraps
 from io import BytesIO
 from pathlib import Path
@@ -3573,6 +3574,34 @@ def render_onedrive_pdf_inline(pdf_content, filename):
         scrolling=False,
     )
 
+def _download_onedrive_thumbnail_uncached(access_token, item_id):
+    """Streamlit状態に触れず、並行取得用に1件の軽量サムネイルを読む。"""
+    safe_item_id = urllib.parse.quote(str(item_id), safe="")
+    response = requests.get(
+        ONEDRIVE_GRAPH_BASE
+        + f"/me/drive/items/{safe_item_id}/thumbnails?$select=small,medium",
+        headers={"Authorization": f"Bearer {access_token}"},
+        timeout=ONEDRIVE_REQUEST_TIMEOUT,
+    )
+    if response.status_code != 200:
+        return None
+    try:
+        values = list(response.json().get("value", []))
+    except Exception:
+        return None
+    if not values:
+        return None
+    thumbnail_set = values[0]
+    thumbnail_info = thumbnail_set.get("small") or thumbnail_set.get("medium") or {}
+    url = str(thumbnail_info.get("url") or "").strip()
+    if not url:
+        return None
+    image_response = requests.get(url, timeout=ONEDRIVE_REQUEST_TIMEOUT)
+    if image_response.status_code != 200:
+        return None
+    return image_response.content
+
+
 @st.cache_data(ttl=6 * 60 * 60, max_entries=1200, show_spinner=False)
 def download_onedrive_thumbnail(_access_token, item_id):
     """一覧用の軽量サムネイルをアプリ全体で共有キャッシュする。"""
@@ -3594,6 +3623,41 @@ def download_onedrive_thumbnail(_access_token, item_id):
     if image_response.status_code != 200:
         return None
     return image_response.content
+
+
+@st.cache_data(ttl=6 * 60 * 60, max_entries=300, show_spinner=False)
+def download_onedrive_thumbnail_batch(_access_token, item_ids):
+    """顧客カルテの初回表示用に、複数サムネイルを最大4件ずつ並行取得する。"""
+    unique_ids = []
+    seen = set()
+    for item_id in item_ids:
+        clean_id = str(item_id or "").strip()
+        if not clean_id or clean_id in seen:
+            continue
+        seen.add(clean_id)
+        unique_ids.append(clean_id)
+    if not unique_ids:
+        return {}
+
+    results = {}
+    max_workers = min(4, len(unique_ids))
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(
+                _download_onedrive_thumbnail_uncached,
+                _access_token,
+                item_id,
+            ): item_id
+            for item_id in unique_ids
+        }
+        for future in as_completed(futures):
+            item_id = futures[future]
+            try:
+                content = future.result()
+            except Exception:
+                content = None
+            results[item_id] = content if isinstance(content, bytes) else None
+    return results
 
 
 def render_clickable_onedrive_thumbnail(
@@ -9279,6 +9343,44 @@ def render_customer_attachments_section(
             visible_groups = display_groups[:limit]
             grid_column_count = 2 if is_mobile_browser() else 3
             grid_columns = []
+
+            # 顧客カルテの初回表示だけ、画面に出す画像の先頭サムネイルを並行取得する。
+            # Streamlitのsession_state更新はメインスレッドで行い、既存の修復処理は
+            # 取得できなかった場合の従来フォールバックとしてそのまま残す。
+            if entity_type == "customer" and access_token:
+                prefetch_ids = []
+                for attachment_group in visible_groups:
+                    representative = attachment_group.get("representative", {})
+                    if representative.get("file_type") != "image":
+                        continue
+                    for thumbnail_item in attachment_group.get("items", []):
+                        thumbnail_item_id = clean_value(
+                            thumbnail_item.get("file_id"),
+                            blank_text="",
+                        ).strip()
+                        if not thumbnail_item_id:
+                            continue
+                        thumb_key = f"onedrive_thumbnail_{thumbnail_item_id}"
+                        if isinstance(st.session_state.get(thumb_key), bytes):
+                            break
+                        prefetch_ids.append(thumbnail_item_id)
+                        break
+
+                if prefetch_ids:
+                    thumbnail_started_at = time.perf_counter()
+                    prefetched = download_onedrive_thumbnail_batch(
+                        access_token,
+                        tuple(prefetch_ids),
+                    )
+                    thumbnail_download_seconds += (
+                        time.perf_counter() - thumbnail_started_at
+                    )
+                    thumbnail_download_count += len(prefetch_ids)
+                    for thumbnail_item_id, thumbnail in prefetched.items():
+                        if isinstance(thumbnail, bytes):
+                            st.session_state[
+                                f"onedrive_thumbnail_{thumbnail_item_id}"
+                            ] = thumbnail
 
             for group_index, attachment_group in enumerate(visible_groups):
                 if group_index % grid_column_count == 0:
