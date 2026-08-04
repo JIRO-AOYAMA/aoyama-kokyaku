@@ -19,6 +19,7 @@ import uuid
 import zipfile
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from io import BytesIO
 from pathlib import Path
 from xml.etree import ElementTree as ET
@@ -312,6 +313,11 @@ WATER_IT_STORAGE_ID = str(
     uuid.uuid5(uuid.NAMESPACE_URL, "aoyama-water-it-csv-snapshot-v1")
 )
 WATER_IT_STORAGE_VERSION = 1
+# 顧客詳細では、WATER it対象顧客の小さな照合索引だけを5分間再利用する。
+# 元CSV・Supabase保存内容・顧客名の照合ルール自体は変更しない。
+WATER_IT_CUSTOMER_INDEX_TTL_SECONDS = 5 * 60
+WATER_IT_CUSTOMER_INDEX_SESSION_KEY = "water_it_customer_key_index"
+WATER_IT_CUSTOMER_INDEX_HASH_SESSION_KEY = "water_it_customer_key_index_hash"
 WATER_IT_REQUIRED_COLUMNS = [
     "測定日時",
     "測定項目",
@@ -3438,6 +3444,33 @@ def render_onedrive_pdf_inline(pdf_content, filename):
         scrolling=False,
     )
 
+def _download_onedrive_thumbnail_uncached(access_token, item_id):
+    """Streamlit状態に触れず、並行取得用に1件の軽量サムネイルを読む。"""
+    safe_item_id = urllib.parse.quote(str(item_id), safe="")
+    response = requests.get(
+        ONEDRIVE_GRAPH_BASE
+        + f"/me/drive/items/{safe_item_id}/thumbnails?$select=small,medium",
+        headers={"Authorization": f"Bearer {access_token}"},
+        timeout=ONEDRIVE_REQUEST_TIMEOUT,
+    )
+    if response.status_code != 200:
+        return None
+    try:
+        values = list(response.json().get("value", []))
+    except Exception:
+        return None
+    if not values:
+        return None
+    thumbnail_set = values[0]
+    thumbnail_info = thumbnail_set.get("small") or thumbnail_set.get("medium") or {}
+    url = str(thumbnail_info.get("url") or "").strip()
+    if not url:
+        return None
+    image_response = requests.get(url, timeout=ONEDRIVE_REQUEST_TIMEOUT)
+    if image_response.status_code != 200:
+        return None
+    return image_response.content
+
 @st.cache_data(ttl=6 * 60 * 60, max_entries=1200, show_spinner=False)
 def download_onedrive_thumbnail(_access_token, item_id):
     """一覧用の軽量サムネイルをアプリ全体で共有キャッシュする。"""
@@ -3459,6 +3492,40 @@ def download_onedrive_thumbnail(_access_token, item_id):
     if image_response.status_code != 200:
         return None
     return image_response.content
+
+@st.cache_data(ttl=6 * 60 * 60, max_entries=300, show_spinner=False)
+def download_onedrive_thumbnail_batch(_access_token, item_ids):
+    """顧客カルテの初回表示用に、複数サムネイルを最大4件ずつ並行取得する。"""
+    unique_ids = []
+    seen = set()
+    for item_id in item_ids:
+        clean_id = str(item_id or "").strip()
+        if not clean_id or clean_id in seen:
+            continue
+        seen.add(clean_id)
+        unique_ids.append(clean_id)
+    if not unique_ids:
+        return {}
+
+    results = {}
+    max_workers = min(4, len(unique_ids))
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(
+                _download_onedrive_thumbnail_uncached,
+                _access_token,
+                item_id,
+            ): item_id
+            for item_id in unique_ids
+        }
+        for future in as_completed(futures):
+            item_id = futures[future]
+            try:
+                content = future.result()
+            except Exception:
+                content = None
+            results[item_id] = content if isinstance(content, bytes) else None
+    return results
 
 
 def render_clickable_onedrive_thumbnail(
@@ -6469,6 +6536,60 @@ def load_notes_from_supabase(customer_name=None, limit=500):
     ]
 
 
+@st.cache_data(ttl=300, show_spinner=False)
+def load_note_presence_index():
+    """顧客メモが存在する顧客名だけを、小さい索引としてSupabaseから読む。"""
+    if not has_supabase_config():
+        return tuple()
+
+    customer_names = set()
+    page_size = 1000
+    offset = 0
+    while True:
+        params = {
+            "select": "id,customer_name",
+            "order": "id.asc",
+            "limit": str(page_size),
+            "offset": str(offset),
+            "id": f"not.like.{LINE_STATUS_NOTE_PREFIX}*",
+        }
+        try:
+            response = requests.get(
+                get_supabase_notes_url(),
+                headers=get_supabase_headers(),
+                params=params,
+                timeout=30,
+            )
+        except Exception as exc:
+            raise RuntimeError("メモの索引読み込み中にSupabaseへ接続できませんでした。") from exc
+        if response.status_code != 200:
+            detail = str(response.text or "").strip()[:500]
+            message = f"メモの索引を読み込めませんでした（{response.status_code}）。"
+            if detail:
+                message += f" {detail}"
+            raise RuntimeError(message)
+        page = response.json()
+        if not isinstance(page, list):
+            raise RuntimeError("Supabaseから返ったメモ索引の形式が正しくありません。")
+
+        for note in page:
+            if not isinstance(note, dict):
+                continue
+            customer_name = clean_value(note.get("customer_name"), blank_text="").strip()
+            if customer_name and customer_name != HOME_TODO_CUSTOMER_NAME:
+                customer_names.add(customer_name)
+
+        if len(page) < page_size:
+            break
+        offset += page_size
+
+    return tuple(sorted(customer_names))
+
+def customer_has_notes(customer_name):
+    """存在索引だけで、その顧客にメモがあるか確認する。"""
+    target = clean_value(customer_name, blank_text="").strip()
+    return target in set(load_note_presence_index())
+
 def insert_note_to_supabase(note):
     """Supabaseのnotesテーブルへメモを1件追加する"""
     if not has_supabase_config():
@@ -6489,6 +6610,10 @@ def insert_note_to_supabase(note):
     if response.status_code not in (200, 201):
         show_supabase_response_error("保存", response)
     load_notes_from_supabase.clear()
+    try:
+        load_note_presence_index.clear()
+    except Exception:
+        pass
 
 
 def delete_note_from_supabase(note_id):
@@ -6517,6 +6642,10 @@ def delete_note_from_supabase(note_id):
         show_supabase_response_error("削除", response)
 
     load_notes_from_supabase.clear()
+    try:
+        load_note_presence_index.clear()
+    except Exception:
+        pass
     return True
 
 
@@ -6972,7 +7101,16 @@ def show_customer_notes(customer_name):
     if st.session_state.pop("note_save_success", None) == customer_name:
         st.success("メモを保存しました。")
 
-    customer_notes = get_notes_for_customer(customer_name)
+    try:
+        has_notes = customer_has_notes(customer_name)
+    except Exception:
+        # 索引確認に失敗した場合は、表示欠落を避けるため従来どおり詳細取得へ戻す。
+        has_notes = None
+
+    if has_notes is False:
+        customer_notes = []
+    else:
+        customer_notes = get_notes_for_customer(customer_name)
 
     if not customer_notes:
         st.info("この顧客のメモはまだありません。")
@@ -7418,6 +7556,74 @@ def check_customer_information_response(action, response, success_codes):
     raise RuntimeError(message)
 
 
+def is_regular_customer_information_item(item):
+    """顧客情報カードへ表示する通常項目かどうかを、従来と同じ除外規則で判定する。"""
+    return not (
+        is_past_product_note_item(item)
+        or is_estimate_item(item)
+        or is_carrier_freight_item(item)
+        or is_onedrive_attachment_item(item)
+    )
+
+@st.cache_data(ttl=300, show_spinner=False)
+def load_customer_information_presence_index():
+    """通常の顧客情報が存在する顧客だけを、小さい索引としてSupabaseから読む。"""
+    if not has_supabase_config():
+        raise RuntimeError("Supabase設定がありません。")
+
+    key_values = set()
+    name_values = set()
+    page_size = 1000
+    offset = 0
+    while True:
+        params = {
+            "select": "id,customer_key,customer_name,field_name",
+            "order": "id.asc",
+            "limit": str(page_size),
+            "offset": str(offset),
+        }
+        try:
+            response = requests.get(
+                get_supabase_customer_information_url(),
+                headers=get_supabase_headers(),
+                params=params,
+                timeout=30,
+            )
+        except Exception as exc:
+            raise RuntimeError("顧客情報の索引読み込み中にSupabaseへ接続できませんでした。") from exc
+        check_customer_information_response("読み込み", response, (200,))
+        page = response.json()
+        if not isinstance(page, list):
+            raise RuntimeError("Supabaseから返った顧客情報索引の形式が正しくありません。")
+
+        for item in page:
+            if not isinstance(item, dict) or not is_regular_customer_information_item(item):
+                continue
+            item_key = clean_value(item.get("customer_key"), blank_text="").strip()
+            item_name = clean_value(item.get("customer_name"), blank_text="").strip()
+            if item_key:
+                key_values.add(item_key)
+            elif item_name:
+                name_values.add(item_name)
+
+        if len(page) < page_size:
+            break
+        offset += page_size
+
+    return {
+        "customer_keys": tuple(sorted(key_values)),
+        "customer_names": tuple(sorted(name_values)),
+    }
+
+def customer_has_regular_information(customer_name, customer_key=None):
+    """存在索引だけで、顧客情報カード用の通常項目があるか確認する。"""
+    index = load_customer_information_presence_index()
+    if customer_key:
+        target = clean_value(customer_key, blank_text="").strip()
+        return target in set(index.get("customer_keys", ()))
+    target = clean_value(customer_name, blank_text="").strip()
+    return target in set(index.get("customer_names", ()))
+
 @st.cache_data(ttl=30, show_spinner=False)
 def load_customer_information(customer_name, customer_key=None):
     """件数上限を設けず、Supabaseからページ単位で顧客情報を読む。"""
@@ -7452,6 +7658,10 @@ def load_customer_information(customer_name, customer_key=None):
 
 def clear_customer_information_cache():
     load_customer_information.clear()
+    try:
+        load_customer_information_presence_index.clear()
+    except Exception:
+        pass
     global_attachment_loader = globals().get("load_all_onedrive_attachments_from_supabase")
     if global_attachment_loader is not None:
         try:
@@ -8794,7 +9004,18 @@ def render_customer_attachments_section(
             st.caption("追加して保存するとアプリが再起動し、通常画面から接続ボタンが消えます。")
 
         access_token = get_onedrive_access_token()
-        tag_history_options = get_attachment_tag_history_options(attachments)
+
+        # Streamlitのタブは、選択していないタブの中身も実行される。
+        # そのため全体タグ履歴はアルバム閲覧だけでは読み込まず、
+        # 実際に追加するファイルを選んだ時、写真を撮った時、または編集開始時だけ取得する。
+        tag_history_options_cache = None
+
+        def load_tag_history_options_for_action():
+            nonlocal tag_history_options_cache
+            if tag_history_options_cache is None:
+                tag_history_options_cache = get_attachment_tag_history_options(attachments)
+            return list(tag_history_options_cache or [])
+
         mobile_browser = is_mobile_browser()
         if mobile_browser:
             album_tab, add_tab, camera_tab = st.tabs(
@@ -8876,9 +9097,15 @@ def render_customer_attachments_section(
                     key=f"onedrive_attachment_pdf_uploader_{suffix}",
                 )
 
+                pending_add_files = bool(photo_files) or pdf_file is not None
+                add_tag_history_options = (
+                    load_tag_history_options_for_action()
+                    if pending_add_files
+                    else []
+                )
                 selected_history_tags = st.multiselect(
                     "タグ（入力すると過去の候補を絞り込み）",
-                    tag_history_options,
+                    add_tag_history_options,
                     key=f"onedrive_attachment_history_tags_{suffix}",
                 )
                 new_tags_text = st.text_input(
@@ -8886,10 +9113,10 @@ def render_customer_attachments_section(
                     placeholder="例：北海道、タンク、要確認",
                     key=f"onedrive_attachment_new_tags_{suffix}",
                 )
-                if tag_history_options:
+                if add_tag_history_options:
                     st.caption(
                         "最近使ったタグ："
-                        + "　".join(f"#{tag}" for tag in tag_history_options[:8])
+                        + "　".join(f"#{tag}" for tag in add_tag_history_options[:8])
                     )
                 remarks = st.text_area(
                     "備考",
@@ -8994,9 +9221,14 @@ def render_customer_attachments_section(
                     )
                     enable_mobile_camera_capture(camera_label)
 
+                    camera_tag_history_options = (
+                        load_tag_history_options_for_action()
+                        if camera_file is not None
+                        else []
+                    )
                     camera_history_tags = st.multiselect(
                         "タグ（入力すると過去の候補を絞り込み）",
-                        tag_history_options,
+                        camera_tag_history_options,
                         key=f"onedrive_attachment_camera_history_tags_{suffix}",
                     )
                     camera_new_tags_text = st.text_input(
@@ -9004,10 +9236,10 @@ def render_customer_attachments_section(
                         placeholder="例：北海道、タンク、要確認",
                         key=f"onedrive_attachment_camera_new_tags_{suffix}",
                     )
-                    if tag_history_options:
+                    if camera_tag_history_options:
                         st.caption(
                             "最近使ったタグ："
-                            + "　".join(f"#{tag}" for tag in tag_history_options[:8])
+                            + "　".join(f"#{tag}" for tag in camera_tag_history_options[:8])
                         )
                     camera_remarks = st.text_area(
                         "備考",
@@ -9066,6 +9298,7 @@ def render_customer_attachments_section(
                             except Exception as exc:
                                 st.error(f"保存できませんでした：{exc}")
 
+
         with album_tab:
             st.markdown("#### アルバム")
             if not attachments:
@@ -9104,6 +9337,39 @@ def render_customer_attachments_section(
             visible_groups = display_groups[:limit]
             grid_column_count = 2 if is_mobile_browser() else 3
             grid_columns = []
+
+            # 顧客カルテの初回表示だけ、画面に出す画像の先頭サムネイルを並行取得する。
+            # Streamlitのsession_state更新はメインスレッドで行い、既存の修復処理は
+            # 取得できなかった場合の従来フォールバックとしてそのまま残す。
+            if entity_type == "customer" and access_token:
+                prefetch_ids = []
+                for attachment_group in visible_groups:
+                    representative = attachment_group.get("representative", {})
+                    if representative.get("file_type") != "image":
+                        continue
+                    for thumbnail_item in attachment_group.get("items", []):
+                        thumbnail_item_id = clean_value(
+                            thumbnail_item.get("file_id"),
+                            blank_text="",
+                        ).strip()
+                        if not thumbnail_item_id:
+                            continue
+                        thumb_key = f"onedrive_thumbnail_{thumbnail_item_id}"
+                        if isinstance(st.session_state.get(thumb_key), bytes):
+                            break
+                        prefetch_ids.append(thumbnail_item_id)
+                        break
+
+                if prefetch_ids:
+                    prefetched = download_onedrive_thumbnail_batch(
+                        access_token,
+                        tuple(prefetch_ids),
+                    )
+                    for thumbnail_item_id, thumbnail in prefetched.items():
+                        if isinstance(thumbnail, bytes):
+                            st.session_state[
+                                f"onedrive_thumbnail_{thumbnail_item_id}"
+                            ] = thumbnail
 
             for group_index, attachment_group in enumerate(visible_groups):
                 if group_index % grid_column_count == 0:
@@ -9249,7 +9515,7 @@ def render_customer_attachments_section(
 
                         if active_edit_id == group_ui_id:
                             current_tags = normalize_attachment_tags(attachment.get("tags") or [])
-                            edit_tag_options = list(tag_history_options)
+                            edit_tag_options = load_tag_history_options_for_action()
                             for current_tag in reversed(current_tags):
                                 if current_tag not in edit_tag_options:
                                     edit_tag_options.insert(0, current_tag)
@@ -9359,6 +9625,39 @@ def render_customer_attachments_section(
                 ):
                     st.session_state[limit_key] = limit + ONEDRIVE_PAGE_SIZE
                     st.rerun()
+
+def _open_customer_attachments_lazy_section(load_key, force_open_key):
+    """顧客詳細の写真・PDFを、利用者が開いた時だけ読み込む。"""
+    st.session_state[load_key] = True
+    st.session_state[force_open_key] = True
+
+def render_customer_attachments_lazy_section(customer_name, customer_key=None):
+    """初期表示ではOneDrive/Supabaseへ接続せず、ボタン操作後だけ既存機能を表示する。"""
+    entity_type = "customer"
+    entity_name = clean_value(customer_name, blank_text="").strip()
+    entity_id = clean_value(customer_key, blank_text="").strip()
+    identity = f"{entity_type}:{entity_id or entity_name}"
+    suffix = hashlib.sha256(str(identity).encode("utf-8")).hexdigest()[:16]
+    load_key = f"customer_attachments_lazy_loaded_{suffix}"
+    force_open_key = f"onedrive_attachment_force_open_{suffix}"
+
+    if not st.session_state.get(load_key, False):
+        st.button(
+            "📎 写真・PDFを開く",
+            key=f"customer_attachments_lazy_open_{suffix}",
+            use_container_width=True,
+            on_click=_open_customer_attachments_lazy_section,
+            args=(load_key, force_open_key),
+        )
+        return
+
+    render_customer_attachments_section(
+        customer_name,
+        customer_key,
+        entity_type=entity_type,
+    )
+
+
 
 
 
@@ -10057,7 +10356,76 @@ def estimate_sort_key(item):
     )
 
 
+@st.cache_data(ttl=300, show_spinner=False)
+def load_estimate_presence_index():
+    """提案・見積りが存在する顧客だけを、小さい索引としてSupabaseから読む。"""
+    if not has_supabase_config():
+        return {"customer_keys": tuple(), "customer_names": tuple()}
+
+    key_values = set()
+    name_values = set()
+    page_size = 1000
+    offset = 0
+    while True:
+        params = {
+            "select": "id,customer_key,customer_name,field_name",
+            "field_name": f"like.{ESTIMATE_PREFIX}*",
+            "order": "id.asc",
+            "limit": str(page_size),
+            "offset": str(offset),
+        }
+        try:
+            response = requests.get(
+                get_supabase_customer_information_url(),
+                headers=get_supabase_headers(),
+                params=params,
+                timeout=30,
+            )
+        except Exception as exc:
+            raise RuntimeError("見積りの索引読み込み中にSupabaseへ接続できませんでした。") from exc
+        check_customer_information_response("読み込み", response, (200,))
+        page = response.json()
+        if not isinstance(page, list):
+            raise RuntimeError("Supabaseから返った見積り索引の形式が正しくありません。")
+
+        for item in page:
+            if not isinstance(item, dict) or not is_estimate_item(item):
+                continue
+            item_key = clean_value(item.get("customer_key"), blank_text="").strip()
+            item_name = clean_value(item.get("customer_name"), blank_text="").strip()
+            if item_key:
+                key_values.add(item_key)
+            elif item_name:
+                name_values.add(item_name)
+
+        if len(page) < page_size:
+            break
+        offset += page_size
+
+    return {
+        "customer_keys": tuple(sorted(key_values)),
+        "customer_names": tuple(sorted(name_values)),
+    }
+
+def customer_has_estimates(customer_name, customer_key=None):
+    """存在索引だけで、その顧客に提案・見積りがあるか確認する。"""
+    index = load_estimate_presence_index()
+    if customer_key:
+        target = clean_value(customer_key, blank_text="").strip()
+        return target in set(index.get("customer_keys", ()))
+    target = clean_value(customer_name, blank_text="").strip()
+    return target in set(index.get("customer_names", ()))
+
 def get_customer_estimates(customer_name, customer_key):
+    try:
+        has_estimates = customer_has_estimates(customer_name, customer_key)
+    except Exception:
+        # 索引確認に失敗した場合は、表示欠落を避けるため従来どおり詳細取得へ戻す。
+        has_estimates = None
+
+    if has_estimates is False:
+        return []
+
     items = load_customer_information(customer_name, customer_key)
     estimates = []
     for item in items:
@@ -10111,6 +10479,10 @@ def load_all_estimates_from_supabase():
 def clear_estimate_cache():
     try:
         load_all_estimates_from_supabase.clear()
+    except Exception:
+        pass
+    try:
+        load_estimate_presence_index.clear()
     except Exception:
         pass
 
@@ -11590,17 +11962,26 @@ def render_customer_information_card(customer_name, customer_key=None):
             return
 
         try:
-            items = load_customer_information(customer_name, customer_key)
-            items = [
-                item for item in items
-                if not is_past_product_note_item(item)
-                and not is_estimate_item(item)
-                and not is_carrier_freight_item(item)
-                and not is_onedrive_attachment_item(item)
-            ]
-        except Exception as exc:
-            st.warning(str(exc))
-            return
+            has_regular_items = customer_has_regular_information(
+                customer_name,
+                customer_key,
+            )
+        except Exception:
+            # 索引確認に失敗した場合は、表示欠落を避けるため従来どおり詳細取得へ戻す。
+            has_regular_items = None
+
+        if has_regular_items is False:
+            items = []
+        else:
+            try:
+                items = load_customer_information(customer_name, customer_key)
+                items = [
+                    item for item in items
+                    if is_regular_customer_information_item(item)
+                ]
+            except Exception as exc:
+                st.warning(str(exc))
+                return
 
         success_key = f"customer_information_success_{state_suffix}"
         success_message = st.session_state.pop(success_key, None)
@@ -12057,9 +12438,9 @@ def recalculate_customer_inventory_for_today(df):
     return recalculated
 
 
-@st.cache_data(ttl=60, show_spinner=False)
-def load_fast_dropbox_data():
-    """通常表示は小さなJSONを使い、Excelが変わった時だけ再生成する。"""
+@st.cache_data(ttl=300, show_spinner=False)
+def load_fast_dropbox_data(jst_date_key):
+    """同じ日本日付ではDropbox確認を5分間再利用し、Excel変更時だけ再生成する。"""
     access_token = get_dropbox_access_token()
     excel_path = get_dropbox_file_path()
     excel_revision = get_dropbox_revision(excel_path, access_token)
@@ -12115,9 +12496,23 @@ def load_data():
     設定がなければ同じフォルダのローカルExcelを読む。
     """
     if has_dropbox_auth_config():
-        return load_fast_dropbox_data()
+        # 日本時間の日付をキャッシュキーに含め、日付が変われば自動的に別キャッシュを使う。
+        # 残数と次回配達予定の再計算場所・計算方法は従来のまま変更しない。
+        return load_fast_dropbox_data(get_jst_now().date().isoformat())
 
     return normalize_excel_table(read_excel_local())
+
+@st.cache_data(ttl=300, show_spinner=False)
+def load_dispatch_customer_names():
+    """配車表の納品先リンク判定用に、顧客名だけを5分間再利用する。"""
+    customer_df = load_data()
+    if "顧客名" not in customer_df.columns:
+        return set()
+    return {
+        clean_value(value, blank_text="").strip()
+        for value in customer_df["顧客名"].tolist()
+        if clean_value(value, blank_text="").strip()
+    }
 
 
 # =========================
@@ -12827,7 +13222,7 @@ def show_customer_detail(df, customer_name):
             st.warning(f"ソリュブル情報を読み込めませんでした：{exc}")
 
     render_customer_estimates_section(customer_name, customer_key)
-    render_customer_attachments_section(customer_name, customer_key)
+    render_customer_attachments_lazy_section(customer_name, customer_key)
 
     show_customer_notes(customer_name)
     render_past_products_section(customer_name, customer_key, detail, visible_detail)
@@ -12997,6 +13392,51 @@ def find_customer_search_candidates(df, keyword):
     return matched.reset_index(drop=True)
 
 
+@st.cache_data(ttl=300, show_spinner=False)
+def load_global_customer_search_index():
+    """共通検索用に、顧客名・ひらがな・地域だけを5分間再利用する。"""
+    columns = ["顧客名", "ひらがな", "地域"]
+    customer_df = load_data()
+    if not isinstance(customer_df, pd.DataFrame) or not set(columns).issubset(customer_df.columns):
+        return pd.DataFrame(columns=columns + ["_検索文字"])
+
+    customers = customer_df[columns].copy()
+    for column in columns:
+        customers[column] = customers[column].apply(
+            lambda value: clean_value(value, blank_text="").strip()
+        )
+    customers = customers[customers["顧客名"] != ""].drop_duplicates(
+        subset=["顧客名"],
+        keep="first",
+    )
+    customers["_検索文字"] = customers.apply(
+        lambda row: " ".join(
+            [row["顧客名"], row["ひらがな"], row["地域"]]
+        ).casefold(),
+        axis=1,
+    )
+    return customers.reset_index(drop=True)
+
+def find_global_customer_search_candidates(search_index, keyword):
+    """共通検索用の小さな索引から、全検索語を含む顧客を返す。"""
+    columns = ["顧客名", "ひらがな", "地域"]
+    if (
+        not isinstance(search_index, pd.DataFrame)
+        or not set(columns + ["_検索文字"]).issubset(search_index.columns)
+    ):
+        return pd.DataFrame(columns=columns)
+
+    terms = normalize_customer_search_terms(keyword)
+    if not terms:
+        return pd.DataFrame(columns=columns)
+
+    matched = pd.Series(True, index=search_index.index)
+    searchable = search_index["_検索文字"].fillna("").astype(str)
+    for term in terms:
+        matched &= searchable.str.contains(term, regex=False, na=False)
+
+    return search_index.loc[matched, columns].reset_index(drop=True)
+
 def render_customer_search_candidate_cards(customers, limit=None):
     """顧客検索候補を、顧客詳細へ直接移動できるカードで表示する。"""
     visible = customers if limit is None else customers.head(int(limit))
@@ -13063,7 +13503,10 @@ def render_global_customer_search():
 
     try:
         with st.spinner("顧客を検索しています…"):
-            customers = find_customer_search_candidates(load_data(), keyword)
+            customers = find_global_customer_search_candidates(
+                load_global_customer_search_index(),
+                keyword,
+            )
     except Exception as exc:
         st.warning(f"顧客検索を読み込めませんでした：{exc}")
         return
@@ -14805,17 +15248,10 @@ def show_dispatch_board():
     for column in ["引取先", "商品名", "数量", "運送会社", "納品先"]:
         display_df[column] = display_df[column].map(normalize_dispatch_text)
 
-    customer_names = set()
     try:
-        customer_df = load_data()
-        if "顧客名" in customer_df.columns:
-            customer_names = {
-                clean_value(value, blank_text="").strip()
-                for value in customer_df["顧客名"].tolist()
-                if clean_value(value, blank_text="").strip()
-            }
+        customer_names = load_dispatch_customer_names()
     except Exception:
-        # 顧客データを確認できない場合も、配車表は従来どおり文字表示で続行する。
+        # 顧客名一覧を確認できない場合も、配車表は従来どおり文字表示で続行する。
         customer_names = set()
 
     render_dispatch_responsive_list(display_df, customer_names)
@@ -17066,6 +17502,13 @@ def save_water_it_snapshot_to_supabase(content, filename, dataframe):
             + (f" {detail}" if detail else "")
         )
     load_saved_water_it_snapshot.clear()
+    # 保存直後は、対象顧客の小さな照合索引も次回表示時に作り直す。
+    try:
+        load_persisted_water_it_customer_key_index.clear()
+    except NameError:
+        pass
+    st.session_state.pop(WATER_IT_CUSTOMER_INDEX_SESSION_KEY, None)
+    st.session_state.pop(WATER_IT_CUSTOMER_INDEX_HASH_SESSION_KEY, None)
 
 
 @st.cache_data(ttl=30, show_spinner=False)
@@ -17157,6 +17600,11 @@ def remember_uploaded_water_it_csv(uploaded_file):
     st.session_state[WATER_IT_UPLOAD_NAME_KEY] = uploaded_name
     st.session_state[WATER_IT_UPLOAD_HASH_KEY] = digest
     st.session_state[WATER_IT_UPLOAD_PERSISTED_KEY] = persisted
+    # 選択したCSVの対象顧客索引を同じセッション内で再利用する。
+    st.session_state[WATER_IT_CUSTOMER_INDEX_HASH_SESSION_KEY] = digest
+    st.session_state[WATER_IT_CUSTOMER_INDEX_SESSION_KEY] = (
+        build_water_it_customer_key_index(dataframe)
+    )
     temporary_store = get_water_it_temporary_store()
     temporary_store.update(
         {
@@ -17254,6 +17702,59 @@ def get_water_it_customer_rows(dataframe, customer_name):
     point_keys = dataframe["ポイント"].map(canonical_water_it_customer_key)
     return dataframe[point_keys == target].copy()
 
+def build_water_it_customer_key_index(dataframe):
+    """WATER it対象顧客の照合キーだけを小さなタプルにまとめる。"""
+    if dataframe is None or dataframe.empty or "ポイント" not in dataframe.columns:
+        return tuple()
+    keys = {
+        canonical_water_it_customer_key(value)
+        for value in dataframe["ポイント"].dropna().tolist()
+    }
+    return tuple(sorted(key for key in keys if key))
+
+@st.cache_data(ttl=WATER_IT_CUSTOMER_INDEX_TTL_SECONDS, show_spinner=False)
+def load_persisted_water_it_customer_key_index():
+    """保存済みCSVまたは同梱CSVから、対象顧客の照合キーだけを再利用する。"""
+    saved = load_saved_water_it_snapshot()
+    if saved:
+        return build_water_it_customer_key_index(saved["dataframe"])
+    dataframe, _ = load_water_it_data()
+    return build_water_it_customer_key_index(dataframe)
+
+def get_active_water_it_customer_key_index():
+    """現在有効なWATER itデータの対象顧客キーだけを返す。"""
+    uploaded_content = st.session_state.get(WATER_IT_UPLOAD_BYTES_KEY)
+    uploaded_hash = st.session_state.get(WATER_IT_UPLOAD_HASH_KEY)
+    if not uploaded_content:
+        temporary_store = get_water_it_temporary_store()
+        uploaded_content = temporary_store.get("content")
+        uploaded_hash = temporary_store.get("hash")
+
+    if uploaded_content:
+        digest = str(uploaded_hash or hashlib.sha256(uploaded_content).hexdigest())
+        cached_digest = st.session_state.get(WATER_IT_CUSTOMER_INDEX_HASH_SESSION_KEY)
+        cached_keys = st.session_state.get(WATER_IT_CUSTOMER_INDEX_SESSION_KEY)
+        if cached_digest == digest and isinstance(cached_keys, (tuple, list, set)):
+            return set(cached_keys)
+        keys = build_water_it_customer_key_index(parse_water_it_csv(uploaded_content))
+        st.session_state[WATER_IT_CUSTOMER_INDEX_HASH_SESSION_KEY] = digest
+        st.session_state[WATER_IT_CUSTOMER_INDEX_SESSION_KEY] = keys
+        return set(keys)
+
+    return set(load_persisted_water_it_customer_key_index())
+
+def customer_has_water_it_data(customer_name):
+    """対象顧客だけWATER it本体を読み込むための事前判定。"""
+    target = canonical_water_it_customer_key(customer_name)
+    if not target:
+        return False
+    try:
+        return target in get_active_water_it_customer_key_index()
+    except Exception:
+        # 索引確認に失敗した場合は従来処理へ戻し、表示機会を失わない。
+        return True
+
+
 
 def render_customer_water_it_card(customer_name):
     """顧客詳細にWATER itの最新値を読み取り専用で表示する。
@@ -17261,6 +17762,10 @@ def render_customer_water_it_card(customer_name):
     ポイント名と顧客名が一致しない顧客には何も表示しない。
     ExcelやWATER itへの書き込み処理は行わない。
     """
+    # 対象外の顧客では、WATER it本体・Supabase保存CSVを読み込まない。
+    if not customer_has_water_it_data(customer_name):
+        return
+
     try:
         dataframe, source = get_active_water_it_data()
     except Exception:
