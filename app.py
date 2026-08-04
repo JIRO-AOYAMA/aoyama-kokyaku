@@ -436,6 +436,11 @@ WATER_IT_STORAGE_ID = str(
     uuid.uuid5(uuid.NAMESPACE_URL, "aoyama-water-it-csv-snapshot-v1")
 )
 WATER_IT_STORAGE_VERSION = 1
+# 顧客詳細では、WATER it対象顧客の小さな照合索引だけを5分間再利用する。
+# 元CSV・Supabase保存内容・顧客名の照合ルール自体は変更しない。
+WATER_IT_CUSTOMER_INDEX_TTL_SECONDS = 5 * 60
+WATER_IT_CUSTOMER_INDEX_SESSION_KEY = "water_it_customer_key_index"
+WATER_IT_CUSTOMER_INDEX_HASH_SESSION_KEY = "water_it_customer_key_index_hash"
 WATER_IT_REQUIRED_COLUMNS = [
     "測定日時",
     "測定項目",
@@ -17535,6 +17540,13 @@ def save_water_it_snapshot_to_supabase(content, filename, dataframe):
             + (f" {detail}" if detail else "")
         )
     load_saved_water_it_snapshot.clear()
+    # 保存直後は、対象顧客の小さな照合索引も次回表示時に作り直す。
+    try:
+        load_persisted_water_it_customer_key_index.clear()
+    except NameError:
+        pass
+    st.session_state.pop(WATER_IT_CUSTOMER_INDEX_SESSION_KEY, None)
+    st.session_state.pop(WATER_IT_CUSTOMER_INDEX_HASH_SESSION_KEY, None)
 
 
 @st.cache_data(ttl=30, show_spinner=False)
@@ -17626,6 +17638,11 @@ def remember_uploaded_water_it_csv(uploaded_file):
     st.session_state[WATER_IT_UPLOAD_NAME_KEY] = uploaded_name
     st.session_state[WATER_IT_UPLOAD_HASH_KEY] = digest
     st.session_state[WATER_IT_UPLOAD_PERSISTED_KEY] = persisted
+    # 選択したCSVの対象顧客索引を同じセッション内で再利用する。
+    st.session_state[WATER_IT_CUSTOMER_INDEX_HASH_SESSION_KEY] = digest
+    st.session_state[WATER_IT_CUSTOMER_INDEX_SESSION_KEY] = (
+        build_water_it_customer_key_index(dataframe)
+    )
     temporary_store = get_water_it_temporary_store()
     temporary_store.update(
         {
@@ -17724,12 +17741,72 @@ def get_water_it_customer_rows(dataframe, customer_name):
     return dataframe[point_keys == target].copy()
 
 
+def build_water_it_customer_key_index(dataframe):
+    """WATER it対象顧客の照合キーだけを小さなタプルにまとめる。"""
+    if dataframe is None or dataframe.empty or "ポイント" not in dataframe.columns:
+        return tuple()
+    keys = {
+        canonical_water_it_customer_key(value)
+        for value in dataframe["ポイント"].dropna().tolist()
+    }
+    return tuple(sorted(key for key in keys if key))
+
+
+@st.cache_data(ttl=WATER_IT_CUSTOMER_INDEX_TTL_SECONDS, show_spinner=False)
+def load_persisted_water_it_customer_key_index():
+    """保存済みCSVまたは同梱CSVから、対象顧客の照合キーだけを再利用する。"""
+    saved = load_saved_water_it_snapshot()
+    if saved:
+        return build_water_it_customer_key_index(saved["dataframe"])
+    dataframe, _ = load_water_it_data()
+    return build_water_it_customer_key_index(dataframe)
+
+
+def get_active_water_it_customer_key_index():
+    """現在有効なWATER itデータの対象顧客キーだけを返す。"""
+    uploaded_content = st.session_state.get(WATER_IT_UPLOAD_BYTES_KEY)
+    uploaded_hash = st.session_state.get(WATER_IT_UPLOAD_HASH_KEY)
+    if not uploaded_content:
+        temporary_store = get_water_it_temporary_store()
+        uploaded_content = temporary_store.get("content")
+        uploaded_hash = temporary_store.get("hash")
+
+    if uploaded_content:
+        digest = str(uploaded_hash or hashlib.sha256(uploaded_content).hexdigest())
+        cached_digest = st.session_state.get(WATER_IT_CUSTOMER_INDEX_HASH_SESSION_KEY)
+        cached_keys = st.session_state.get(WATER_IT_CUSTOMER_INDEX_SESSION_KEY)
+        if cached_digest == digest and isinstance(cached_keys, (tuple, list, set)):
+            return set(cached_keys)
+        keys = build_water_it_customer_key_index(parse_water_it_csv(uploaded_content))
+        st.session_state[WATER_IT_CUSTOMER_INDEX_HASH_SESSION_KEY] = digest
+        st.session_state[WATER_IT_CUSTOMER_INDEX_SESSION_KEY] = keys
+        return set(keys)
+
+    return set(load_persisted_water_it_customer_key_index())
+
+
+def customer_has_water_it_data(customer_name):
+    """対象顧客だけWATER it本体を読み込むための事前判定。"""
+    target = canonical_water_it_customer_key(customer_name)
+    if not target:
+        return False
+    try:
+        return target in get_active_water_it_customer_key_index()
+    except Exception:
+        # 索引確認に失敗した場合は従来処理へ戻し、表示機会を失わない。
+        return True
+
+
 def render_customer_water_it_card(customer_name):
     """顧客詳細にWATER itの最新値を読み取り専用で表示する。
 
     ポイント名と顧客名が一致しない顧客には何も表示しない。
     ExcelやWATER itへの書き込み処理は行わない。
     """
+    # 対象外の顧客では、WATER it本体・Supabase保存CSVを読み込まない。
+    if not customer_has_water_it_data(customer_name):
+        return
+
     try:
         dataframe, source = get_active_water_it_data()
     except Exception:
