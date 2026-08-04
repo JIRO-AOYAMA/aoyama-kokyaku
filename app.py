@@ -9509,6 +9509,39 @@ def render_customer_attachments_section(
 
 
 
+
+def _open_customer_attachments_lazy_section(load_key, force_open_key):
+    """顧客詳細の写真・PDFを、利用者が開いた時だけ読み込む。"""
+    st.session_state[load_key] = True
+    st.session_state[force_open_key] = True
+
+
+def render_customer_attachments_lazy_section(customer_name, customer_key=None):
+    """初期表示ではOneDrive/Supabaseへ接続せず、ボタン操作後だけ既存機能を表示する。"""
+    entity_type = "customer"
+    entity_name = clean_value(customer_name, blank_text="").strip()
+    entity_id = clean_value(customer_key, blank_text="").strip()
+    identity = f"{entity_type}:{entity_id or entity_name}"
+    suffix = hashlib.sha256(str(identity).encode("utf-8")).hexdigest()[:16]
+    load_key = f"customer_attachments_lazy_loaded_{suffix}"
+    force_open_key = f"onedrive_attachment_force_open_{suffix}"
+
+    if not st.session_state.get(load_key, False):
+        st.button(
+            "📎 写真・PDFを開く",
+            key=f"customer_attachments_lazy_open_{suffix}",
+            use_container_width=True,
+            on_click=_open_customer_attachments_lazy_section,
+            args=(load_key, force_open_key),
+        )
+        return
+
+    render_customer_attachments_section(
+        customer_name,
+        customer_key,
+        entity_type=entity_type,
+    )
+
 def show_attachment_search_page():
     """顧客・仕入先・運送会社・ホテルの写真・資料を横断検索する。"""
     st.header("🔎 写真・資料検索")
@@ -13027,7 +13060,7 @@ def show_customer_detail(df, customer_name):
     )
     performance_timed_call(
         "顧客詳細：写真・PDF",
-        render_customer_attachments_section,
+        render_customer_attachments_lazy_section,
         customer_name,
         customer_key,
     )
