@@ -8890,13 +8890,23 @@ def render_customer_attachments_section(
         return
 
     try:
-        attachments = get_entity_attachments(entity_type, entity_name, entity_id)
+        attachments = performance_timed_call(
+            "写真PDF：Supabaseメタデータ",
+            get_entity_attachments,
+            entity_type,
+            entity_name,
+            entity_id,
+        )
     except Exception as exc:
         with st.expander("📎 写真・資料"):
             st.warning(f"写真・資料の一覧を読み込めませんでした：{exc}")
         return
 
-    attachment_groups = group_onedrive_attachments_for_display(attachments)
+    attachment_groups = performance_timed_call(
+        "写真PDF：一覧グループ化",
+        group_onedrive_attachments_for_display,
+        attachments,
+    )
     force_open = bool(st.session_state.pop(open_key, False))
     restore_scroll = bool(st.session_state.pop(restore_key, False))
     with st.expander(f"📎 写真・資料　{len(attachment_groups)}件", expanded=force_open):
@@ -8915,7 +8925,10 @@ def render_customer_attachments_section(
             st.error(auth_error)
 
         try:
-            read_onedrive_settings()
+            performance_timed_call(
+                "写真PDF：OneDrive設定確認",
+                read_onedrive_settings,
+            )
         except Exception as exc:
             st.warning(str(exc))
             st.code(
@@ -8939,8 +8952,15 @@ def render_customer_attachments_section(
             st.code(f'refresh_token = "{setup_refresh_token}"', language="toml")
             st.caption("追加して保存するとアプリが再起動し、通常画面から接続ボタンが消えます。")
 
-        access_token = get_onedrive_access_token()
-        tag_history_options = get_attachment_tag_history_options(attachments)
+        access_token = performance_timed_call(
+            "写真PDF：OneDrive認証",
+            get_onedrive_access_token,
+        )
+        tag_history_options = performance_timed_call(
+            "写真PDF：全体タグ履歴",
+            get_attachment_tag_history_options,
+            attachments,
+        )
         mobile_browser = is_mobile_browser()
         if mobile_browser:
             album_tab, add_tab, camera_tab = st.tabs(
@@ -8951,6 +8971,7 @@ def render_customer_attachments_section(
             camera_tab = None
 
         # 追加タブは保存済み画像とPDF専用。タブの初期表示は先頭のアルバム。
+        add_tab_started_at = time.perf_counter()
         with add_tab:
             if not access_token:
                 if configured_refresh_token:
@@ -9212,6 +9233,14 @@ def render_customer_attachments_section(
                             except Exception as exc:
                                 st.error(f"保存できませんでした：{exc}")
 
+        record_performance_timing(
+            "写真PDF：追加タブ描画",
+            time.perf_counter() - add_tab_started_at,
+        )
+
+        album_started_at = time.perf_counter()
+        thumbnail_download_seconds = 0.0
+        thumbnail_download_count = 0
         with album_tab:
             st.markdown("#### アルバム")
             if not attachments:
@@ -9284,6 +9313,7 @@ def render_customer_attachments_section(
                                         continue
                                     thumb_key = f"onedrive_thumbnail_{thumbnail_item_id}"
                                     if not isinstance(st.session_state.get(thumb_key), bytes):
+                                        thumbnail_started_at = time.perf_counter()
                                         try:
                                             thumbnail = download_onedrive_attachment_thumbnail(
                                                 access_token,
@@ -9293,6 +9323,11 @@ def render_customer_attachments_section(
                                                 st.session_state[thumb_key] = thumbnail
                                         except Exception:
                                             pass
+                                        finally:
+                                            thumbnail_download_seconds += (
+                                                time.perf_counter() - thumbnail_started_at
+                                            )
+                                            thumbnail_download_count += 1
                                     if isinstance(st.session_state.get(thumb_key), bytes):
                                         thumbnail_content = st.session_state[thumb_key]
                                         thumbnail_filename = thumbnail_item.get(
@@ -9506,8 +9541,19 @@ def render_customer_attachments_section(
                     st.session_state[limit_key] = limit + ONEDRIVE_PAGE_SIZE
                     st.rerun()
 
-
-
+        album_elapsed = time.perf_counter() - album_started_at
+        record_performance_timing(
+            f"写真PDF：サムネイル取得（{thumbnail_download_count}件）",
+            thumbnail_download_seconds,
+        )
+        record_performance_timing(
+            "写真PDF：カード・画面描画",
+            max(album_elapsed - thumbnail_download_seconds, 0.0),
+        )
+        record_performance_timing(
+            "写真PDF：アルバム全体",
+            album_elapsed,
+        )
 
 
 def _open_customer_attachments_lazy_section(load_key, force_open_key):
