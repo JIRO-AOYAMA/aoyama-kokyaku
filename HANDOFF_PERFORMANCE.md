@@ -17,6 +17,27 @@
 - 新規環境のStreamlit 1.60.0でCookie準備待ちの白画面になったため、テストブランチだけ直前版`1.59.2`へ固定して比較中。
 - The isolated app `aoyama-kokyaku-cszjcu4w4rmykjojby9wxm.streamlit.app` stayed blank even after `app.py` was replaced with a minimal three-widget page and the app was rebooted. This rules out the customer app code and points to a broken Streamlit app instance/deployment.
 - The full diagnostic `app.py` was restored exactly from commit `cd0150f` in restore commit `43c56c8`.
+
+## Private performance app (2026-08-04)
+
+- New test app: `https://aoyama-kokyaku-qwlh5ekeys6bgnhjovzawx.streamlit.app/`
+- Repository/branch/file: `JIRO-AOYAMA/aoyama-kokyaku` / `perf/phase1-measurement-20260804` / `app.py`
+- Python: `3.12`
+- The user turned off `Make this app public` before the test-only login gate was deployed.
+- Commit `db0de3e` adds a test-only login gate. It is enabled only when all three conditions are true:
+  1. The request host exactly matches the new test app host.
+  2. The URL contains `perf=1`.
+  3. The test app has the top-level Streamlit Secret `PERFORMANCE_TEST_MODE = true`.
+- Synthetic test claims are not written to the Supabase Microsoft login history.
+- Production `main` and the production Streamlit app were not changed.
+
+### Immediate next step
+
+1. Add `PERFORMANCE_TEST_MODE = true` at the very top of the new private test app's Secrets, before the first TOML section header such as `[auth]`.
+2. Save the Secrets.
+3. Open `https://aoyama-kokyaku-qwlh5ekeys6bgnhjovzawx.streamlit.app/?perf=1`.
+4. Confirm the home screen and the private performance-test warning appear without Microsoft login.
+5. Measure the baseline before making any performance optimization.
 - OneDrive内の旧`.py`は使用しない。
 
 ## 次に行うこと
