@@ -6683,6 +6683,63 @@ def load_notes_from_supabase(customer_name=None, limit=500):
     ]
 
 
+@performance_timed("メモ：存在索引")
+@st.cache_data(ttl=300, show_spinner=False)
+def load_note_presence_index():
+    """顧客メモが存在する顧客名だけを、小さい索引としてSupabaseから読む。"""
+    if not has_supabase_config():
+        return tuple()
+
+    customer_names = set()
+    page_size = 1000
+    offset = 0
+    while True:
+        params = {
+            "select": "id,customer_name",
+            "order": "id.asc",
+            "limit": str(page_size),
+            "offset": str(offset),
+            "id": f"not.like.{LINE_STATUS_NOTE_PREFIX}*",
+        }
+        try:
+            response = requests.get(
+                get_supabase_notes_url(),
+                headers=get_supabase_headers(),
+                params=params,
+                timeout=30,
+            )
+        except Exception as exc:
+            raise RuntimeError("メモの索引読み込み中にSupabaseへ接続できませんでした。") from exc
+        if response.status_code != 200:
+            detail = str(response.text or "").strip()[:500]
+            message = f"メモの索引を読み込めませんでした（{response.status_code}）。"
+            if detail:
+                message += f" {detail}"
+            raise RuntimeError(message)
+        page = response.json()
+        if not isinstance(page, list):
+            raise RuntimeError("Supabaseから返ったメモ索引の形式が正しくありません。")
+
+        for note in page:
+            if not isinstance(note, dict):
+                continue
+            customer_name = clean_value(note.get("customer_name"), blank_text="").strip()
+            if customer_name and customer_name != HOME_TODO_CUSTOMER_NAME:
+                customer_names.add(customer_name)
+
+        if len(page) < page_size:
+            break
+        offset += page_size
+
+    return tuple(sorted(customer_names))
+
+
+def customer_has_notes(customer_name):
+    """存在索引だけで、その顧客にメモがあるか確認する。"""
+    target = clean_value(customer_name, blank_text="").strip()
+    return target in set(load_note_presence_index())
+
+
 def insert_note_to_supabase(note):
     """Supabaseのnotesテーブルへメモを1件追加する"""
     if not has_supabase_config():
@@ -6703,6 +6760,10 @@ def insert_note_to_supabase(note):
     if response.status_code not in (200, 201):
         show_supabase_response_error("保存", response)
     load_notes_from_supabase.clear()
+    try:
+        load_note_presence_index.clear()
+    except Exception:
+        pass
 
 
 def delete_note_from_supabase(note_id):
@@ -6731,6 +6792,10 @@ def delete_note_from_supabase(note_id):
         show_supabase_response_error("削除", response)
 
     load_notes_from_supabase.clear()
+    try:
+        load_note_presence_index.clear()
+    except Exception:
+        pass
     return True
 
 
@@ -6757,6 +6822,7 @@ def add_note(customer_name, body):
     return True
 
 
+@performance_timed("メモ：詳細取得")
 def get_notes_for_customer(customer_name):
     return load_notes_from_supabase(customer_name=customer_name)
 
@@ -7186,7 +7252,16 @@ def show_customer_notes(customer_name):
     if st.session_state.pop("note_save_success", None) == customer_name:
         st.success("メモを保存しました。")
 
-    customer_notes = get_notes_for_customer(customer_name)
+    try:
+        has_notes = customer_has_notes(customer_name)
+    except Exception:
+        # 索引確認に失敗した場合は、表示欠落を避けるため従来どおり詳細取得へ戻す。
+        has_notes = None
+
+    if has_notes is False:
+        customer_notes = []
+    else:
+        customer_notes = get_notes_for_customer(customer_name)
 
     if not customer_notes:
         st.info("この顧客のメモはまだありません。")
@@ -10488,7 +10563,80 @@ def estimate_sort_key(item):
     )
 
 
+@performance_timed("見積り：存在索引")
+@st.cache_data(ttl=300, show_spinner=False)
+def load_estimate_presence_index():
+    """提案・見積りが存在する顧客だけを、小さい索引としてSupabaseから読む。"""
+    if not has_supabase_config():
+        return {"customer_keys": tuple(), "customer_names": tuple()}
+
+    key_values = set()
+    name_values = set()
+    page_size = 1000
+    offset = 0
+    while True:
+        params = {
+            "select": "id,customer_key,customer_name,field_name",
+            "field_name": f"like.{ESTIMATE_PREFIX}*",
+            "order": "id.asc",
+            "limit": str(page_size),
+            "offset": str(offset),
+        }
+        try:
+            response = requests.get(
+                get_supabase_customer_information_url(),
+                headers=get_supabase_headers(),
+                params=params,
+                timeout=30,
+            )
+        except Exception as exc:
+            raise RuntimeError("見積りの索引読み込み中にSupabaseへ接続できませんでした。") from exc
+        check_customer_information_response("読み込み", response, (200,))
+        page = response.json()
+        if not isinstance(page, list):
+            raise RuntimeError("Supabaseから返った見積り索引の形式が正しくありません。")
+
+        for item in page:
+            if not isinstance(item, dict) or not is_estimate_item(item):
+                continue
+            item_key = clean_value(item.get("customer_key"), blank_text="").strip()
+            item_name = clean_value(item.get("customer_name"), blank_text="").strip()
+            if item_key:
+                key_values.add(item_key)
+            elif item_name:
+                name_values.add(item_name)
+
+        if len(page) < page_size:
+            break
+        offset += page_size
+
+    return {
+        "customer_keys": tuple(sorted(key_values)),
+        "customer_names": tuple(sorted(name_values)),
+    }
+
+
+def customer_has_estimates(customer_name, customer_key=None):
+    """存在索引だけで、その顧客に提案・見積りがあるか確認する。"""
+    index = load_estimate_presence_index()
+    if customer_key:
+        target = clean_value(customer_key, blank_text="").strip()
+        return target in set(index.get("customer_keys", ()))
+    target = clean_value(customer_name, blank_text="").strip()
+    return target in set(index.get("customer_names", ()))
+
+
+@performance_timed("見積り：詳細取得")
 def get_customer_estimates(customer_name, customer_key):
+    try:
+        has_estimates = customer_has_estimates(customer_name, customer_key)
+    except Exception:
+        # 索引確認に失敗した場合は、表示欠落を避けるため従来どおり詳細取得へ戻す。
+        has_estimates = None
+
+    if has_estimates is False:
+        return []
+
     items = load_customer_information(customer_name, customer_key)
     estimates = []
     for item in items:
@@ -10542,6 +10690,10 @@ def load_all_estimates_from_supabase():
 def clear_estimate_cache():
     try:
         load_all_estimates_from_supabase.clear()
+    except Exception:
+        pass
+    try:
+        load_estimate_presence_index.clear()
     except Exception:
         pass
 
