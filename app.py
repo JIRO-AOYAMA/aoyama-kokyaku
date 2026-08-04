@@ -8963,6 +8963,12 @@ def render_customer_attachments_section(
     entity_id = clean_value(customer_key, blank_text="").strip()
     identity = f"{entity_type}:{entity_id or entity_name}"
     suffix = hashlib.sha256(str(identity).encode("utf-8")).hexdigest()[:16]
+    add_form_version_key = f"onedrive_attachment_add_form_version_{suffix}"
+    camera_form_version_key = f"onedrive_attachment_camera_form_version_{suffix}"
+    add_form_version = int(st.session_state.get(add_form_version_key, 0) or 0)
+    camera_form_version = int(st.session_state.get(camera_form_version_key, 0) or 0)
+    add_widget_suffix = f"{suffix}_{add_form_version}"
+    camera_widget_suffix = f"{suffix}_{camera_form_version}"
     success_key = f"onedrive_attachment_success_{suffix}"
     upload_error_key = f"onedrive_attachment_upload_error_{suffix}"
     edit_key = f"onedrive_attachment_edit_{suffix}"
@@ -9081,7 +9087,7 @@ def render_customer_attachments_section(
                     image_uploader_label,
                     type=image_uploader_types,
                     accept_multiple_files=True,
-                    key=f"onedrive_attachment_photo_uploader_{suffix}",
+                    key=f"onedrive_attachment_photo_uploader_{add_widget_suffix}",
                 )
                 if mobile_browser:
                     enable_mobile_bulk_image_picker(image_uploader_label)
@@ -9116,7 +9122,7 @@ def render_customer_attachments_section(
                     "📄 PDFを選ぶ",
                     type=["pdf"],
                     accept_multiple_files=False,
-                    key=f"onedrive_attachment_pdf_uploader_{suffix}",
+                    key=f"onedrive_attachment_pdf_uploader_{add_widget_suffix}",
                 )
 
                 pending_add_files = bool(photo_files) or pdf_file is not None
@@ -9128,12 +9134,12 @@ def render_customer_attachments_section(
                 selected_history_tags = st.multiselect(
                     "タグ（入力すると過去の候補を絞り込み）",
                     add_tag_history_options,
-                    key=f"onedrive_attachment_history_tags_{suffix}",
+                    key=f"onedrive_attachment_history_tags_{add_widget_suffix}",
                 )
                 new_tags_text = st.text_input(
                     "新しいタグ（候補にない場合）",
                     placeholder="例：北海道、タンク、要確認",
-                    key=f"onedrive_attachment_new_tags_{suffix}",
+                    key=f"onedrive_attachment_new_tags_{add_widget_suffix}",
                 )
                 if add_tag_history_options:
                     st.caption(
@@ -9144,13 +9150,13 @@ def render_customer_attachments_section(
                     "備考",
                     placeholder="写真や資料について残したい内容",
                     height=90,
-                    key=f"onedrive_attachment_remarks_{suffix}",
+                    key=f"onedrive_attachment_remarks_{add_widget_suffix}",
                 )
                 if st.button(
                     "OneDriveへ保存",
                     type="primary",
                     use_container_width=True,
-                    key=f"onedrive_attachment_upload_{suffix}",
+                    key=f"onedrive_attachment_upload_{add_widget_suffix}",
                 ):
                     uploaded_files = photo_files if photo_files else ([pdf_file] if pdf_file is not None else [])
                     if invalid_photo_files:
@@ -9204,6 +9210,10 @@ def render_customer_attachments_section(
                             else:
                                 st.session_state[success_key] = f"写真・資料を{len(saved_items)}件保存しました。"
                             st.session_state[limit_key] = ONEDRIVE_PAGE_SIZE
+                            # 全件正常保存できた時だけ、次の追加を空の入力状態で始める。
+                            # 一部失敗時は、再確認できるよう現在の入力を残す。
+                            if not failed_items:
+                                st.session_state[add_form_version_key] = add_form_version + 1
                         if failed_items:
                             failed_names = "、".join(name for name, _ in failed_items)
                             first_error = failed_items[0][1]
@@ -9238,7 +9248,7 @@ def render_customer_attachments_section(
                         camera_label,
                         type=["jpg", "jpeg", "png", "webp"],
                         accept_multiple_files=False,
-                        key=f"onedrive_attachment_camera_uploader_{suffix}",
+                        key=f"onedrive_attachment_camera_uploader_{camera_widget_suffix}",
                         help="スマホの背面カメラを起動して撮影します。",
                     )
                     enable_mobile_camera_capture(camera_label)
@@ -9251,12 +9261,12 @@ def render_customer_attachments_section(
                     camera_history_tags = st.multiselect(
                         "タグ（入力すると過去の候補を絞り込み）",
                         camera_tag_history_options,
-                        key=f"onedrive_attachment_camera_history_tags_{suffix}",
+                        key=f"onedrive_attachment_camera_history_tags_{camera_widget_suffix}",
                     )
                     camera_new_tags_text = st.text_input(
                         "新しいタグ（候補にない場合）",
                         placeholder="例：北海道、タンク、要確認",
-                        key=f"onedrive_attachment_camera_new_tags_{suffix}",
+                        key=f"onedrive_attachment_camera_new_tags_{camera_widget_suffix}",
                     )
                     if camera_tag_history_options:
                         st.caption(
@@ -9267,13 +9277,13 @@ def render_customer_attachments_section(
                         "備考",
                         placeholder="写真について残したい内容",
                         height=90,
-                        key=f"onedrive_attachment_camera_remarks_{suffix}",
+                        key=f"onedrive_attachment_camera_remarks_{camera_widget_suffix}",
                     )
                     if st.button(
                         "OneDriveへ保存",
                         type="primary",
                         use_container_width=True,
-                        key=f"onedrive_attachment_camera_upload_{suffix}",
+                        key=f"onedrive_attachment_camera_upload_{camera_widget_suffix}",
                     ):
                         if camera_file is None:
                             st.warning("写真を撮ってください。")
@@ -9316,6 +9326,8 @@ def render_customer_attachments_section(
                                 )
                                 st.session_state[success_key] = "写真・資料を保存しました。"
                                 st.session_state[limit_key] = ONEDRIVE_PAGE_SIZE
+                                # 保存後は、次の撮影を空のタグ・備考・写真選択で始める。
+                                st.session_state[camera_form_version_key] = camera_form_version + 1
                                 st.rerun()
                             except Exception as exc:
                                 st.error(f"保存できませんでした：{exc}")
