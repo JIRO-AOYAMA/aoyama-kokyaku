@@ -12650,9 +12650,9 @@ def recalculate_customer_inventory_for_today(df):
 
 
 @performance_timed("顧客データ：Dropbox・軽量キャッシュ")
-@st.cache_data(ttl=60, show_spinner=False)
-def load_fast_dropbox_data():
-    """通常表示は小さなJSONを使い、Excelが変わった時だけ再生成する。"""
+@st.cache_data(ttl=300, show_spinner=False)
+def load_fast_dropbox_data(jst_date_key):
+    """同じ日本日付ではDropbox確認を5分間再利用し、Excel変更時だけ再生成する。"""
     access_token = get_dropbox_access_token()
     excel_path = get_dropbox_file_path()
     excel_revision = get_dropbox_revision(excel_path, access_token)
@@ -12709,7 +12709,9 @@ def load_data():
     設定がなければ同じフォルダのローカルExcelを読む。
     """
     if has_dropbox_auth_config():
-        return load_fast_dropbox_data()
+        # 日本時間の日付をキャッシュキーに含め、日付が変われば自動的に別キャッシュを使う。
+        # 残数と次回配達予定の再計算場所・計算方法は従来のまま変更しない。
+        return load_fast_dropbox_data(get_jst_now().date().isoformat())
 
     return normalize_excel_table(read_excel_local())
 
