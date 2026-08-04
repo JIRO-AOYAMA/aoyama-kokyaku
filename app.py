@@ -66,6 +66,7 @@ st.set_page_config(
 # テストブランチ用の速度診断
 # =========================
 PERFORMANCE_TIMINGS_KEY = "_performance_timings"
+PERFORMANCE_TEST_HOST = "aoyama-kokyaku-qwlh5ekeys6bgnhjovzawx.streamlit.app"
 
 
 def performance_diagnostics_enabled():
@@ -77,6 +78,52 @@ def performance_diagnostics_enabled():
     if isinstance(value, list):
         value = value[0] if value else ""
     return str(value).strip().lower() in {"1", "true", "on", "yes"}
+
+
+def _secret_value_is_true(value):
+    if isinstance(value, bool):
+        return value
+    return str(value or "").strip().lower() in {"1", "true", "on", "yes"}
+
+
+def _current_request_host():
+    """Return the externally visible host without trusting query parameters."""
+    try:
+        headers = st.context.headers
+        header_items = (
+            headers.to_dict().items()
+            if hasattr(headers, "to_dict")
+            else dict(headers).items()
+        )
+    except Exception:
+        return ""
+
+    forwarded_host = ""
+    direct_host = ""
+    for key, value in header_items:
+        key_lower = str(key).strip().lower()
+        if key_lower == "x-forwarded-host":
+            forwarded_host = str(value or "")
+        elif key_lower == "host":
+            direct_host = str(value or "")
+
+    host = (forwarded_host or direct_host).split(",", 1)[0].strip().lower()
+    return host.split(":", 1)[0].rstrip(".")
+
+
+def private_performance_test_enabled():
+    """Enable the login bypass only for the private, dedicated test deployment."""
+    try:
+        secret_enabled = _secret_value_is_true(
+            st.secrets.get("PERFORMANCE_TEST_MODE", False)
+        )
+    except Exception:
+        secret_enabled = False
+    return bool(
+        secret_enabled
+        and performance_diagnostics_enabled()
+        and hmac.compare_digest(_current_request_host(), PERFORMANCE_TEST_HOST)
+    )
 
 
 def reset_performance_timings():
@@ -996,6 +1043,18 @@ def set_query_params_safely(params):
 
 def get_microsoft_user_claims():
     """Streamlitが検証したMicrosoft OIDCのユーザー情報を辞書で返す。"""
+    if private_performance_test_enabled():
+        issued_at = int(time.time())
+        return {
+            "is_logged_in": True,
+            "sub": MICROSOFT_ALLOWED_SUB or "private-performance-test",
+            "iss": f"{MICROSOFT_ISSUER_PREFIX}consumers/v2.0",
+            "aud": get_configured_auth_client_id(),
+            "iat": issued_at,
+            "exp": issued_at + LOGIN_TOKEN_TTL_SECONDS,
+            "name": "Private performance test",
+            "preferred_username": "private-performance-test",
+        }
     try:
         if hasattr(st.user, "to_dict"):
             claims = st.user.to_dict()
@@ -4589,14 +4648,24 @@ if not active_login_payload:
     set_query_params_safely({"page": "home", "auth_invalid": "1"})
     st.rerun()
 
-login_audit_warning = ensure_login_audit_for_current_session(
-    microsoft_claims,
-    active_login_payload,
-)
+if private_performance_test_enabled():
+    # Synthetic test claims must never be written to the production login history.
+    login_audit_warning = ""
+else:
+    login_audit_warning = ensure_login_audit_for_current_session(
+        microsoft_claims,
+        active_login_payload,
+    )
 if login_audit_warning:
     st.session_state["login_audit_warning"] = login_audit_warning
 
 enforce_login_expiry()
+
+if private_performance_test_enabled():
+    st.warning(
+        "🔒 非公開の速度測定モードです。Microsoftログイン履歴には記録されません。"
+        "本番版は変更していません。"
+    )
 
 
 # =========================
