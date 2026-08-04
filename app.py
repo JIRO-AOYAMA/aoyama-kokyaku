@@ -12257,6 +12257,20 @@ def load_data():
     return normalize_excel_table(read_excel_local())
 
 
+@performance_timed("配車表：顧客名一覧")
+@st.cache_data(ttl=300, show_spinner=False)
+def load_dispatch_customer_names():
+    """配車表の納品先リンク判定用に、顧客名だけを5分間再利用する。"""
+    customer_df = load_data()
+    if "顧客名" not in customer_df.columns:
+        return set()
+    return {
+        clean_value(value, blank_text="").strip()
+        for value in customer_df["顧客名"].tolist()
+        if clean_value(value, blank_text="").strip()
+    }
+
+
 # =========================
 # 画面遷移
 # =========================
@@ -14952,17 +14966,10 @@ def show_dispatch_board():
     for column in ["引取先", "商品名", "数量", "運送会社", "納品先"]:
         display_df[column] = display_df[column].map(normalize_dispatch_text)
 
-    customer_names = set()
     try:
-        customer_df = load_data()
-        if "顧客名" in customer_df.columns:
-            customer_names = {
-                clean_value(value, blank_text="").strip()
-                for value in customer_df["顧客名"].tolist()
-                if clean_value(value, blank_text="").strip()
-            }
+        customer_names = load_dispatch_customer_names()
     except Exception:
-        # 顧客データを確認できない場合も、配車表は従来どおり文字表示で続行する。
+        # 顧客名一覧を確認できない場合も、配車表は従来どおり文字表示で続行する。
         customer_names = set()
 
     render_dispatch_responsive_list(display_df, customer_names)
