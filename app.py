@@ -9020,11 +9020,22 @@ def render_customer_attachments_section(
             "写真PDF：OneDrive認証",
             get_onedrive_access_token,
         )
-        tag_history_options = performance_timed_call(
-            "写真PDF：全体タグ履歴",
-            get_attachment_tag_history_options,
-            attachments,
-        )
+
+        # Streamlitのタブは、選択していないタブの中身も実行される。
+        # そのため全体タグ履歴はアルバム閲覧だけでは読み込まず、
+        # 実際に追加するファイルを選んだ時、写真を撮った時、または編集開始時だけ取得する。
+        tag_history_options_cache = None
+
+        def load_tag_history_options_for_action():
+            nonlocal tag_history_options_cache
+            if tag_history_options_cache is None:
+                tag_history_options_cache = performance_timed_call(
+                    "写真PDF：全体タグ履歴",
+                    get_attachment_tag_history_options,
+                    attachments,
+                )
+            return list(tag_history_options_cache or [])
+
         mobile_browser = is_mobile_browser()
         if mobile_browser:
             album_tab, add_tab, camera_tab = st.tabs(
@@ -9107,9 +9118,15 @@ def render_customer_attachments_section(
                     key=f"onedrive_attachment_pdf_uploader_{suffix}",
                 )
 
+                pending_add_files = bool(photo_files) or pdf_file is not None
+                add_tag_history_options = (
+                    load_tag_history_options_for_action()
+                    if pending_add_files
+                    else []
+                )
                 selected_history_tags = st.multiselect(
                     "タグ（入力すると過去の候補を絞り込み）",
-                    tag_history_options,
+                    add_tag_history_options,
                     key=f"onedrive_attachment_history_tags_{suffix}",
                 )
                 new_tags_text = st.text_input(
@@ -9117,10 +9134,10 @@ def render_customer_attachments_section(
                     placeholder="例：北海道、タンク、要確認",
                     key=f"onedrive_attachment_new_tags_{suffix}",
                 )
-                if tag_history_options:
+                if add_tag_history_options:
                     st.caption(
                         "最近使ったタグ："
-                        + "　".join(f"#{tag}" for tag in tag_history_options[:8])
+                        + "　".join(f"#{tag}" for tag in add_tag_history_options[:8])
                     )
                 remarks = st.text_area(
                     "備考",
@@ -9225,9 +9242,14 @@ def render_customer_attachments_section(
                     )
                     enable_mobile_camera_capture(camera_label)
 
+                    camera_tag_history_options = (
+                        load_tag_history_options_for_action()
+                        if camera_file is not None
+                        else []
+                    )
                     camera_history_tags = st.multiselect(
                         "タグ（入力すると過去の候補を絞り込み）",
-                        tag_history_options,
+                        camera_tag_history_options,
                         key=f"onedrive_attachment_camera_history_tags_{suffix}",
                     )
                     camera_new_tags_text = st.text_input(
@@ -9235,10 +9257,10 @@ def render_customer_attachments_section(
                         placeholder="例：北海道、タンク、要確認",
                         key=f"onedrive_attachment_camera_new_tags_{suffix}",
                     )
-                    if tag_history_options:
+                    if camera_tag_history_options:
                         st.caption(
                             "最近使ったタグ："
-                            + "　".join(f"#{tag}" for tag in tag_history_options[:8])
+                            + "　".join(f"#{tag}" for tag in camera_tag_history_options[:8])
                         )
                     camera_remarks = st.text_area(
                         "備考",
@@ -9532,7 +9554,7 @@ def render_customer_attachments_section(
 
                         if active_edit_id == group_ui_id:
                             current_tags = normalize_attachment_tags(attachment.get("tags") or [])
-                            edit_tag_options = list(tag_history_options)
+                            edit_tag_options = load_tag_history_options_for_action()
                             for current_tag in reversed(current_tags):
                                 if current_tag not in edit_tag_options:
                                     edit_tag_options.insert(0, current_tag)
