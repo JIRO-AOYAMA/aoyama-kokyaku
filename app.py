@@ -13152,6 +13152,54 @@ def find_customer_search_candidates(df, keyword):
     return matched.reset_index(drop=True)
 
 
+@performance_timed("共通検索：顧客検索索引")
+@st.cache_data(ttl=300, show_spinner=False)
+def load_global_customer_search_index():
+    """共通検索用に、顧客名・ひらがな・地域だけを5分間再利用する。"""
+    columns = ["顧客名", "ひらがな", "地域"]
+    customer_df = load_data()
+    if not isinstance(customer_df, pd.DataFrame) or not set(columns).issubset(customer_df.columns):
+        return pd.DataFrame(columns=columns + ["_検索文字"])
+
+    customers = customer_df[columns].copy()
+    for column in columns:
+        customers[column] = customers[column].apply(
+            lambda value: clean_value(value, blank_text="").strip()
+        )
+    customers = customers[customers["顧客名"] != ""].drop_duplicates(
+        subset=["顧客名"],
+        keep="first",
+    )
+    customers["_検索文字"] = customers.apply(
+        lambda row: " ".join(
+            [row["顧客名"], row["ひらがな"], row["地域"]]
+        ).casefold(),
+        axis=1,
+    )
+    return customers.reset_index(drop=True)
+
+
+def find_global_customer_search_candidates(search_index, keyword):
+    """共通検索用の小さな索引から、全検索語を含む顧客を返す。"""
+    columns = ["顧客名", "ひらがな", "地域"]
+    if (
+        not isinstance(search_index, pd.DataFrame)
+        or not set(columns + ["_検索文字"]).issubset(search_index.columns)
+    ):
+        return pd.DataFrame(columns=columns)
+
+    terms = normalize_customer_search_terms(keyword)
+    if not terms:
+        return pd.DataFrame(columns=columns)
+
+    matched = pd.Series(True, index=search_index.index)
+    searchable = search_index["_検索文字"].fillna("").astype(str)
+    for term in terms:
+        matched &= searchable.str.contains(term, regex=False, na=False)
+
+    return search_index.loc[matched, columns].reset_index(drop=True)
+
+
 def render_customer_search_candidate_cards(customers, limit=None):
     """顧客検索候補を、顧客詳細へ直接移動できるカードで表示する。"""
     visible = customers if limit is None else customers.head(int(limit))
@@ -13219,7 +13267,10 @@ def render_global_customer_search():
 
     try:
         with st.spinner("顧客を検索しています…"):
-            customers = find_customer_search_candidates(load_data(), keyword)
+            customers = find_global_customer_search_candidates(
+                load_global_customer_search_index(),
+                keyword,
+            )
     except Exception as exc:
         st.warning(f"顧客検索を読み込めませんでした：{exc}")
         return
