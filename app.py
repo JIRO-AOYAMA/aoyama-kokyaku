@@ -112,18 +112,18 @@ def _current_request_host():
 
 
 def private_performance_test_enabled():
-    """Enable the login bypass only for the private, dedicated test deployment."""
+    """Enable the login bypass only when the dedicated test app secret and perf=1 are both set."""
     try:
         secret_enabled = _secret_value_is_true(
             st.secrets.get("PERFORMANCE_TEST_MODE", False)
         )
     except Exception:
         secret_enabled = False
-    return bool(
-        secret_enabled
-        and performance_diagnostics_enabled()
-        and hmac.compare_digest(_current_request_host(), PERFORMANCE_TEST_HOST)
-    )
+
+    # Streamlit Community Cloud may expose an internal/proxy host in request headers,
+    # so an exact host comparison can incorrectly block the dedicated test app.
+    # Production main is unchanged, and this secret exists only in the private test app.
+    return bool(secret_enabled and performance_diagnostics_enabled())
 
 
 def reset_performance_timings():
