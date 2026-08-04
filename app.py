@@ -12650,9 +12650,9 @@ def recalculate_customer_inventory_for_today(df):
 
 
 @performance_timed("顧客データ：Dropbox・軽量キャッシュ")
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=60, show_spinner=False)
 def load_fast_dropbox_data():
-    """Dropbox確認結果を5分間再利用し、Excelが変わった時だけJSONを再生成する。"""
+    """通常表示は小さなJSONを使い、Excelが変わった時だけ再生成する。"""
     access_token = get_dropbox_access_token()
     excel_path = get_dropbox_file_path()
     excel_revision = get_dropbox_revision(excel_path, access_token)
@@ -12670,9 +12670,7 @@ def load_fast_dropbox_data():
             ):
                 records = payload.get("records", [])
                 if isinstance(records, list) and records:
-                    # 残数と次回配達予定はload_data側で再計算する。
-                    # Dropbox通信だけを5分間再利用し、日本時間の「今日」は60秒ごとに更新する。
-                    return pd.DataFrame(records)
+                    return recalculate_customer_inventory_for_today(pd.DataFrame(records))
         except Exception:
             pass
 
@@ -12711,9 +12709,7 @@ def load_data():
     設定がなければ同じフォルダのローカルExcelを読む。
     """
     if has_dropbox_auth_config():
-        # Dropboxへの更新確認は5分間再利用するが、今日の残数計算は
-        # この60秒キャッシュ側で行い、日付が変わっても長時間古い値を残さない。
-        return recalculate_customer_inventory_for_today(load_fast_dropbox_data())
+        return load_fast_dropbox_data()
 
     return normalize_excel_table(read_excel_local())
 
