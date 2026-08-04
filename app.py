@@ -5844,8 +5844,25 @@ def validate_map_location(value):
     return text
 
 
+def is_blank_excel_value(value):
+    """Excel由来のNone・空文字・pandasのNaN/NaTを同じ空欄として扱う。"""
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return value.strip() == ""
+    try:
+        return bool(pd.isna(value))
+    except (TypeError, ValueError):
+        return False
+
+
+def normalize_existing_excel_value(value):
+    """編集欄が未入力のとき、pandasのNaN/NaTをExcelへ書き戻さない。"""
+    return None if is_blank_excel_value(value) else value
+
+
 def same_excel_value(old, new):
-    if old is None and new in (None, ""):
+    if is_blank_excel_value(old) and is_blank_excel_value(new):
         return True
     if isinstance(old, (datetime, date)) and isinstance(new, (datetime, date)):
         return old.date() == new.date() if isinstance(old, datetime) else old == (new.date() if isinstance(new, datetime) else new)
@@ -12867,18 +12884,24 @@ def render_customer_excel_editor(customer_name, product_name, current):
         try:
             proposed = {
                 # 空欄は既存値を維持し、入力された項目だけ更新する。
-                "メーカー": str(maker).strip() or current.get("メーカー"),
+                "メーカー": (
+                    str(maker).strip()
+                    or normalize_existing_excel_value(current.get("メーカー"))
+                ),
                 "本数": (
                     parse_optional_nonnegative_number(bottles, integer=True)
-                    if str(bottles).strip() else current.get("本数")
+                    if str(bottles).strip()
+                    else normalize_existing_excel_value(current.get("本数"))
                 ),
                 "kg/本": (
                     parse_optional_nonnegative_number(kg_per_bottle, integer=False)
-                    if str(kg_per_bottle).strip() else current.get("kg/本")
+                    if str(kg_per_bottle).strip()
+                    else normalize_existing_excel_value(current.get("kg/本"))
                 ),
                 "配達日": (
                     parse_optional_date(delivery_date)
-                    if str(delivery_date).strip() else current.get("配達日")
+                    if str(delivery_date).strip()
+                    else normalize_existing_excel_value(current.get("配達日"))
                 ),
             }
             changes = {
