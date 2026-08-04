@@ -161,6 +161,17 @@ def performance_timed(label):
     return decorator
 
 
+def performance_timed_call(label, function, *args, **kwargs):
+    """perf=1 の時だけ、既存関数の動作を変えずに所要時間を記録する。"""
+    if not performance_diagnostics_enabled():
+        return function(*args, **kwargs)
+    started_at = time.perf_counter()
+    try:
+        return function(*args, **kwargs)
+    finally:
+        record_performance_timing(label, time.perf_counter() - started_at)
+
+
 def render_performance_diagnostics():
     if not performance_diagnostics_enabled():
         return
@@ -12836,7 +12847,11 @@ def show_customer_detail(df, customer_name):
     region = clean_value(detail.iloc[0]["地域"])
 
     st.markdown("---")
-    line_connected = get_line_connected(customer_name)
+    line_connected = performance_timed_call(
+        "顧客詳細：LINE状態",
+        get_line_connected,
+        customer_name,
+    )
 
     name_col, line_col, _ = st.columns([6, 3, 3])
     with name_col:
@@ -12879,6 +12894,7 @@ def show_customer_detail(df, customer_name):
         if success.get("history_warning"):
             st.warning(success["history_warning"])
 
+    map_section_started_at = time.perf_counter()
     try:
         map_info = get_customer_map_info(detail)
         if map_info and map_info["map_url"]:
@@ -12894,13 +12910,27 @@ def show_customer_detail(df, customer_name):
         "顧客一致件数": len(detail),
     }
     render_customer_map_editor(customer_name, current_map_values)
+    record_performance_timing(
+        "顧客詳細：住所・地図",
+        time.perf_counter() - map_section_started_at,
+    )
 
     customer_key = get_stable_customer_key(detail)
-    render_customer_information_card(customer_name, customer_key)
+    performance_timed_call(
+        "顧客詳細：顧客情報",
+        render_customer_information_card,
+        customer_name,
+        customer_key,
+    )
 
     # WATER itのポイント名と顧客名が一致する場合だけ、最新値を読み取り専用で表示する。
-    render_customer_water_it_card(customer_name)
+    performance_timed_call(
+        "顧客詳細：WATER it",
+        render_customer_water_it_card,
+        customer_name,
+    )
 
+    product_cards_started_at = time.perf_counter()
     if visible_detail.empty:
         st.info("表示対象の商品はありません。使用数量/日が0または空白の商品は非表示にしています。")
 
@@ -12959,7 +12989,12 @@ def show_customer_detail(df, customer_name):
             }
             render_customer_excel_editor(customer_name, product_name, current_edit_values)
 
+    record_performance_timing(
+        "顧客詳細：商品カード",
+        time.perf_counter() - product_cards_started_at,
+    )
 
+    soluble_started_at = time.perf_counter()
     if normalize_soluble_customer_name(customer_name) in {
         normalize_soluble_customer_name(name) for name in SOLUBLE_CUSTOMER_NAMES
     }:
@@ -12979,12 +13014,37 @@ def show_customer_detail(df, customer_name):
                 st.warning(f"ソリュブルシートに「{customer_name}」が見つかりません。")
         except Exception as exc:
             st.warning(f"ソリュブル情報を読み込めませんでした：{exc}")
+    record_performance_timing(
+        "顧客詳細：ソリュブル",
+        time.perf_counter() - soluble_started_at,
+    )
 
-    render_customer_estimates_section(customer_name, customer_key)
-    render_customer_attachments_section(customer_name, customer_key)
+    performance_timed_call(
+        "顧客詳細：提案・見積り",
+        render_customer_estimates_section,
+        customer_name,
+        customer_key,
+    )
+    performance_timed_call(
+        "顧客詳細：写真・PDF",
+        render_customer_attachments_section,
+        customer_name,
+        customer_key,
+    )
 
-    show_customer_notes(customer_name)
-    render_past_products_section(customer_name, customer_key, detail, visible_detail)
+    performance_timed_call(
+        "顧客詳細：メモ",
+        show_customer_notes,
+        customer_name,
+    )
+    performance_timed_call(
+        "顧客詳細：過去商品",
+        render_past_products_section,
+        customer_name,
+        customer_key,
+        detail,
+        visible_detail,
+    )
 
 # =========================
 # 顧客名一覧
