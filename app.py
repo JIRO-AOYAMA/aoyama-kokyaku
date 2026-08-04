@@ -2563,10 +2563,9 @@ def find_matching_onedrive_camera_roll_file(
     camera_roll = get_onedrive_camera_roll_folder(access_token) or {}
     camera_roll_id = clean_value(camera_roll.get("id"), blank_text="")
     if not camera_roll_id:
-        raise RuntimeError(
-            "OneDriveの写真バックアップ用フォルダーを確認できませんでした。"
-            "二重保存を防ぐため、新しいコピーは作成していません。"
-        )
+        # カメラバックアップ用フォルダーがない場合は、
+        # 呼び出し側で選択画像を新規アップロードする。
+        return None
 
     # 同じ保存操作で取得済みの一覧があれば、再走査せず先に照合する。
     cached_candidates = get_recent_camera_candidate_cache(camera_roll_id)
@@ -2647,11 +2646,8 @@ def find_matching_onedrive_camera_roll_file(
         remove_recent_camera_candidate_cache_item(matched.get("id"))
         return matched
 
-    raise RuntimeError(
-        "OneDriveの写真バックアップに同じ写真が見つかりませんでした。"
-        "二重保存を防ぐため、新しいコピーは作成していません。"
-        "バックアップ完了後にもう一度試してください。"
-    )
+    # OneDrive内に同じ写真がない場合は、呼び出し側で新規アップロードする。
+    return None
 
 
 def move_onedrive_item(access_token, item_id, parent_id, filename):
@@ -8581,26 +8577,35 @@ def save_entity_onedrive_attachment(
             original_name,
             content,
         )
-        source_parent_reference = source_item.get("parentReference") or {}
-        source_item_id = clean_value(source_item.get("id"), blank_text="")
-        source_parent_id = clean_value(source_parent_reference.get("id"), blank_text="")
-        source_name = clean_value(source_item.get("name"), blank_text="") or original_name
-        if not source_item_id or not source_parent_id:
-            raise RuntimeError(
-                "OneDriveの元写真の保存場所を確認できませんでした。"
-                "誤移動を防ぐため保存を停止しました。"
+        if source_item:
+            source_parent_reference = source_item.get("parentReference") or {}
+            source_item_id = clean_value(source_item.get("id"), blank_text="")
+            source_parent_id = clean_value(source_parent_reference.get("id"), blank_text="")
+            source_name = clean_value(source_item.get("name"), blank_text="") or original_name
+            if not source_item_id or not source_parent_id:
+                raise RuntimeError(
+                    "OneDriveの元写真の保存場所を確認できませんでした。"
+                    "誤移動を防ぐため保存を停止しました。"
+                )
+            uploaded_item = move_onedrive_file_to_folder(
+                access_token,
+                source_item_id,
+                folder_path,
+                stored_name,
             )
-        uploaded_item = move_onedrive_file_to_folder(
-            access_token,
-            source_item_id,
-            folder_path,
-            stored_name,
-        )
-        moved_source = {
-            "item_id": source_item_id,
-            "parent_id": source_parent_id,
-            "name": source_name,
-        }
+            moved_source = {
+                "item_id": source_item_id,
+                "parent_id": source_parent_id,
+                "name": source_name,
+            }
+        else:
+            uploaded_item = upload_onedrive_file(
+                access_token,
+                folder_path,
+                stored_name,
+                content,
+                mime_type,
+            )
     else:
         uploaded_item = upload_onedrive_file(
             access_token,
@@ -9081,9 +9086,9 @@ def render_customer_attachments_section(
                 if mobile_browser:
                     enable_mobile_bulk_image_picker(image_uploader_label)
                     st.caption(
-                        "選んだ画像は新しいコピーを作らず、OneDriveのカメラバックアップにある"
-                        "同じ写真をこの取引先の写真フォルダへ移動します。"
-                        "バックアップ前の写真は二重保存を防ぐため保存しません。"
+                        "OneDriveのカメラバックアップに同じ写真がある場合は、"
+                        "その写真をこの取引先の写真フォルダへ移動します。"
+                        "同じ写真が見つからない場合は、選んだ画像を新規アップロードします。"
                     )
                 photo_files = list(selected_image_files or [])
                 supported_image_mime_types = {"image/jpeg", "image/png", "image/webp"}
