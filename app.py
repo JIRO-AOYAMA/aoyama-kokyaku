@@ -79,7 +79,7 @@ FULL_DATA_BACKUP_DROPBOX_FOLDER = st.secrets.get(
 )
 DROPBOX_FAST_CACHE_FILE = "/1共有　青山商店　本社/配車表-北海道-/顧客検索キャッシュ.json"
 # Excelの列構成や読み込み処理を変更した時は、この番号を上げて古いJSONを無効化する。
-DROPBOX_FAST_CACHE_VERSION = 3
+DROPBOX_FAST_CACHE_VERSION = 4
 DISPATCH_DROPBOX_DEFAULT_FILE_PATH = "/1共有　青山商店　本社/配車表-次郎-/配車表1.xlsm"
 DISPATCH_DROPBOX_FILE_PATH = st.secrets.get(
     "DISPATCH_DROPBOX_FILE_PATH",
@@ -9131,6 +9131,90 @@ def render_collapsible_attachment_remarks(value):
     )
 
 
+def render_collapsible_record_remarks(value):
+    """商品・運賃などの備考を全幅で2行まで表示し、長い場合だけ折りたたむ。"""
+    remarks = clean_value(value, blank_text="").strip()
+    if not remarks:
+        return
+
+    normalized = remarks.replace("\r\n", "\n").replace("\r", "\n")
+    visible_character_count = len(re.sub(r"\s+", "", normalized))
+    needs_collapse = len(normalized.split("\n")) > 2 or visible_character_count > 36
+    safe_remarks = html.escape(normalized).replace("\n", "<br>")
+
+    if not needs_collapse:
+        st.markdown(
+            f'<div class="aoyama-record-remarks-text">{safe_remarks}</div>'
+            '<style>'
+            '.aoyama-record-remarks-text {'
+            'font-weight: 700; line-height: 1.65; overflow-wrap: anywhere; '
+            'word-break: break-word; margin: 0.05rem 0 0.45rem 0;'
+            '}'
+            '</style>',
+            unsafe_allow_html=True,
+        )
+        return
+
+    st.markdown(
+        f"""
+        <details class="aoyama-record-remarks">
+          <summary>
+            <span class="aoyama-record-remarks-preview">{safe_remarks}</span>
+            <span class="aoyama-record-remarks-toggle"></span>
+          </summary>
+          <div class="aoyama-record-remarks-full">{safe_remarks}</div>
+        </details>
+        <style>
+          details.aoyama-record-remarks {{
+            width: 100%;
+            margin: 0.05rem 0 0.45rem 0;
+            font-weight: 700;
+            line-height: 1.65;
+            overflow-wrap: anywhere;
+            word-break: break-word;
+          }}
+          details.aoyama-record-remarks summary {{
+            cursor: pointer;
+            list-style: none;
+          }}
+          details.aoyama-record-remarks summary::-webkit-details-marker {{
+            display: none;
+          }}
+          .aoyama-record-remarks-preview {{
+            display: -webkit-box;
+            -webkit-box-orient: vertical;
+            -webkit-line-clamp: 2;
+            overflow: hidden;
+            overflow-wrap: anywhere;
+            word-break: break-word;
+          }}
+          .aoyama-record-remarks-toggle {{
+            display: inline-block;
+            margin-top: 0.12rem;
+            color: rgb(0, 104, 201);
+            font-size: 0.86rem;
+            font-weight: 600;
+          }}
+          .aoyama-record-remarks-toggle::before {{
+            content: "続きを読む";
+          }}
+          details.aoyama-record-remarks[open] .aoyama-record-remarks-preview {{
+            display: none;
+          }}
+          details.aoyama-record-remarks[open] .aoyama-record-remarks-toggle::before {{
+            content: "閉じる";
+          }}
+          .aoyama-record-remarks-full {{
+            margin-top: 0.22rem;
+            overflow-wrap: anywhere;
+            word-break: break-word;
+          }}
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 
 def render_attachment_card_layout_styles():
     """写真・資料の一覧カードだけを、行内で上揃え・同じ高さに整える。"""
@@ -11218,7 +11302,7 @@ def render_customer_estimates_section(customer_name, customer_key=None):
                     st.write(estimate_price_label(estimate))
                 if estimate.get("remarks"):
                     st.caption("備考")
-                    st.write(estimate["remarks"])
+                    render_collapsible_record_remarks(estimate["remarks"])
 
                 edit_col, delete_col = st.columns(2)
                 with edit_col:
@@ -11335,7 +11419,7 @@ def show_estimates_page():
                 st.write(estimate_price_label(estimate))
             if estimate.get("remarks"):
                 st.caption("備考")
-                st.write(estimate["remarks"])
+                render_collapsible_record_remarks(estimate["remarks"])
 
 
 # =========================
@@ -11776,7 +11860,7 @@ def render_carrier_freight_display(item):
         st.write(carrier_freight_rate_label(item))
     if item.get("remarks"):
         st.caption("備考")
-        st.write(item["remarks"])
+        render_collapsible_record_remarks(item["remarks"])
 
 
 def render_carrier_freight_form(form_key, existing=None):
@@ -12075,7 +12159,7 @@ def render_carrier_freight_ranking(title, records, field_name, current_names):
                 )
             if record.get("remarks"):
                 st.caption("備考")
-                st.write(record["remarks"])
+                render_collapsible_record_remarks(record["remarks"])
 
 
 def show_carrier_freight_compare():
@@ -12692,7 +12776,9 @@ def rebuild_sheet1_from_formula_references(excel_source):
 
             customer_name = delivery_values[1] if len(delivery_values) >= 2 else None
             product_name = delivery_values[4] if len(delivery_values) >= 5 else None
-            if not normalize_match_value(customer_name) or not normalize_match_value(product_name):
+            # 見積り段階など商品名が未登録でも、顧客名があれば顧客として残す。
+            # 空の商品名は顧客詳細側で商品カードにしない。
+            if not normalize_match_value(customer_name):
                 continue
 
             next_delivery, remaining = calculate_delivery_values(delivery_values)
@@ -13476,8 +13562,15 @@ def show_customer_detail(df, customer_name):
     show_back_home_button("detail_back_home")
     show_detail_search_shortcuts()
 
-    # 使用数量/日が0・空白・NaNの商品行は、商品名ごと表示しない。
-    visible_detail = detail[~detail["使用数量/日"].apply(is_blank_or_zero)].copy()
+    # 商品名が空欄の行は顧客情報として残すが、空の商品カードにはしない。
+    # 商品名がある行については、従来どおり使用数量/日が0・空白・NaNなら表示しない。
+    named_product_mask = detail["商品名"].apply(
+        lambda value: bool(normalize_match_value(value))
+    )
+    visible_detail = detail[
+        named_product_mask & (~detail["使用数量/日"].apply(is_blank_or_zero))
+    ].copy()
+    has_named_product = bool(named_product_mask.any())
 
     region = clean_value(detail.iloc[0]["地域"])
 
@@ -13548,7 +13641,10 @@ def show_customer_detail(df, customer_name):
     render_customer_water_it_card(customer_name)
 
     if visible_detail.empty:
-        st.info("表示対象の商品はありません。使用数量/日が0または空白の商品は非表示にしています。")
+        if not has_named_product:
+            st.info("登録されている商品はありません。")
+        else:
+            st.info("表示対象の商品はありません。使用数量/日が0または空白の商品は非表示にしています。")
 
     # 同じ商品に使用中行が複数あっても、商品カードは1つだけ表示する。
     # 複数の使用中行がある場合はカード内で警告し、編集を停止する。
@@ -19794,7 +19890,11 @@ def show_supplier_product_search():
                     continue
                 value = trade_partner_text(product.get(field))
                 if value:
-                    st.write(f"**{field}：** {value}")
+                    if field == "備考":
+                        st.caption("備考")
+                        render_collapsible_record_remarks(value)
+                    else:
+                        st.write(f"**{field}：** {value}")
 
 
 def show_carrier_condition_search():
@@ -19844,7 +19944,11 @@ def show_carrier_condition_search():
                     continue
                 value = trade_partner_text(condition.get(field))
                 if value:
-                    st.write(f"**{field}：** {value}")
+                    if field == "備考":
+                        st.caption("備考")
+                        render_collapsible_record_remarks(value)
+                    else:
+                        st.write(f"**{field}：** {value}")
 
 
 def render_trade_partner_fields(row, headers, excluded=None):
@@ -19859,13 +19963,47 @@ def render_trade_partner_fields(row, headers, excluded=None):
     if not visible:
         st.caption("入力済みの情報はありません。")
         return
-    for start in range(0, len(visible), 2):
+
+    pending = []
+
+    def render_pending_fields():
+        nonlocal pending
+        if not pending:
+            return
         cols = st.columns(2)
-        for offset, item in enumerate(visible[start:start + 2]):
+        for offset, item in enumerate(pending):
             header, value = item
             with cols[offset]:
                 st.caption(header)
                 st.markdown(f"**{html.escape(value)}**")
+        pending = []
+
+    for header, value in visible:
+        if header == "備考":
+            render_pending_fields()
+            st.caption("備考")
+            render_collapsible_record_remarks(value)
+            continue
+        pending.append((header, value))
+        if len(pending) == 2:
+            render_pending_fields()
+    render_pending_fields()
+
+
+def render_trade_partner_form_input(header, value="", key=None):
+    """備考だけ改行可能な入力欄にし、それ以外の入力方法は変えない。"""
+    if header == "備考":
+        return st.text_area(
+            header,
+            value=trade_partner_text(value),
+            height=110,
+            key=key,
+        )
+    return st.text_input(
+        header,
+        value=trade_partner_text(value),
+        key=key,
+    )
 
 
 def trade_partner_history_section(sheet_name):
@@ -19897,9 +20035,9 @@ def render_trade_partner_row_editor(
         with st.form(f"edit_{key_prefix}_{record_id}"):
             inputs = {}
             for header in editable_headers:
-                inputs[header] = st.text_input(
+                inputs[header] = render_trade_partner_form_input(
                     header,
-                    value=trade_partner_text(row.get(header)),
+                    value=row.get(header),
                     key=f"edit_{key_prefix}_{record_id}_{header}",
                 )
             submitted = st.form_submit_button("バックアップして保存", use_container_width=True)
@@ -19979,7 +20117,7 @@ def render_trade_partner_related_section(
             if sheet_name in {TRADE_PARTNER_CONTACT_SHEET, TRADE_PARTNER_PRODUCT_SHEET}:
                 values["会社名"] = company_name
             for header in editable_headers:
-                values[header] = st.text_input(
+                values[header] = render_trade_partner_form_input(
                     header,
                     key=f"add_{sheet_name}_{partner_id}_{header}",
                 )
@@ -20112,7 +20250,7 @@ def show_trade_partner_register(partner_type):
     with st.form(f"register_{partner_type}"):
         values = {}
         for header in editable_headers:
-            values[header] = st.text_input(
+            values[header] = render_trade_partner_form_input(
                 header,
                 key=f"register_{partner_type}_{header}",
             )
