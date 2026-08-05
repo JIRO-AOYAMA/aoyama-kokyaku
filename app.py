@@ -226,6 +226,11 @@ VOICE_INPUT_HELP = "スマホではキーボードのマイクを押して音声
 PAST_PRODUCT_NOTE_PREFIX = "__past_product_note__:"
 ESTIMATE_PREFIX = "__estimate__:"
 ESTIMATE_VERSION = 1
+# 予想使用量は既存Excelを変更せず、customer_information内の内部レコードに保存する。
+# 今日以降の在庫編集を基準として蓄積し、現在の「使用数量/日」は上書きしない。
+INVENTORY_USAGE_SNAPSHOT_PREFIX = "__inventory_usage_snapshot__:"
+INVENTORY_USAGE_SNAPSHOT_VERSION = 1
+INVENTORY_USAGE_SNAPSHOT_CACHE_TTL_SECONDS = 5 * 60
 CARRIER_FREIGHT_PREFIX = "__carrier_freight__:"
 CARRIER_FREIGHT_VERSION = 1
 CHANGE_HISTORY_CUSTOMER = "__CHANGE_HISTORY__"
@@ -7600,6 +7605,12 @@ def check_customer_information_response(action, response, success_codes):
     raise RuntimeError(message)
 
 
+def is_inventory_usage_snapshot_item(item):
+    """予想使用量の内部レコードかどうかを返す。通常の顧客情報には表示しない。"""
+    field_name = clean_value((item or {}).get("field_name"), blank_text="")
+    return field_name.startswith(INVENTORY_USAGE_SNAPSHOT_PREFIX)
+
+
 def is_regular_customer_information_item(item):
     """顧客情報カードへ表示する通常項目かどうかを、従来と同じ除外規則で判定する。"""
     return not (
@@ -7607,6 +7618,7 @@ def is_regular_customer_information_item(item):
         or is_estimate_item(item)
         or is_carrier_freight_item(item)
         or is_onedrive_attachment_item(item)
+        or is_inventory_usage_snapshot_item(item)
     )
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -7769,6 +7781,297 @@ def delete_customer_information(item_id):
         raise RuntimeError("顧客情報の削除中にSupabaseへ接続できませんでした。") from exc
     check_customer_information_response("削除", response, (200, 204))
     clear_customer_information_cache()
+
+
+# =========================
+# 予想使用量（Supabase内部保存・Excelの使用数量/日は変更しない）
+# =========================
+def make_inventory_usage_snapshot_field_name(product_name):
+    """商品名から、顧客内で安定する内部レコード名を作る。"""
+    normalized_product = normalize_match_value(product_name)
+    digest = hashlib.sha256(normalized_product.encode("utf-8")).hexdigest()[:32]
+    return f"{INVENTORY_USAGE_SNAPSHOT_PREFIX}{digest}"
+
+
+def inventory_usage_number(value):
+    """在庫履歴用の値を有限の数値へ変換し、変換できない場合はNoneを返す。"""
+    if is_blank_excel_value(value):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def parse_inventory_usage_snapshot_item(item):
+    """Supabase内部レコードを、予想使用量表示・次回計算用の辞書へ変換する。"""
+    if not is_inventory_usage_snapshot_item(item):
+        return None
+    try:
+        payload = json.loads(str((item or {}).get("content") or "{}"))
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    product_name = clean_value(payload.get("product_name"), blank_text="").strip()
+    if not product_name:
+        return None
+    return {
+        "id": clean_value((item or {}).get("id"), blank_text=""),
+        "field_name": clean_value((item or {}).get("field_name"), blank_text=""),
+        "product_name": product_name,
+        "baseline_date": clean_value(payload.get("baseline_date"), blank_text=""),
+        "baseline_bottles": inventory_usage_number(payload.get("baseline_bottles")),
+        "baseline_kg_per_bottle": inventory_usage_number(payload.get("baseline_kg_per_bottle")),
+        "baseline_inventory_kg": inventory_usage_number(payload.get("baseline_inventory_kg")),
+        "comparison_date": clean_value(payload.get("comparison_date"), blank_text=""),
+        "comparison_inventory_kg": inventory_usage_number(payload.get("comparison_inventory_kg")),
+        "predicted_daily_usage": inventory_usage_number(payload.get("predicted_daily_usage")),
+        "created_at": clean_value((item or {}).get("created_at"), blank_text=""),
+        "updated_at": clean_value((item or {}).get("updated_at"), blank_text=""),
+    }
+
+
+@st.cache_data(ttl=INVENTORY_USAGE_SNAPSHOT_CACHE_TTL_SECONDS, show_spinner=False)
+def load_customer_inventory_usage_snapshots(customer_name, customer_key=None):
+    """対象顧客の予想使用量内部レコードだけを、小さい問い合わせで取得する。"""
+    if not has_supabase_config():
+        return []
+
+    rows = []
+    page_size = 1000
+    offset = 0
+    while True:
+        params = customer_information_query(customer_name, customer_key)
+        params.update(
+            {
+                "field_name": f"like.{INVENTORY_USAGE_SNAPSHOT_PREFIX}*",
+                "order": "updated_at.desc,created_at.desc,id.desc",
+                "limit": str(page_size),
+                "offset": str(offset),
+            }
+        )
+        try:
+            response = requests.get(
+                get_supabase_customer_information_url(),
+                headers=get_supabase_headers(),
+                params=params,
+                timeout=30,
+            )
+        except Exception as exc:
+            raise RuntimeError("予想使用量を読み込めませんでした。") from exc
+        check_customer_information_response("読み込み", response, (200,))
+        page = response.json()
+        if not isinstance(page, list):
+            raise RuntimeError("Supabaseから返った予想使用量の形式が正しくありません。")
+        rows.extend(page)
+        if len(page) < page_size:
+            break
+        offset += page_size
+    return rows
+
+
+@st.cache_data(ttl=INVENTORY_USAGE_SNAPSHOT_CACHE_TTL_SECONDS, show_spinner=False)
+def load_inventory_usage_snapshot_presence_index():
+    """予想使用量を持つ顧客だけを、小さい索引として5分間再利用する。"""
+    if not has_supabase_config():
+        return {"customer_keys": tuple(), "customer_names": tuple()}
+
+    key_values = set()
+    name_values = set()
+    page_size = 1000
+    offset = 0
+    while True:
+        params = {
+            "select": "customer_key,customer_name,field_name",
+            "field_name": f"like.{INVENTORY_USAGE_SNAPSHOT_PREFIX}*",
+            "order": "id.asc",
+            "limit": str(page_size),
+            "offset": str(offset),
+        }
+        try:
+            response = requests.get(
+                get_supabase_customer_information_url(),
+                headers=get_supabase_headers(),
+                params=params,
+                timeout=30,
+            )
+        except Exception as exc:
+            raise RuntimeError("予想使用量の索引を読み込めませんでした。") from exc
+        check_customer_information_response("読み込み", response, (200,))
+        page = response.json()
+        if not isinstance(page, list):
+            raise RuntimeError("Supabaseから返った予想使用量索引の形式が正しくありません。")
+        for item in page:
+            item_key = clean_value((item or {}).get("customer_key"), blank_text="").strip()
+            item_name = clean_value((item or {}).get("customer_name"), blank_text="").strip()
+            if item_key:
+                key_values.add(item_key)
+            elif item_name:
+                name_values.add(item_name)
+        if len(page) < page_size:
+            break
+        offset += page_size
+
+    return {
+        "customer_keys": tuple(sorted(key_values)),
+        "customer_names": tuple(sorted(name_values)),
+    }
+
+
+def customer_has_inventory_usage_snapshot(customer_name, customer_key=None):
+    index = load_inventory_usage_snapshot_presence_index()
+    if customer_key:
+        target = clean_value(customer_key, blank_text="").strip()
+        return target in set(index.get("customer_keys", ()))
+    target = clean_value(customer_name, blank_text="").strip()
+    return target in set(index.get("customer_names", ()))
+
+
+def clear_inventory_usage_snapshot_cache():
+    try:
+        load_customer_inventory_usage_snapshots.clear()
+    except Exception:
+        pass
+    try:
+        load_inventory_usage_snapshot_presence_index.clear()
+    except Exception:
+        pass
+
+
+def get_customer_inventory_usage_snapshot_map(customer_name, customer_key=None):
+    """商品名をキーに、最新の予想使用量内部レコードを返す。"""
+    try:
+        has_snapshot = customer_has_inventory_usage_snapshot(customer_name, customer_key)
+    except Exception:
+        # 索引取得に失敗した場合は表示欠落を避け、従来どおり詳細取得へ進む。
+        has_snapshot = None
+    if has_snapshot is False:
+        return {}
+
+    snapshots = {}
+    for item in load_customer_inventory_usage_snapshots(customer_name, customer_key):
+        parsed = parse_inventory_usage_snapshot_item(item)
+        if not parsed:
+            continue
+        product_key = normalize_match_value(parsed.get("product_name"))
+        if product_key and product_key not in snapshots:
+            snapshots[product_key] = parsed
+    return snapshots
+
+
+def build_inventory_usage_snapshot(existing, product_name, delivery_date, bottles, kg_per_bottle):
+    """
+    今日以降に保存した基準値だけで予想使用量を作る。
+    Excelの残数・現在の使用数量/日・過去データからの逆算は行わない。
+    """
+    baseline_date = to_date(delivery_date)
+    baseline_bottles = inventory_usage_number(bottles)
+    baseline_kg_per_bottle = inventory_usage_number(kg_per_bottle)
+    if baseline_date is None or baseline_bottles is None or baseline_kg_per_bottle is None:
+        raise ValueError("予想使用量の記録には、配達日・本数・kg/本が必要です。")
+    if baseline_bottles < 0 or baseline_kg_per_bottle <= 0:
+        raise ValueError("予想使用量の記録には、0以上の本数と0より大きいkg/本が必要です。")
+
+    baseline_inventory_kg = baseline_bottles * baseline_kg_per_bottle
+    comparison_date = None
+    comparison_inventory_kg = None
+    predicted_daily_usage = None
+
+    existing = dict(existing or {})
+    previous_baseline_date = to_date(existing.get("baseline_date"))
+    previous_baseline_inventory_kg = inventory_usage_number(
+        existing.get("baseline_inventory_kg")
+    )
+    existing_comparison_date = to_date(existing.get("comparison_date"))
+    existing_comparison_inventory_kg = inventory_usage_number(
+        existing.get("comparison_inventory_kg")
+    )
+
+    if previous_baseline_date is not None and previous_baseline_inventory_kg is not None:
+        if baseline_date < previous_baseline_date:
+            # 最初の基準を訂正する場合だけ、前の日付への変更を許可する。
+            if existing_comparison_date is not None:
+                raise ValueError(
+                    "配達日が前回の基準日より前のため、予想使用量の履歴は更新しませんでした。"
+                )
+        elif baseline_date == previous_baseline_date:
+            # 同じ日の入力訂正では、直前の比較開始点を保って再計算する。
+            comparison_date = existing_comparison_date
+            comparison_inventory_kg = existing_comparison_inventory_kg
+        else:
+            comparison_date = previous_baseline_date
+            comparison_inventory_kg = previous_baseline_inventory_kg
+
+    if comparison_date is not None and comparison_inventory_kg is not None:
+        elapsed_days = (baseline_date - comparison_date).days
+        inventory_decrease_kg = comparison_inventory_kg - baseline_inventory_kg
+        if elapsed_days > 0 and inventory_decrease_kg >= 0:
+            predicted_daily_usage = inventory_decrease_kg / elapsed_days
+        # 在庫が増えた場合は納品・補充とみなし、負の使用量を出さず新しい基準だけ保存する。
+
+    return {
+        "version": INVENTORY_USAGE_SNAPSHOT_VERSION,
+        "product_name": normalize_match_value(product_name),
+        "baseline_date": baseline_date.isoformat(),
+        "baseline_bottles": baseline_bottles,
+        "baseline_kg_per_bottle": baseline_kg_per_bottle,
+        "baseline_inventory_kg": baseline_inventory_kg,
+        "comparison_date": comparison_date.isoformat() if comparison_date else "",
+        "comparison_inventory_kg": comparison_inventory_kg,
+        "predicted_daily_usage": predicted_daily_usage,
+        "recorded_at": get_jst_now().isoformat(),
+    }
+
+
+def save_customer_inventory_usage_snapshot(
+    customer_name,
+    customer_key,
+    product_name,
+    proposed,
+    changes,
+):
+    """在庫基準が変わった時だけ、予想使用量の基準を保存する。"""
+    relevant_fields = {"本数", "kg/本", "配達日"}
+    if not relevant_fields.intersection(set((changes or {}).keys())):
+        return
+    if not has_supabase_config():
+        raise RuntimeError("Supabase設定がないため、予想使用量の基準を保存できません。")
+
+    snapshots = get_customer_inventory_usage_snapshot_map(customer_name, customer_key)
+    product_key = normalize_match_value(product_name)
+    existing = snapshots.get(product_key)
+    payload = build_inventory_usage_snapshot(
+        existing,
+        product_name,
+        (proposed or {}).get("配達日"),
+        (proposed or {}).get("本数"),
+        (proposed or {}).get("kg/本"),
+    )
+    content = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    field_name = make_inventory_usage_snapshot_field_name(product_name)
+
+    if existing and existing.get("id"):
+        update_customer_information(existing["id"], field_name, content)
+    else:
+        insert_customer_information(
+            customer_name,
+            customer_key,
+            field_name,
+            content,
+            0,
+        )
+    clear_inventory_usage_snapshot_cache()
+
+
+def save_customer_inventory_usage_snapshot_safely(*args, **kwargs):
+    """Excel保存を取り消さず、予想使用量の記録失敗だけを警告として返す。"""
+    try:
+        save_customer_inventory_usage_snapshot(*args, **kwargs)
+        return ""
+    except Exception as exc:
+        return f"在庫の保存は完了しましたが、予想使用量を記録できませんでした：{exc}"
 
 
 # =========================
@@ -13244,7 +13547,7 @@ def display_change_value(value):
     return str(value)
 
 
-def render_customer_excel_editor(customer_name, product_name, current):
+def render_customer_excel_editor(customer_name, customer_key, product_name, current):
     """商品カード内に、確認画面付きのExcel編集欄を追加する。"""
     identity = f"{customer_name}|{product_name}"
     key_suffix = str(abs(hash(identity)))
@@ -13288,6 +13591,13 @@ def render_customer_excel_editor(customer_name, product_name, current):
                 try:
                     with st.spinner("バックアップを作成して保存しています…"):
                         result = save_customer_excel_changes(customer_name, product_name, pending["proposed"])
+                        result["usage_warning"] = save_customer_inventory_usage_snapshot_safely(
+                            customer_name,
+                            customer_key,
+                            product_name,
+                            pending["proposed"],
+                            pending["changes"],
+                        )
                         result["history_warning"] = record_change_history_safely(
                             "顧客",
                             "",
@@ -13385,6 +13695,13 @@ def render_customer_excel_editor(customer_name, product_name, current):
                         customer_name,
                         product_name,
                         proposed,
+                    )
+                    result["usage_warning"] = save_customer_inventory_usage_snapshot_safely(
+                        customer_name,
+                        customer_key,
+                        product_name,
+                        proposed,
+                        changes,
                     )
                     result["history_warning"] = record_change_history_safely(
                         "顧客",
@@ -13615,6 +13932,8 @@ def show_customer_detail(df, customer_name):
         st.write(f"**更新した商品名：** {success['product_name']}")
         if success.get("cleanup_warning"):
             st.warning(success["cleanup_warning"])
+        if success.get("usage_warning"):
+            st.warning(success["usage_warning"])
         if success.get("history_warning"):
             st.warning(success["history_warning"])
 
@@ -13657,10 +13976,29 @@ def show_customer_detail(df, customer_name):
         seen_products.add(candidate_product)
         visible_products.append(candidate_row)
 
+    predicted_usage_by_product = {}
+    if visible_products and has_supabase_config():
+        try:
+            predicted_usage_by_product = get_customer_inventory_usage_snapshot_map(
+                customer_name,
+                customer_key,
+            )
+        except Exception:
+            # 予想使用量の取得失敗で、既存の商品・在庫表示を止めない。
+            predicted_usage_by_product = {}
+
     for row in visible_products:
         product_name = clean_value(row["商品名"])
         customer_id = clean_value(row["ID"])
         usage = format_number(row["使用数量/日"])
+        prediction = predicted_usage_by_product.get(
+            normalize_match_value(product_name),
+            {},
+        )
+        predicted_usage = format_number(
+            prediction.get("predicted_daily_usage"),
+            blank_text="",
+        )
         next_date = format_date(row["次回配達予定"])
         remaining = format_number(row["残数"])
 
@@ -13675,6 +14013,13 @@ def show_customer_detail(df, customer_name):
 
                 st.caption("使用数量/日")
                 st.markdown(f"**{usage}**")
+
+                st.caption("予想使用量/日")
+                if predicted_usage:
+                    st.markdown(f"**{predicted_usage}**")
+                else:
+                    # 今日から履歴を開始するため、比較元がない最初の保存後は空白表示。
+                    st.markdown("&nbsp;", unsafe_allow_html=True)
 
             with col2:
                 st.caption("次回配達予定")
@@ -13699,7 +14044,7 @@ def show_customer_detail(df, customer_name):
                 "商品一致件数": product_match_count,
                 "顧客一致件数": len(detail),
             }
-            render_customer_excel_editor(customer_name, product_name, current_edit_values)
+            render_customer_excel_editor(customer_name, customer_key, product_name, current_edit_values)
 
 
     if normalize_soluble_customer_name(customer_name) in {
