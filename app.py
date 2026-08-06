@@ -6,6 +6,7 @@ import hashlib
 import hmac
 import html
 import json
+import logging
 import math
 import mimetypes
 import posixpath
@@ -60,6 +61,40 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="collapsed",
 )
+
+# 画像処理の診断記録は画面や保存データを変えず、Streamlitのサーバーログへだけ出す。
+# アクセストークン・ダウンロードURL・画像本体は絶対に記録しない。
+IMAGE_EVENT_LOGGER = logging.getLogger("aoyama.image")
+if not any(getattr(handler, "_aoyama_image_handler", False) for handler in IMAGE_EVENT_LOGGER.handlers):
+    image_log_handler = logging.StreamHandler()
+    image_log_handler._aoyama_image_handler = True
+    image_log_handler.setFormatter(logging.Formatter("%(message)s"))
+    IMAGE_EVENT_LOGGER.addHandler(image_log_handler)
+IMAGE_EVENT_LOGGER.setLevel(logging.INFO)
+IMAGE_EVENT_LOGGER.propagate = False
+
+
+def log_image_event(event, **details):
+    """画像処理の成否・時間・容量だけを、安全なJSON形式でサーバーログへ残す。"""
+    payload = {
+        "event": str(event or "image_event")[:80],
+        "recorded_at": datetime.now(timezone.utc).isoformat(),
+    }
+    for key, value in dict(details or {}).items():
+        safe_key = re.sub(r"[^0-9A-Za-z_]", "_", str(key or "detail"))[:60]
+        if isinstance(value, bool) or value is None:
+            safe_value = value
+        elif isinstance(value, (int, float)):
+            safe_value = value
+        else:
+            safe_value = str(value or "")[:300]
+        payload[safe_key] = safe_value
+    try:
+        IMAGE_EVENT_LOGGER.info(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
+    except Exception:
+        # 記録機能の障害でアプリ本体を止めない。
+        pass
+
 
 EXCEL_FILE = "配車予定 次郎_修正版.xlsm"
 SHEET_NAME = "Sheet1"
@@ -2850,7 +2885,14 @@ def get_onedrive_item_download_url(access_token, item_id):
 
 def prepare_onedrive_display_image(content, original_name, stored_name):
     """元画像を残し、通常表示用の長辺1600px WebPを作る。"""
+    started_at = time.perf_counter()
+    original_size = len(content or b"")
     if Image is None or not content:
+        log_image_event(
+            "display_webp_skipped",
+            reason="pillow_unavailable" if Image is None else "empty_content",
+            original_size=original_size,
+        )
         return None
     try:
         with Image.open(BytesIO(content)) as source_image:
@@ -2861,6 +2903,12 @@ def prepare_onedrive_display_image(content, original_name, stored_name):
                 else source_image.copy()
             )
             if image.width <= 0 or image.height <= 0:
+                log_image_event(
+                    "display_webp_failed",
+                    reason="invalid_dimensions",
+                    original_size=original_size,
+                    duration_ms=round((time.perf_counter() - started_at) * 1000, 1),
+                )
                 return None
             resampling = getattr(getattr(Image, "Resampling", Image), "LANCZOS")
             if max(image.size) > ONEDRIVE_DISPLAY_IMAGE_MAX_EDGE:
@@ -2884,9 +2932,15 @@ def prepare_onedrive_display_image(content, original_name, stored_name):
             )
             display_content = output.getvalue()
             if not display_content:
+                log_image_event(
+                    "display_webp_failed",
+                    reason="empty_output",
+                    original_size=original_size,
+                    duration_ms=round((time.perf_counter() - started_at) * 1000, 1),
+                )
                 return None
             safe_stem = Path(str(stored_name or original_name or "image")).stem
-            return {
+            result = {
                 "content": display_content,
                 "stored_name": f"{safe_stem}__display.webp",
                 "mime_type": "image/webp",
@@ -2894,8 +2948,28 @@ def prepare_onedrive_display_image(content, original_name, stored_name):
                 "width": int(image.width),
                 "height": int(image.height),
             }
-    except Exception:
+            log_image_event(
+                "display_webp_created",
+                original_size=original_size,
+                display_size=len(display_content),
+                width=int(image.width),
+                height=int(image.height),
+                compression_ratio=(
+                    round(len(display_content) / original_size, 4)
+                    if original_size > 0
+                    else None
+                ),
+                duration_ms=round((time.perf_counter() - started_at) * 1000, 1),
+            )
+            return result
+    except Exception as exc:
         # 変換できない画像は、元画像の従来保存・従来表示へ戻す。
+        log_image_event(
+            "display_webp_failed",
+            reason=type(exc).__name__,
+            original_size=original_size,
+            duration_ms=round((time.perf_counter() - started_at) * 1000, 1),
+        )
         return None
 
 
@@ -2968,6 +3042,7 @@ def update_onedrive_attachment_display_fields(
 
 def ensure_onedrive_attachment_display_image(access_token, attachment):
     """旧画像を初めて開く時だけ、通常表示用WebPを1枚生成して記録する。"""
+    started_at = time.perf_counter()
     if not isinstance(attachment, dict) or attachment.get("file_type") != "image":
         return ""
 
@@ -2992,11 +3067,17 @@ def ensure_onedrive_attachment_display_image(access_token, attachment):
             f"{folder_path}/{display_stored_name}",
         )
         if isinstance(existing_item, dict) and not existing_item.get("folder"):
-            return update_onedrive_attachment_display_fields(
+            repaired_id = update_onedrive_attachment_display_fields(
                 attachment,
                 existing_item,
                 requested_stored_name=display_stored_name,
             )
+            log_image_event(
+                "legacy_display_webp_reused",
+                success=bool(repaired_id),
+                duration_ms=round((time.perf_counter() - started_at) * 1000, 1),
+            )
+            return repaired_id
 
         original_content = download_onedrive_attachment_file(
             access_token,
@@ -3019,14 +3100,27 @@ def ensure_onedrive_attachment_display_image(access_token, attachment):
             display["content"],
             display["mime_type"],
         )
-        return update_onedrive_attachment_display_fields(
+        display_file_id = update_onedrive_attachment_display_fields(
             attachment,
             display_item,
             requested_stored_name=display_stored_name,
             display_content=display["content"],
         )
-    except Exception:
+        log_image_event(
+            "legacy_display_webp_saved",
+            success=bool(display_file_id),
+            original_size=len(original_content or b""),
+            display_size=len(display.get("content") or b""),
+            duration_ms=round((time.perf_counter() - started_at) * 1000, 1),
+        )
+        return display_file_id
+    except Exception as exc:
         # 変換・保存・記録のどこかが失敗しても、呼び出し側は従来どおり元画像を表示する。
+        log_image_event(
+            "legacy_display_webp_failed",
+            reason=type(exc).__name__,
+            duration_ms=round((time.perf_counter() - started_at) * 1000, 1),
+        )
         return ""
 
 
@@ -3156,6 +3250,7 @@ def build_onedrive_image_gallery_items(access_token, attachments):
 
 def open_onedrive_image_group_gallery(access_token, attachments):
     """最初の画像だけを読み、次の画像は移動した時に読み込ませる。"""
+    started_at = time.perf_counter()
     image_attachments = [
         item
         for item in list(attachments or [])
@@ -3173,6 +3268,14 @@ def open_onedrive_image_group_gallery(access_token, attachments):
             access_token,
             image_attachments,
         )
+    log_image_event(
+        "gallery_prepared",
+        requested_count=len(image_attachments),
+        available_count=len(image_items),
+        missing_count=len(missing_names),
+        error_count=len(other_errors),
+        duration_ms=round((time.perf_counter() - started_at) * 1000, 1),
+    )
     if image_items:
         show_onedrive_image_gallery_dialog(image_items)
     if missing_names:
@@ -4875,6 +4978,41 @@ def is_onedrive_not_found_error(exc):
     return "（404）" in text or "(404)" in text or "resource could not be found" in text.lower()
 
 
+def confirm_onedrive_item_deleted(access_token, item_id):
+    """削除後にOneDriveのIDが存在しないことを確認する。"""
+    clean_id = str(item_id or "").strip()
+    if not clean_id:
+        return True
+    response = onedrive_graph_request(
+        "GET",
+        f"/me/drive/items/{urllib.parse.quote(clean_id, safe='')}?$select=id",
+        access_token,
+        expected=(200, 404),
+    )
+    return response.status_code == 404
+
+
+def confirm_customer_information_deleted(item_id):
+    """削除後にSupabaseの添付情報が存在しないことを確認する。"""
+    clean_id = str(item_id or "").strip()
+    if not clean_id:
+        return True
+    try:
+        response = requests.get(
+            get_supabase_customer_information_url(),
+            headers=get_supabase_headers(),
+            params={"select": "id", "id": f"eq.{clean_id}", "limit": "1"},
+            timeout=30,
+        )
+    except Exception as exc:
+        raise RuntimeError("削除後のSupabase確認中に接続できませんでした。") from exc
+    check_customer_information_response("削除後の確認", response, (200,))
+    rows = response.json()
+    if not isinstance(rows, list):
+        raise RuntimeError("削除後のSupabase確認結果が正しくありません。")
+    return not rows
+
+
 @st.dialog("写真・資料を削除")
 def confirm_onedrive_attachment_delete_dialog(
     access_token,
@@ -4929,14 +5067,27 @@ def confirm_onedrive_attachment_delete_dialog(
                         item_metadata_id = str(item.get("id") or "")
                         item_id = str(item.get("file_id") or "")
                         item_name = str(item.get("original_name") or "名称未設定")
+                        item_started_at = time.perf_counter()
+                        display_item_id = str(item.get("display_file_id") or "")
+                        log_image_event(
+                            "attachment_delete_started",
+                            file_type=str(item.get("file_type") or ""),
+                            has_display_file=bool(display_item_id),
+                            has_original_file=bool(item_id),
+                            has_metadata=bool(item_metadata_id),
+                        )
                         try:
-                            display_item_id = str(item.get("display_file_id") or "")
                             if display_item_id:
                                 try:
                                     delete_onedrive_file(access_token, display_item_id)
                                 except Exception as exc:
                                     if not is_onedrive_not_found_error(exc):
                                         raise
+                                if not confirm_onedrive_item_deleted(
+                                    access_token,
+                                    display_item_id,
+                                ):
+                                    raise RuntimeError("表示用WebPがOneDriveに残っています。")
                             if item_id:
                                 try:
                                     delete_onedrive_file(access_token, item_id)
@@ -4944,11 +5095,33 @@ def confirm_onedrive_attachment_delete_dialog(
                                     # OneDrive上で既に消えている場合は、孤立したSupabase記録だけ削除する。
                                     if not is_onedrive_not_found_error(exc):
                                         raise
+                                if not confirm_onedrive_item_deleted(access_token, item_id):
+                                    raise RuntimeError("元画像・資料がOneDriveに残っています。")
                             if item_metadata_id:
                                 delete_customer_information(item_metadata_id)
+                                if not confirm_customer_information_deleted(item_metadata_id):
+                                    raise RuntimeError("写真・資料の登録情報がSupabaseに残っています。")
                             st.session_state.pop(f"onedrive_thumbnail_{item_id}", None)
                             deleted_items.append(item)
+                            log_image_event(
+                                "attachment_delete_completed",
+                                success=True,
+                                duration_ms=round(
+                                    (time.perf_counter() - item_started_at) * 1000,
+                                    1,
+                                ),
+                            )
                         except Exception as exc:
+                            log_image_event(
+                                "attachment_delete_failed",
+                                success=False,
+                                reason=type(exc).__name__,
+                                message=str(exc),
+                                duration_ms=round(
+                                    (time.perf_counter() - item_started_at) * 1000,
+                                    1,
+                                ),
+                            )
                             failed_items.append((item_name, str(exc)))
 
                 if deleted_items:
