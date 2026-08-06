@@ -5846,6 +5846,122 @@ def read_customer_edit_bundle_from_bytes(content, customer_name):
         workbook.close()
 
 
+def delivery_record_fingerprint(source, row_number, values):
+    """履歴修正中の別端末更新を検知するため、A:Nの現在値から指紋を作る。"""
+    normalized = [change_history_value(value) for value in list(values or [])[:14]]
+    payload = json.dumps(
+        {
+            "source": str(source or ""),
+            "row_number": int(row_number),
+            "values": normalized,
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def read_product_delivery_history_from_bytes(content, customer_name, product_name):
+    """配達履歴と次回配達日シートの現在行を、修正用の一覧として返す。"""
+    workbook = load_workbook(
+        BytesIO(content),
+        keep_vba=True,
+        data_only=False,
+        read_only=False,
+    )
+    try:
+        if DELIVERY_SHEET_NAME not in workbook.sheetnames:
+            raise ValueError("次回配達日シートが見つかりません。")
+        if DELIVERY_HISTORY_SHEET_NAME not in workbook.sheetnames:
+            raise ValueError("配達履歴シートが見つかりません。")
+
+        delivery_ws = workbook[DELIVERY_SHEET_NAME]
+        _, active_rows, _ = find_product_rows_by_usage(
+            delivery_ws,
+            customer_name,
+            product_name,
+        )
+        if len(active_rows) > 1:
+            raise ValueError("同じ顧客名・商品名の使用中行が複数見つかりました。確認してください。")
+        if not active_rows:
+            raise ValueError("使用中の商品行が見つからないため、納品履歴を表示できません。")
+
+        current_row = active_rows[0]
+        current_values = tuple(
+            delivery_ws.cell(current_row, column).value
+            for column in range(1, 15)
+        )
+        target_identity = delivery_history_identity(current_values)
+        if target_identity is None:
+            raise ValueError("顧客・商品を履歴と結び付ける情報が見つかりません。")
+
+        records = []
+        history_ws = workbook[DELIVERY_HISTORY_SHEET_NAME]
+        for row_number, values in enumerate(
+            history_ws.iter_rows(min_row=2, max_col=14, values_only=True),
+            start=2,
+        ):
+            values = tuple(values or ())
+            if delivery_history_identity(values) != target_identity:
+                continue
+            records.append(
+                {
+                    "record_key": f"history:{row_number}",
+                    "source": "history",
+                    "row_number": row_number,
+                    "identity": target_identity,
+                    "fingerprint": delivery_record_fingerprint(
+                        "history",
+                        row_number,
+                        values,
+                    ),
+                    "メーカー": values[5] if len(values) >= 6 else None,
+                    "在庫本数": values[7] if len(values) >= 8 else None,
+                    "本数": values[8] if len(values) >= 9 else None,
+                    "kg/本": values[9] if len(values) >= 10 else None,
+                    "配達日": values[10] if len(values) >= 11 else None,
+                    "配達数量": values[11] if len(values) >= 12 else None,
+                    "次回配達予定": values[12] if len(values) >= 13 else None,
+                }
+            )
+
+        current_next_delivery, _ = calculate_delivery_values(current_values)
+        records.append(
+            {
+                "record_key": f"current:{current_row}",
+                "source": "current",
+                "row_number": current_row,
+                "identity": target_identity,
+                "fingerprint": delivery_record_fingerprint(
+                    "current",
+                    current_row,
+                    current_values,
+                ),
+                "メーカー": current_values[5] if len(current_values) >= 6 else None,
+                "在庫本数": current_values[7] if len(current_values) >= 8 else None,
+                "本数": current_values[8] if len(current_values) >= 9 else None,
+                "kg/本": current_values[9] if len(current_values) >= 10 else None,
+                "配達日": current_values[10] if len(current_values) >= 11 else None,
+                "配達数量": current_values[11] if len(current_values) >= 12 else None,
+                "次回配達予定": current_next_delivery,
+            }
+        )
+
+        # 修正後に日付の前後が変わっても、画面は日付の新しい順で表示する。
+        records.sort(
+            key=lambda item: (
+                to_date(item.get("配達日")) or date.min,
+                1 if item.get("source") == "current" else 0,
+                int(item.get("row_number") or 0),
+            ),
+            reverse=True,
+        )
+        return records
+    finally:
+        workbook.close()
+
+
 def parse_optional_nonnegative_number(text, integer=False):
     value = str(text).strip().translate(str.maketrans("０１２３４５６７８９．，", "0123456789.,"))
     # 音声入力で付きやすい単位を許可する。
@@ -5901,7 +6017,11 @@ def same_excel_value(old, new):
     if is_blank_excel_value(old) and is_blank_excel_value(new):
         return True
     if isinstance(old, (datetime, date)) and isinstance(new, (datetime, date)):
-        return old.date() == new.date() if isinstance(old, datetime) else old == (new.date() if isinstance(new, datetime) else new)
+        # datetime と date の組み合わせでも、date 側へ .date() を呼ばない。
+        # 例：Excelの datetime(8/6) をアプリの date(8/3)へ直す場合も安全に比較する。
+        old_date = old.date() if isinstance(old, datetime) else old
+        new_date = new.date() if isinstance(new, datetime) else new
+        return old_date == new_date
     return old == new
 
 
@@ -6224,6 +6344,283 @@ def save_customer_excel_changes(customer_name, product_name, proposed):
     )
 
     # Keep the existing exact rule: retain the newest 30 backups.
+    cleanup_warning = trim_old_dropbox_backups(access_token, keep=30)
+    warnings = [warning for warning in (cleanup_warning, cache_warning) if warning]
+    st.cache_data.clear()
+    return {
+        "backup_path": backup_path,
+        "updated_at": get_jst_now(),
+        "changed_cells": changed_cells,
+        "cleanup_warning": "\n".join(warnings),
+    }
+
+
+
+def update_delivery_history_record_bytes(
+    original_content,
+    customer_name,
+    product_name,
+    record_ref,
+    proposed,
+):
+    """納品履歴の指定1行を訂正する。新しい履歴行は追加しない。"""
+    workbook = load_workbook(
+        BytesIO(original_content),
+        keep_vba=True,
+        data_only=False,
+        read_only=False,
+    )
+    original_sheets = list(workbook.sheetnames)
+    changed_cells = []
+    try:
+        source = str((record_ref or {}).get("source") or "").strip()
+        row_number = int((record_ref or {}).get("row_number") or 0)
+        expected_fingerprint = str(
+            (record_ref or {}).get("fingerprint") or ""
+        ).strip()
+        expected_identity = tuple((record_ref or {}).get("identity") or ())
+
+        if source == "current":
+            sheet_name = DELIVERY_SHEET_NAME
+        elif source == "history":
+            sheet_name = DELIVERY_HISTORY_SHEET_NAME
+        else:
+            raise ValueError("修正する納品履歴を特定できません。")
+
+        if sheet_name not in workbook.sheetnames:
+            raise ValueError(f"{sheet_name}シートが見つかりません。")
+        if DELIVERY_SHEET_NAME not in workbook.sheetnames:
+            raise ValueError("次回配達日シートが見つかりません。")
+        if DELIVERY_HISTORY_SHEET_NAME not in workbook.sheetnames:
+            raise ValueError("配達履歴シートが見つかりません。")
+        if MANAGEMENT_SHEET_NAME not in workbook.sheetnames:
+            raise ValueError("管理シートが見つかりません。")
+
+        ws = workbook[sheet_name]
+        if row_number < 1 or row_number > ws.max_row:
+            raise ValueError("修正対象の行が見つかりません。再読み込みしてください。")
+
+        row_values = tuple(ws.cell(row_number, column).value for column in range(1, 15))
+        actual_identity = delivery_history_identity(row_values)
+        if expected_identity and actual_identity != expected_identity:
+            raise ValueError("修正対象の顧客・商品が変わっています。再読み込みしてください。")
+        if normalize_match_value(row_values[1] if len(row_values) >= 2 else None) != normalize_match_value(customer_name):
+            raise ValueError("修正対象の顧客が一致しません。再読み込みしてください。")
+        if normalize_match_value(row_values[4] if len(row_values) >= 5 else None) != normalize_match_value(product_name):
+            raise ValueError("修正対象の商品が一致しません。再読み込みしてください。")
+
+        actual_fingerprint = delivery_record_fingerprint(
+            source,
+            row_number,
+            row_values,
+        )
+        if expected_fingerprint and actual_fingerprint != expected_fingerprint:
+            raise ValueError(
+                "この納品履歴はPCまたは別端末で変更されています。"
+                "納品履歴を開き直してから修正してください。"
+            )
+
+        column_mapping = {
+            "メーカー": 6,
+            "在庫本数": 8,
+            "本数": 9,
+            "kg/本": 10,
+            "配達日": 11,
+        }
+        old_values = {
+            label: ws.cell(row_number, column).value
+            for label, column in column_mapping.items()
+        }
+
+        for label, column in column_mapping.items():
+            cell = ws.cell(row_number, column)
+            new_value = proposed.get(label)
+            if not same_excel_value(cell.value, new_value):
+                cell.value = new_value
+                changed_cells.append((sheet_name, row_number, column, new_value))
+
+        inventory_changed = not same_excel_value(
+            old_values.get("在庫本数"),
+            proposed.get("在庫本数"),
+        )
+        delivery_changed = not same_excel_value(
+            old_values.get("本数"),
+            proposed.get("本数"),
+        )
+        kg_changed = not same_excel_value(
+            old_values.get("kg/本"),
+            proposed.get("kg/本"),
+        )
+        date_changed = not same_excel_value(
+            old_values.get("配達日"),
+            proposed.get("配達日"),
+        )
+
+        quantity_changed = False
+        should_recalculate_quantity = inventory_changed or delivery_changed
+        if kg_changed:
+            # H/Iがある新しい形式の行だけ、kg/本の訂正を配達数量へ反映する。
+            # H/Iが空欄の古い履歴では、既存の配達数量を消さずに保持する。
+            should_recalculate_quantity = should_recalculate_quantity or (
+                inventory_usage_number(proposed.get("在庫本数")) is not None
+                or inventory_usage_number(proposed.get("本数")) is not None
+            )
+
+        if should_recalculate_quantity:
+            inventory_count = inventory_usage_number(proposed.get("在庫本数"))
+            delivery_count = inventory_usage_number(proposed.get("本数"))
+            kg_per_bottle = inventory_usage_number(proposed.get("kg/本"))
+            corrected_quantity = None
+            if inventory_count is not None or delivery_count is not None:
+                if kg_per_bottle is None or kg_per_bottle <= 0:
+                    raise ValueError(
+                        "在庫本数または本数を入れる場合は、kg/本に0より大きい数値が必要です。"
+                    )
+                corrected_quantity = (
+                    (inventory_count or 0) + (delivery_count or 0)
+                ) * kg_per_bottle
+                if not math.isfinite(corrected_quantity):
+                    raise ValueError("配達数量を正しく計算できませんでした。")
+                if corrected_quantity.is_integer():
+                    corrected_quantity = int(corrected_quantity)
+
+            quantity_cell = ws.cell(row_number, 12)
+            if not same_excel_value(quantity_cell.value, corrected_quantity):
+                quantity_cell.value = corrected_quantity
+                changed_cells.append(
+                    (sheet_name, row_number, 12, corrected_quantity)
+                )
+                quantity_changed = True
+
+        # 配達履歴シートは数式ではないため、訂正後の次回配達予定も同じ行で再計算する。
+        # 次回配達日シートは従来のM列数式をそのまま維持し、Excel再計算に任せる。
+        if source == "history" and (date_changed or quantity_changed):
+            corrected_values = [
+                ws.cell(row_number, column).value
+                for column in range(1, 15)
+            ]
+            corrected_next_delivery, _ = calculate_delivery_values(corrected_values)
+            next_cell = ws.cell(row_number, 13)
+            if not same_excel_value(next_cell.value, corrected_next_delivery):
+                next_cell.value = corrected_next_delivery
+                changed_cells.append(
+                    (sheet_name, row_number, 13, corrected_next_delivery)
+                )
+
+        if not changed_cells:
+            raise ValueError("変更された項目がありません。")
+
+        enable_excel_recalculation(workbook)
+        output = BytesIO()
+        workbook.save(output)
+    finally:
+        workbook.close()
+
+    saved_content = output.getvalue()
+    verified = load_workbook(
+        BytesIO(saved_content),
+        keep_vba=True,
+        data_only=False,
+        read_only=False,
+    )
+    try:
+        if list(verified.sheetnames) != original_sheets:
+            raise ValueError("保存後にシート構成が変わったため、更新を中止しました。")
+        required_sheets = {
+            DELIVERY_SHEET_NAME,
+            DELIVERY_HISTORY_SHEET_NAME,
+            MANAGEMENT_SHEET_NAME,
+            SHEET_NAME,
+        }
+        if not required_sheets.issubset(set(verified.sheetnames)):
+            raise ValueError("保存後の検証で必要なシートが見つかりません。")
+        if verified.vba_archive is None:
+            raise ValueError("保存後の検証でVBAプロジェクトを確認できません。")
+        for sheet, row, column, expected in changed_cells:
+            actual = verified[sheet].cell(row, column).value
+            if not same_excel_value(actual, expected):
+                coordinate = verified[sheet].cell(row, column).coordinate
+                raise ValueError(
+                    f"保存後の検証で{sheet}!{coordinate}の値が一致しません。"
+                )
+    finally:
+        verified.close()
+    return saved_content, changed_cells
+
+
+def save_customer_delivery_history_correction(
+    customer_name,
+    product_name,
+    record_ref,
+    proposed,
+):
+    """バックアップ・競合防止・ハッシュ確認付きで納品履歴の1件を訂正する。"""
+    access_token = get_dropbox_access_token()
+    target_path = get_dropbox_file_path()
+    original_content, download_response = download_dropbox_file(
+        target_path,
+        access_token,
+    )
+    if original_content is None:
+        raise RuntimeError(
+            "最新のExcelを取得できませんでした。\n"
+            + dropbox_error_text(download_response)
+        )
+    revision = get_download_revision(download_response)
+    if not revision:
+        raise RuntimeError(
+            "Dropboxのrevを取得できないため、安全のため更新を中止しました。"
+        )
+
+    timestamp = get_jst_now().strftime("%Y%m%d_%H%M%S_%f")
+    backup_path = f"{DROPBOX_BACKUP_FOLDER}/配車予定 次郎_{timestamp}.xlsm"
+    create_dropbox_backup(
+        target_path,
+        backup_path,
+        original_content,
+        access_token,
+    )
+
+    saved_content, changed_cells = update_delivery_history_record_bytes(
+        original_content,
+        customer_name,
+        product_name,
+        record_ref,
+        proposed,
+    )
+    upload_response = upload_dropbox_file(
+        target_path,
+        saved_content,
+        access_token,
+        mode="update",
+        rev=revision,
+    )
+    if upload_response.status_code == 409:
+        raise RuntimeError(
+            "PCまたは別端末でExcelが更新されています。"
+            "再読み込みしてからやり直してください"
+        )
+    if upload_response.status_code != 200:
+        raise RuntimeError(
+            "本番Excelを更新できませんでした。\n"
+            + dropbox_error_text(upload_response)
+        )
+
+    upload_metadata = get_dropbox_response_metadata(upload_response)
+    if not upload_metadata.get("content_hash") or upload_metadata.get("size") is None:
+        upload_metadata = get_dropbox_file_metadata(target_path, access_token)
+    confirmed_revision = verify_dropbox_file_metadata(
+        upload_metadata,
+        saved_content,
+        previous_revision=revision,
+    )
+
+    # 過去履歴の訂正でも予想使用量が変わるため、表示用JSONを必ず作り直す。
+    cache_warning = refresh_fast_dropbox_cache_after_save(
+        saved_content,
+        confirmed_revision,
+        access_token,
+    )
     cleanup_warning = trim_old_dropbox_backups(access_token, keep=30)
     warnings = [warning for warning in (cleanup_warning, cache_warning) if warning]
     st.cache_data.clear()
@@ -13086,7 +13483,19 @@ def calculate_predicted_daily_usage_from_states(states):
     legacy_baseline_inventory_kg = None
     latest_prediction = None
 
-    for values in states:
+    # 履歴修正で日付の順番が変わる場合もあるため、計算時だけ配達日順へ並べる。
+    # 同じ日付の行は、Excelの元の並び順を維持する。
+    indexed_states = list(enumerate(states or []))
+
+    def state_sort_key(item):
+        original_index, raw_values = item
+        values = list(raw_values or [])
+        event_date = to_date(values[10] if len(values) >= 11 else None)
+        return event_date or date.max, original_index
+
+    indexed_states.sort(key=state_sort_key)
+
+    for _, values in indexed_states:
         values = list(values or [])
         inventory_count = inventory_usage_number(values[7] if len(values) >= 8 else None)
         delivery_count = inventory_usage_number(values[8] if len(values) >= 9 else None)
@@ -13774,12 +14183,227 @@ def display_change_value(value):
     return str(value)
 
 
+def render_customer_delivery_history_editor(
+    customer_name,
+    product_name,
+    key_suffix,
+    history_open_key,
+    history_edit_key,
+):
+    """編集画面の中だけで、現在の登録と過去の納品履歴を修正できるようにする。"""
+    history_limit_key = f"delivery_history_limit_{key_suffix}"
+    st.markdown("#### 納品履歴")
+    st.caption(
+        "Excelの納品ボタンまたはアプリから登録した履歴です。"
+        "ここでの修正は新しい納品を追加せず、選んだ記録だけを訂正します。"
+    )
+
+    if st.button(
+        "編集画面に戻る",
+        key=f"delivery_history_back_{key_suffix}",
+        use_container_width=True,
+    ):
+        st.session_state.pop(history_open_key, None)
+        st.session_state.pop(history_edit_key, None)
+        st.session_state.pop(history_limit_key, None)
+        st.rerun()
+
+    try:
+        content = get_cached_dropbox_excel_content()
+        records = read_product_delivery_history_from_bytes(
+            content,
+            customer_name,
+            product_name,
+        )
+    except Exception as exc:
+        st.error(f"納品履歴を読み込めませんでした：{exc}")
+        return
+
+    if not records:
+        st.info("納品履歴はありません。")
+        return
+
+    active_record_key = st.session_state.get(history_edit_key)
+    try:
+        history_limit = max(20, int(st.session_state.get(history_limit_key, 20)))
+    except (TypeError, ValueError):
+        history_limit = 20
+    visible_records = records[:history_limit]
+
+    for record in visible_records:
+        record_key = record["record_key"]
+        with st.container(border=True):
+            title = format_date(record.get("配達日"))
+            if record.get("source") == "current":
+                st.markdown(f"**{title}　現在の登録**")
+            else:
+                st.markdown(f"**{title}**")
+
+            col1, col2 = st.columns(2)
+            with col1:
+                st.caption("メーカー")
+                st.markdown(f"**{clean_value(record.get('メーカー'))}**")
+                st.caption("在庫本数")
+                st.markdown(f"**{format_number(record.get('在庫本数'))}**")
+                st.caption("本数")
+                st.markdown(f"**{format_number(record.get('本数'))}**")
+            with col2:
+                st.caption("kg/本")
+                st.markdown(f"**{format_number(record.get('kg/本'))}**")
+                st.caption("配達数量")
+                st.markdown(f"**{format_number(record.get('配達数量'))}**")
+                st.caption("次回配達予定")
+                st.markdown(f"**{format_date(record.get('次回配達予定'))}**")
+
+            if active_record_key != record_key:
+                if st.button(
+                    "修正",
+                    key=f"delivery_history_edit_{key_suffix}_{record_key}",
+                    use_container_width=True,
+                ):
+                    st.session_state[history_edit_key] = record_key
+                    st.rerun()
+                continue
+
+            st.markdown("**この記録を修正**")
+            with st.form(f"delivery_history_form_{key_suffix}_{record_key}"):
+                maker = st.text_input(
+                    "メーカー",
+                    value=value_for_input(record.get("メーカー")),
+                    help=VOICE_INPUT_HELP,
+                )
+                inventory_bottles = st.text_input(
+                    "在庫本数",
+                    value=value_for_input(record.get("在庫本数")),
+                    help=VOICE_INPUT_HELP,
+                )
+                bottles = st.text_input(
+                    "本数",
+                    value=value_for_input(record.get("本数")),
+                    help=VOICE_INPUT_HELP,
+                )
+                kg_per_bottle = st.text_input(
+                    "kg/本",
+                    value=value_for_input(record.get("kg/本")),
+                    help=VOICE_INPUT_HELP,
+                )
+                delivery_date = st.text_input(
+                    "配達日",
+                    value=date_for_input(record.get("配達日")),
+                    placeholder="例：2026年7月15日",
+                    help=VOICE_INPUT_HELP,
+                )
+                save_col, cancel_col = st.columns(2)
+                with save_col:
+                    save_correction = st.form_submit_button(
+                        "修正を保存",
+                        type="primary",
+                        use_container_width=True,
+                    )
+                with cancel_col:
+                    cancel_correction = st.form_submit_button(
+                        "キャンセル",
+                        use_container_width=True,
+                    )
+
+            if cancel_correction:
+                st.session_state.pop(history_edit_key, None)
+                st.rerun()
+
+            if save_correction:
+                try:
+                    proposed = {
+                        "メーカー": str(maker).strip() or None,
+                        "在庫本数": (
+                            parse_optional_nonnegative_number(
+                                inventory_bottles,
+                                integer=True,
+                            )
+                            if str(inventory_bottles).strip()
+                            else None
+                        ),
+                        "本数": (
+                            parse_optional_nonnegative_number(
+                                bottles,
+                                integer=True,
+                            )
+                            if str(bottles).strip()
+                            else None
+                        ),
+                        "kg/本": (
+                            parse_optional_nonnegative_number(
+                                kg_per_bottle,
+                                integer=False,
+                            )
+                            if str(kg_per_bottle).strip()
+                            else None
+                        ),
+                        "配達日": (
+                            parse_optional_date(delivery_date)
+                            if str(delivery_date).strip()
+                            else None
+                        ),
+                    }
+                    changes = {
+                        label: (record.get(label), proposed[label])
+                        for label in proposed
+                        if not same_excel_value(record.get(label), proposed[label])
+                    }
+                    if not changes:
+                        st.warning("変更された項目がありません。")
+                        continue
+
+                    with st.spinner("バックアップを作成して履歴を修正しています…"):
+                        result = save_customer_delivery_history_correction(
+                            customer_name,
+                            product_name,
+                            record,
+                            proposed,
+                        )
+                        result["usage_warning"] = ""
+                        result["history_warning"] = record_change_history_safely(
+                            "顧客",
+                            "",
+                            customer_name,
+                            "変更",
+                            changes,
+                            section=f"商品：{product_name}／納品履歴",
+                        )
+
+                    st.session_state.pop(history_edit_key, None)
+                    st.session_state.pop(history_open_key, None)
+                    st.session_state[f"excel_edit_{key_suffix}"] = True
+                    st.session_state["excel_save_success"] = {
+                        **result,
+                        "customer_name": customer_name,
+                        "product_name": f"{product_name}（納品履歴修正）",
+                    }
+                    st.rerun()
+                except ValueError as exc:
+                    st.error(str(exc))
+                except Exception as exc:
+                    st.error(f"納品履歴を修正できませんでした：{exc}")
+
+    if len(records) > history_limit:
+        remaining_count = len(records) - history_limit
+        if st.button(
+            f"さらに表示（残り{remaining_count}件）",
+            key=f"delivery_history_more_{key_suffix}_{history_limit}",
+            use_container_width=True,
+        ):
+            st.session_state[history_limit_key] = history_limit + 20
+            st.rerun()
+
+
 def render_customer_excel_editor(customer_name, customer_key, product_name, current):
     """商品カード内に、確認画面付きのExcel編集欄を追加する。"""
     identity = f"{customer_name}|{product_name}"
     key_suffix = str(abs(hash(identity)))
     edit_key = f"excel_edit_{key_suffix}"
     confirm_key = f"excel_confirm_{key_suffix}"
+    history_open_key = f"delivery_history_open_{key_suffix}"
+    history_edit_key = f"delivery_history_active_edit_{key_suffix}"
+    history_limit_key = f"delivery_history_limit_{key_suffix}"
 
     if current.get("商品一致件数") == 0:
         st.error("顧客名・商品名が一致する行が見つからないため編集できません。")
@@ -13804,6 +14428,16 @@ def render_customer_excel_editor(customer_name, customer_key, product_name, curr
     with col_d:
         st.caption("配達日")
         st.markdown(f"**{format_date(current.get('配達日'))}**")
+
+    if st.session_state.get(history_open_key):
+        render_customer_delivery_history_editor(
+            customer_name,
+            product_name,
+            key_suffix,
+            history_open_key,
+            history_edit_key,
+        )
+        return
 
     if not st.session_state.get(edit_key) and not st.session_state.get(confirm_key):
         if st.button("編集", key=f"edit_button_{key_suffix}"):
@@ -13833,6 +14467,9 @@ def render_customer_excel_editor(customer_name, customer_key, product_name, curr
                         )
                     st.session_state.pop(confirm_key, None)
                     st.session_state.pop(edit_key, None)
+                    st.session_state.pop(history_open_key, None)
+                    st.session_state.pop(history_edit_key, None)
+                    st.session_state.pop(history_limit_key, None)
                     st.session_state["excel_save_success"] = {
                         **result,
                         "customer_name": customer_name,
@@ -13890,8 +14527,21 @@ def render_customer_excel_editor(customer_name, customer_key, product_name, curr
         with cancel_col:
             cancel = st.form_submit_button("キャンセル", use_container_width=True)
 
+    if st.button(
+        "納品履歴",
+        key=f"delivery_history_open_button_{key_suffix}",
+        use_container_width=True,
+    ):
+        st.session_state[history_open_key] = True
+        st.session_state[history_limit_key] = 20
+        st.session_state.pop(history_edit_key, None)
+        st.rerun()
+
     if cancel:
         st.session_state.pop(edit_key, None)
+        st.session_state.pop(history_open_key, None)
+        st.session_state.pop(history_edit_key, None)
+        st.session_state.pop(history_limit_key, None)
         st.rerun()
     if proceed:
         try:
@@ -13958,6 +14608,9 @@ def render_customer_excel_editor(customer_name, customer_key, product_name, curr
                     )
                 st.session_state.pop(confirm_key, None)
                 st.session_state.pop(edit_key, None)
+                st.session_state.pop(history_open_key, None)
+                st.session_state.pop(history_edit_key, None)
+                st.session_state.pop(history_limit_key, None)
                 st.session_state["excel_save_success"] = {
                     **result,
                     "customer_name": customer_name,
