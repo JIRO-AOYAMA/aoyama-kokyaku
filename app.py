@@ -4386,7 +4386,6 @@ def show_onedrive_image_gallery_dialog(image_items):
             <div class="odv-toolbar">
               <div class="odv-filename"></div>
               <div class="odv-count"></div>
-              <button class="odv-original" type="button" aria-label="原寸を開く" title="原寸を開く">原寸</button>
               <button class="odv-fullscreen" type="button" aria-label="全画面表示">⛶</button>
               <button class="odv-close" type="button" aria-label="閉じる">×</button>
             </div>
@@ -4475,15 +4474,6 @@ def show_onedrive_image_gallery_dialog(image_items):
               cursor: pointer;
               touch-action: manipulation;
             }}
-            #${{viewerId}} .odv-original {{
-              width: 54px;
-              flex-basis: 54px;
-              font-size: 13px;
-              font-weight: 700;
-            }}
-            #${{viewerId}} .odv-original:disabled {{
-              display: none;
-            }}
             #${{viewerId}} .odv-fullscreen {{ font-size: 22px; }}
             #${{viewerId}} .odv-nav {{
               position:absolute;
@@ -4527,7 +4517,6 @@ def show_onedrive_image_gallery_dialog(image_items):
           const stage = overlay.querySelector('.odv-stage');
           const image = overlay.querySelector('.odv-image');
           const closeButton = overlay.querySelector('.odv-close');
-          const originalButton = overlay.querySelector('.odv-original');
           const fullscreenButton = overlay.querySelector('.odv-fullscreen');
           const filenameNode = overlay.querySelector('.odv-filename');
           const countNode = overlay.querySelector('.odv-count');
@@ -4569,8 +4558,6 @@ def show_onedrive_image_gallery_dialog(image_items):
             image.alt = current.filename;
             image.src = current.url;
             filenameNode.textContent = current.filename;
-            originalButton.disabled = !current.originalUrl;
-            originalButton.style.display = current.originalUrl ? '' : 'none';
             countNode.textContent = images.length > 1
               ? `${{currentIndex + 1}} / ${{images.length}}`
               : '';
@@ -4646,15 +4633,6 @@ def show_onedrive_image_gallery_dialog(image_items):
           closeButton.addEventListener('click', closeViewer);
           prevButton.addEventListener('click', () => showImage(currentIndex - 1));
           nextButton.addEventListener('click', () => showImage(currentIndex + 1));
-          originalButton.addEventListener('click', () => {{
-            const current = images[currentIndex];
-            const originalUrl = current && current.originalUrl
-              ? String(current.originalUrl)
-              : '';
-            if (!originalUrl) return;
-            parentWindow.open(originalUrl, '_blank', 'noopener,noreferrer');
-          }});
-
           fullscreenButton.addEventListener('click', async () => {{
             try {{
               if (parentDocument.fullscreenElement) {{
