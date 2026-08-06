@@ -16633,7 +16633,15 @@ def build_exact_product_search_results(product_rows, product_name, keyword=""):
                 }
             )
 
-    current_results.sort(key=lambda item: item["顧客名"])
+    # 商品名・メーカー名のどちらで検索した場合も、現在使用中は
+    # 次回配達予定の早い順に表示する。日付なし・判定不能は最後、同日は顧客名順。
+    current_results.sort(
+        key=lambda item: (
+            to_date(item.get("次回配達予定")) is None,
+            to_date(item.get("次回配達予定")) or date.max,
+            item["顧客名"],
+        )
+    )
     past_results.sort(key=lambda item: item["顧客名"])
     return current_results, past_results
 
