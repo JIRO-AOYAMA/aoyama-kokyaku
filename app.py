@@ -2837,14 +2837,143 @@ def prepare_onedrive_display_image(content, original_name, stored_name):
         return None
 
 
+def get_onedrive_attachment_display_stored_name(attachment):
+    """表示用WebPの保存名を返す。旧データは元画像の保存名から安全に補完する。"""
+    if not isinstance(attachment, dict):
+        return ""
+    configured_name = clean_value(
+        attachment.get("display_stored_name"), blank_text=""
+    ).strip("/")
+    if configured_name:
+        return Path(configured_name).name
+    original_stored_name = clean_value(
+        attachment.get("stored_name"), blank_text=""
+    ).strip("/")
+    if not original_stored_name:
+        return ""
+    return f"{Path(original_stored_name).stem}__display.webp"
+
+
+def update_onedrive_attachment_display_fields(
+    attachment,
+    display_item,
+    requested_stored_name="",
+    display_content=b"",
+):
+    """表示用WebP情報をメモリへ反映し、可能ならSupabaseにも保存する。"""
+    if not isinstance(attachment, dict) or not isinstance(display_item, dict):
+        return ""
+    display_file_id = clean_value(display_item.get("id"), blank_text="").strip()
+    if not display_file_id:
+        return ""
+
+    display_stored_name = (
+        clean_value(display_item.get("name"), blank_text="").strip()
+        or clean_value(requested_stored_name, blank_text="").strip()
+    )
+    updated = dict(attachment)
+    updated["display_file_id"] = display_file_id
+    updated["display_stored_name"] = display_stored_name
+    updated["display_mime_type"] = "image/webp"
+    updated["display_size"] = int(
+        display_item.get("size")
+        or len(display_content or b"")
+        or attachment.get("display_size")
+        or 0
+    )
+    updated["display_web_url"] = (
+        clean_value(display_item.get("webUrl"), blank_text="")
+        or clean_value(attachment.get("display_web_url"), blank_text="")
+    )
+
+    # 先に現在の画面へ反映する。Supabaseが一時的に更新できなくても、
+    # OneDrive上の決定的な保存名から次回表示時に再取得できる。
+    attachment.update(updated)
+    metadata_id = clean_value(updated.get("id"), blank_text="")
+    field_name = clean_value(updated.get("field_name"), blank_text="")
+    if metadata_id and field_name:
+        try:
+            update_customer_information(
+                metadata_id,
+                field_name,
+                serialize_onedrive_attachment(updated),
+            )
+        except Exception:
+            # 表示用WebPの記録更新失敗で、従来の画像表示まで止めない。
+            pass
+    return display_file_id
+
+
+def ensure_onedrive_attachment_display_image(access_token, attachment):
+    """旧画像を初めて開く時だけ、通常表示用WebPを1枚生成して記録する。"""
+    if not isinstance(attachment, dict) or attachment.get("file_type") != "image":
+        return ""
+
+    existing_display_id = clean_value(
+        attachment.get("display_file_id"), blank_text=""
+    ).strip()
+    if existing_display_id:
+        return existing_display_id
+
+    folder_path = clean_value(
+        attachment.get("onedrive_path"), blank_text=""
+    ).strip("/")
+    display_stored_name = get_onedrive_attachment_display_stored_name(attachment)
+    if not folder_path or not display_stored_name:
+        return ""
+
+    try:
+        # 前回のSupabase更新だけ失敗してWebP本体が残っている場合は、
+        # 元画像を再ダウンロードせず、そのファイルIDだけを修復する。
+        existing_item = get_onedrive_path_item(
+            access_token,
+            f"{folder_path}/{display_stored_name}",
+        )
+        if isinstance(existing_item, dict) and not existing_item.get("folder"):
+            return update_onedrive_attachment_display_fields(
+                attachment,
+                existing_item,
+                requested_stored_name=display_stored_name,
+            )
+
+        original_content = download_onedrive_attachment_file(
+            access_token,
+            attachment,
+        )
+        display = prepare_onedrive_display_image(
+            original_content,
+            attachment.get("original_name", ""),
+            attachment.get("stored_name", ""),
+        )
+        if not display:
+            return ""
+
+        # 保存名は元画像のstored_nameから決まるため、同時アクセスでも同じ場所を使う。
+        display["stored_name"] = display_stored_name
+        display_item = upload_onedrive_file_to_existing_folder(
+            access_token,
+            folder_path,
+            display_stored_name,
+            display["content"],
+            display["mime_type"],
+        )
+        return update_onedrive_attachment_display_fields(
+            attachment,
+            display_item,
+            requested_stored_name=display_stored_name,
+            display_content=display["content"],
+        )
+    except Exception:
+        # 変換・保存・記録のどこかが失敗しても、呼び出し側は従来どおり元画像を表示する。
+        return ""
+
+
 def repair_onedrive_attachment_display_reference(access_token, attachment):
     """表示用WebPのIDだけが古い場合、保存名から取り直す。"""
     if not isinstance(attachment, dict):
         return ""
     folder_path = clean_value(attachment.get("onedrive_path"), blank_text="").strip("/")
-    stored_name = clean_value(
-        attachment.get("display_stored_name"), blank_text=""
-    ).strip("/")
+    stored_name = get_onedrive_attachment_display_stored_name(attachment)
     if not folder_path or not stored_name:
         return ""
     item = get_onedrive_path_item(access_token, f"{folder_path}/{stored_name}")
@@ -2956,10 +3085,22 @@ def build_onedrive_image_gallery_items(access_token, attachments):
 
 def open_onedrive_image_group_gallery(access_token, attachments):
     """最初の画像だけを読み、次の画像は移動した時に読み込ませる。"""
+    image_attachments = [
+        item
+        for item in list(attachments or [])
+        if isinstance(item, dict) and item.get("file_type") == "image"
+    ]
     with st.spinner("画像を準備しています…"):
+        # 旧画像は最初に表示する1枚だけを初回WebP化する。
+        # グループ全件を変換すると元画像の一括ダウンロードへ戻るため行わない。
+        if image_attachments:
+            ensure_onedrive_attachment_display_image(
+                access_token,
+                image_attachments[0],
+            )
         image_items, missing_names, other_errors = build_onedrive_image_gallery_items(
             access_token,
-            attachments,
+            image_attachments,
         )
     if image_items:
         show_onedrive_image_gallery_dialog(image_items)
