@@ -4460,6 +4460,7 @@ def show_onedrive_image_gallery_dialog(image_items):
           let lastSinglePoint = null;
           let lastPinchDistance = 0;
           let lastPinchMidpoint = null;
+          let nextImagePreloader = null;
 
           const clamp = (value, min, max) => Math.min(max, Math.max(min, value));
           const applyTransform = () => {{
@@ -4485,6 +4486,32 @@ def show_onedrive_image_gallery_dialog(image_items):
             prevButton.style.display = navDisplay;
             nextButton.style.display = navDisplay;
           }};
+          const preloadNextImage = () => {{
+            if (nextImagePreloader) {{
+              nextImagePreloader.onload = null;
+              nextImagePreloader.onerror = null;
+              nextImagePreloader.src = '';
+              nextImagePreloader = null;
+            }}
+            if (images.length <= 1) return;
+
+            const nextIndex = (currentIndex + 1) % images.length;
+            const nextImage = images[nextIndex];
+            if (!nextImage || !nextImage.url) return;
+
+            const preloader = new parentWindow.Image();
+            nextImagePreloader = preloader;
+            const releasePreloader = () => {{
+              if (nextImagePreloader === preloader) {{
+                nextImagePreloader = null;
+              }}
+              preloader.onload = null;
+              preloader.onerror = null;
+            }};
+            preloader.onload = releasePreloader;
+            preloader.onerror = releasePreloader;
+            preloader.src = nextImage.url;
+          }};
           const zoomAt = (newScale, clientX, clientY) => {{
             newScale = clamp(newScale, 1, 8);
             const rect = stage.getBoundingClientRect();
@@ -4505,6 +4532,12 @@ def show_onedrive_image_gallery_dialog(image_items):
 
           const closeViewer = () => {{
             parentWindow.clearTimeout(helpTimer);
+            if (nextImagePreloader) {{
+              nextImagePreloader.onload = null;
+              nextImagePreloader.onerror = null;
+              nextImagePreloader.src = '';
+              nextImagePreloader = null;
+            }}
             parentDocument.removeEventListener('keydown', onKeyDown, true);
             if (parentDocument.fullscreenElement === overlay && parentDocument.exitFullscreen) {{
               parentDocument.exitFullscreen().catch(() => {{}});
@@ -4618,7 +4651,10 @@ def show_onedrive_image_gallery_dialog(image_items):
             zoomAt(scale * factor, event.clientX, event.clientY);
           }}, {{passive: false}});
 
-          image.addEventListener('load', resetView);
+          image.addEventListener('load', () => {{
+            resetView();
+            preloadNextImage();
+          }});
           showImage(0);
         }})();
         </script>
