@@ -376,7 +376,11 @@ ONEDRIVE_SUPPLIER_FOLDER = "仕入先"
 ONEDRIVE_CARRIER_FOLDER = "運送会社"
 ONEDRIVE_HOTEL_FOLDER = "ホテル"
 ONEDRIVE_ATTACHMENT_PREFIX = "__onedrive_attachment__:"
-ONEDRIVE_ATTACHMENT_VERSION = 1
+ONEDRIVE_ATTACHMENT_VERSION = 2
+ONEDRIVE_DISPLAY_IMAGE_MAX_EDGE = 1600
+ONEDRIVE_DISPLAY_IMAGE_QUALITY = 82
+ONEDRIVE_DISPLAY_IMAGE_METHOD = 4
+ONEDRIVE_GALLERY_URL_WORKERS = 4
 ONEDRIVE_FIXED_TAGS = ("設備", "名刺", "納品場所", "商品", "トラブル")
 ONEDRIVE_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
 ONEDRIVE_PDF_EXTENSIONS = {".pdf"}
@@ -2745,6 +2749,233 @@ def download_onedrive_file(access_token, item_id):
     return response.content
 
 
+def get_onedrive_item_download_url(access_token, item_id):
+    """画像本文をアプリへ通さず、ブラウザーが直接読む短期URLを返す。"""
+    clean_id = clean_value(item_id, blank_text="").strip()
+    if not clean_id:
+        return ""
+    response = onedrive_graph_request(
+        "GET",
+        f"/me/drive/items/{urllib.parse.quote(clean_id, safe='')}",
+        access_token,
+        expected=(200,),
+    )
+    payload = response.json() if response.content else {}
+    direct_url = str((payload or {}).get("@microsoft.graph.downloadUrl") or "").strip()
+    if direct_url:
+        return direct_url
+
+    streamed = requests.get(
+        ONEDRIVE_GRAPH_BASE
+        + f"/me/drive/items/{urllib.parse.quote(clean_id, safe='')}/content",
+        headers={"Authorization": f"Bearer {access_token}"},
+        timeout=ONEDRIVE_REQUEST_TIMEOUT,
+        allow_redirects=True,
+        stream=True,
+    )
+    try:
+        if streamed.status_code != 200:
+            raise RuntimeError(
+                f"Microsoft Graphでエラーが発生しました（{streamed.status_code}）"
+            )
+        final_url = str(streamed.url or "").strip()
+        if not final_url or final_url.startswith(ONEDRIVE_GRAPH_BASE):
+            return ""
+        return final_url
+    finally:
+        streamed.close()
+
+
+def prepare_onedrive_display_image(content, original_name, stored_name):
+    """元画像を残し、通常表示用の長辺1600px WebPを作る。"""
+    if Image is None or not content:
+        return None
+    try:
+        with Image.open(BytesIO(content)) as source_image:
+            source_image.load()
+            image = (
+                ImageOps.exif_transpose(source_image)
+                if ImageOps is not None
+                else source_image.copy()
+            )
+            if image.width <= 0 or image.height <= 0:
+                return None
+            resampling = getattr(getattr(Image, "Resampling", Image), "LANCZOS")
+            if max(image.size) > ONEDRIVE_DISPLAY_IMAGE_MAX_EDGE:
+                image.thumbnail(
+                    (ONEDRIVE_DISPLAY_IMAGE_MAX_EDGE, ONEDRIVE_DISPLAY_IMAGE_MAX_EDGE),
+                    resampling,
+                )
+            if image.mode in {"RGBA", "LA"} or (
+                image.mode == "P" and "transparency" in image.info
+            ):
+                image = image.convert("RGBA")
+            else:
+                image = image.convert("RGB")
+            output = BytesIO()
+            image.save(
+                output,
+                format="WEBP",
+                quality=ONEDRIVE_DISPLAY_IMAGE_QUALITY,
+                method=ONEDRIVE_DISPLAY_IMAGE_METHOD,
+                optimize=True,
+            )
+            display_content = output.getvalue()
+            if not display_content:
+                return None
+            safe_stem = Path(str(stored_name or original_name or "image")).stem
+            return {
+                "content": display_content,
+                "stored_name": f"{safe_stem}__display.webp",
+                "mime_type": "image/webp",
+                "size": len(display_content),
+                "width": int(image.width),
+                "height": int(image.height),
+            }
+    except Exception:
+        # 変換できない画像は、元画像の従来保存・従来表示へ戻す。
+        return None
+
+
+def repair_onedrive_attachment_display_reference(access_token, attachment):
+    """表示用WebPのIDだけが古い場合、保存名から取り直す。"""
+    if not isinstance(attachment, dict):
+        return ""
+    folder_path = clean_value(attachment.get("onedrive_path"), blank_text="").strip("/")
+    stored_name = clean_value(
+        attachment.get("display_stored_name"), blank_text=""
+    ).strip("/")
+    if not folder_path or not stored_name:
+        return ""
+    item = get_onedrive_path_item(access_token, f"{folder_path}/{stored_name}")
+    if not isinstance(item, dict) or item.get("folder"):
+        return ""
+    repaired_id = clean_value(item.get("id"), blank_text="")
+    if not repaired_id:
+        return ""
+    old_id = clean_value(attachment.get("display_file_id"), blank_text="")
+    updated = dict(attachment)
+    updated["display_file_id"] = repaired_id
+    updated["display_stored_name"] = (
+        clean_value(item.get("name"), blank_text="") or stored_name
+    )
+    updated["display_web_url"] = clean_value(item.get("webUrl"), blank_text="")
+    metadata_id = clean_value(updated.get("id"), blank_text="")
+    field_name = clean_value(updated.get("field_name"), blank_text="")
+    if metadata_id and field_name and repaired_id != old_id:
+        update_customer_information(
+            metadata_id,
+            field_name,
+            serialize_onedrive_attachment(updated),
+        )
+    attachment.update(updated)
+    return repaired_id
+
+
+def get_onedrive_attachment_image_download_url(access_token, attachment):
+    """表示用WebPを優先し、旧画像は元画像へフォールバックする。"""
+    display_id = clean_value(
+        (attachment or {}).get("display_file_id"), blank_text=""
+    ).strip()
+    if display_id:
+        try:
+            direct_url = get_onedrive_item_download_url(access_token, display_id)
+            if direct_url:
+                return direct_url
+        except Exception as exc:
+            if not is_onedrive_not_found_error(exc):
+                raise
+            repaired_id = repair_onedrive_attachment_display_reference(
+                access_token,
+                attachment,
+            )
+            if repaired_id:
+                direct_url = get_onedrive_item_download_url(access_token, repaired_id)
+                if direct_url:
+                    return direct_url
+
+    item_id = clean_value((attachment or {}).get("file_id"), blank_text="").strip()
+    if not item_id:
+        item_id = repair_onedrive_attachment_reference(access_token, attachment)
+    if not item_id:
+        raise RuntimeError("OneDriveファイルIDを確認できませんでした。")
+    try:
+        return get_onedrive_item_download_url(access_token, item_id)
+    except Exception as exc:
+        if not is_onedrive_not_found_error(exc):
+            raise
+        repaired_id = repair_onedrive_attachment_reference(access_token, attachment)
+        if not repaired_id or repaired_id == item_id:
+            raise
+        return get_onedrive_item_download_url(access_token, repaired_id)
+
+
+def build_onedrive_image_gallery_items(access_token, attachments):
+    """本文を読まず、短期URLだけを最大4件並行で取得する。"""
+    image_attachments = [
+        item
+        for item in list(attachments or [])
+        if isinstance(item, dict) and item.get("file_type") == "image"
+    ]
+    if not image_attachments:
+        return [], [], []
+    results = {}
+    max_workers = min(ONEDRIVE_GALLERY_URL_WORKERS, len(image_attachments))
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_map = {
+            executor.submit(
+                get_onedrive_attachment_image_download_url,
+                access_token,
+                attachment,
+            ): index
+            for index, attachment in enumerate(image_attachments)
+        }
+        for future in as_completed(future_map):
+            index = future_map[future]
+            try:
+                results[index] = (future.result(), "")
+            except Exception as exc:
+                results[index] = ("", str(exc))
+
+    gallery_items = []
+    missing_names = []
+    other_errors = []
+    for index, attachment in enumerate(image_attachments):
+        filename = str(attachment.get("original_name") or "名称未設定")
+        direct_url, error_text = results.get(index, ("", ""))
+        if direct_url:
+            gallery_items.append({"url": direct_url, "filename": filename})
+        elif error_text and ("404" in error_text or "見つか" in error_text):
+            missing_names.append(filename)
+        elif error_text:
+            other_errors.append((filename, error_text))
+        else:
+            missing_names.append(filename)
+    return gallery_items, missing_names, other_errors
+
+
+def open_onedrive_image_group_gallery(access_token, attachments):
+    """最初の画像だけを読み、次の画像は移動した時に読み込ませる。"""
+    with st.spinner("画像を準備しています…"):
+        image_items, missing_names, other_errors = build_onedrive_image_gallery_items(
+            access_token,
+            attachments,
+        )
+    if image_items:
+        show_onedrive_image_gallery_dialog(image_items)
+    if missing_names:
+        st.warning(
+            "OneDrive上に見つからない画像があります："
+            + "、".join(missing_names)
+        )
+    if other_errors:
+        st.error(
+            "表示できない画像があります："
+            + "、".join(name for name, _ in other_errors)
+            + f"（{other_errors[0][1]}）"
+        )
+
+
 def repair_onedrive_attachment_reference(access_token, attachment):
     """保存済みパスからOneDriveの現在のfile_idを取り直し、記録を修復する。"""
     if not isinstance(attachment, dict):
@@ -3860,15 +4091,26 @@ def show_onedrive_image_gallery_dialog(image_items):
         if isinstance(item, dict):
             image_content = item.get("content")
             filename = item.get("filename")
+            direct_url = str(item.get("url") or "").strip()
         else:
             try:
                 image_content, filename = item
             except Exception:
                 continue
+            direct_url = ""
+        safe_filename = str(filename or "画像")
+        if direct_url:
+            prepared.append(
+                {
+                    "filename": safe_filename,
+                    "url": direct_url,
+                    "size": 0,
+                }
+            )
+            continue
         image_bytes = bytes(image_content or b"")
         if not image_bytes:
             continue
-        safe_filename = str(filename or "画像")
         guessed_type = mimetypes.guess_type(safe_filename)[0] or "image/jpeg"
         if not str(guessed_type).startswith("image/"):
             guessed_type = "image/jpeg"
@@ -4433,6 +4675,13 @@ def confirm_onedrive_attachment_delete_dialog(
                         item_id = str(item.get("file_id") or "")
                         item_name = str(item.get("original_name") or "名称未設定")
                         try:
+                            display_item_id = str(item.get("display_file_id") or "")
+                            if display_item_id:
+                                try:
+                                    delete_onedrive_file(access_token, display_item_id)
+                                except Exception as exc:
+                                    if not is_onedrive_not_found_error(exc):
+                                        raise
                             if item_id:
                                 try:
                                     delete_onedrive_file(access_token, item_id)
@@ -9175,6 +9424,11 @@ def parse_onedrive_attachment_item(item):
         "size": payload.get("size") or 0,
         "onedrive_path": clean_value(payload.get("onedrive_path"), blank_text=""),
         "web_url": clean_value(payload.get("web_url"), blank_text=""),
+        "display_file_id": clean_value(payload.get("display_file_id"), blank_text=""),
+        "display_stored_name": clean_value(payload.get("display_stored_name"), blank_text=""),
+        "display_mime_type": clean_value(payload.get("display_mime_type"), blank_text=""),
+        "display_size": payload.get("display_size") or 0,
+        "display_web_url": clean_value(payload.get("display_web_url"), blank_text=""),
         "tags": normalize_attachment_tags(payload.get("tags") or []),
         "remarks": clean_value(payload.get("remarks"), blank_text=""),
         "uploaded_by": clean_value(payload.get("uploaded_by"), blank_text=""),
@@ -9184,9 +9438,8 @@ def parse_onedrive_attachment_item(item):
         "group_id": clean_value(payload.get("group_id"), blank_text=""),
         "group_index": int(payload.get("group_index") or 0),
         "group_size": max(1, int(payload.get("group_size") or 1)),
-        "version": payload.get("version") or ONEDRIVE_ATTACHMENT_VERSION,
+        "version": payload.get("version") or 1,
     }
-
 
 def serialize_onedrive_attachment(attachment):
     payload = {
@@ -9204,6 +9457,11 @@ def serialize_onedrive_attachment(attachment):
         "size": int(attachment.get("size") or 0),
         "onedrive_path": attachment.get("onedrive_path", ""),
         "web_url": attachment.get("web_url", ""),
+        "display_file_id": attachment.get("display_file_id", ""),
+        "display_stored_name": attachment.get("display_stored_name", ""),
+        "display_mime_type": attachment.get("display_mime_type", ""),
+        "display_size": int(attachment.get("display_size") or 0),
+        "display_web_url": attachment.get("display_web_url", ""),
         "tags": normalize_attachment_tags(attachment.get("tags") or []),
         "remarks": attachment.get("remarks", ""),
         "uploaded_by": attachment.get("uploaded_by", ""),
@@ -9213,7 +9471,6 @@ def serialize_onedrive_attachment(attachment):
         "group_size": max(1, int(attachment.get("group_size") or 1)),
     }
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-
 
 def attachment_group_index(value):
     try:
@@ -9443,8 +9700,11 @@ def build_entity_onedrive_attachment_record(
     group_id="",
     group_index=0,
     group_size=1,
+    display_item=None,
+    requested_display_name="",
+    display_content=b"",
 ):
-    """OneDrive保存結果から、従来と同じ写真・資料の登録内容を組み立てる。"""
+    """従来の元画像情報に、任意の通常表示用WebP情報だけを加える。"""
     file_kind = attachment_file_kind(original_name, mime_type)
     file_id = clean_value((uploaded_item or {}).get("id"), blank_text="")
     if not file_id:
@@ -9452,6 +9712,11 @@ def build_entity_onedrive_attachment_record(
     stored_name = (
         clean_value((uploaded_item or {}).get("name"), blank_text="")
         or clean_value(requested_stored_name, blank_text="")
+    )
+    display_file_id = clean_value((display_item or {}).get("id"), blank_text="")
+    display_stored_name = (
+        clean_value((display_item or {}).get("name"), blank_text="")
+        or clean_value(requested_display_name, blank_text="")
     )
     return {
         "entity_type": normalize_attachment_entity_type(entity_type),
@@ -9467,6 +9732,15 @@ def build_entity_onedrive_attachment_record(
         "size": int((uploaded_item or {}).get("size") or len(content)),
         "onedrive_path": folder_path,
         "web_url": clean_value((uploaded_item or {}).get("webUrl"), blank_text=""),
+        "display_file_id": display_file_id,
+        "display_stored_name": display_stored_name if display_file_id else "",
+        "display_mime_type": "image/webp" if display_file_id else "",
+        "display_size": (
+            int((display_item or {}).get("size") or len(display_content or b""))
+            if display_file_id
+            else 0
+        ),
+        "display_web_url": clean_value((display_item or {}).get("webUrl"), blank_text=""),
         "tags": normalize_attachment_tags(tags),
         "remarks": str(remarks or "").strip(),
         "uploaded_by": str(uploaded_by or ""),
@@ -9476,17 +9750,17 @@ def build_entity_onedrive_attachment_record(
         "group_size": max(1, int(group_size or 1)),
     }
 
-
 def register_entity_onedrive_attachment(
     attachment,
     access_token,
     moved_source=None,
 ):
-    """Supabase登録を直列で行い、失敗時は従来どおりOneDriveを元へ戻す。"""
+    """Supabase登録に失敗した時は、元画像と表示用画像を従来どおり戻す。"""
     entity_type = normalize_attachment_entity_type(attachment.get("entity_type"))
     entity_id = clean_value(attachment.get("entity_id"), blank_text="").strip()
     entity_name = clean_value(attachment.get("entity_name"), blank_text="").strip()
     file_id = clean_value(attachment.get("file_id"), blank_text="")
+    display_file_id = clean_value(attachment.get("display_file_id"), blank_text="")
     stored_name = clean_value(attachment.get("stored_name"), blank_text="")
     storage_key = attachment_storage_key(entity_type, entity_id, entity_name)
     try:
@@ -9498,6 +9772,11 @@ def register_entity_onedrive_attachment(
             int(time.time()),
         )
     except Exception:
+        if display_file_id:
+            try:
+                delete_onedrive_file(access_token, display_file_id)
+            except Exception:
+                pass
         if moved_source:
             try:
                 move_onedrive_item(
@@ -9520,7 +9799,6 @@ def register_entity_onedrive_attachment(
         raise
     return attachment
 
-
 def save_multiple_entity_onedrive_photos_parallel(
     entity_type,
     entity_name,
@@ -9533,7 +9811,7 @@ def save_multiple_entity_onedrive_photos_parallel(
     max_workers=3,
     move_from_camera_roll=False,
 ):
-    """複数写真のOneDrive処理だけを最大3件ずつ並行し、登録は従来どおり直列で行う。"""
+    """元画像の保存ルールを保ち、通常表示用WebPを加えて最大3件ずつ保存する。"""
     entity_type = normalize_attachment_entity_type(entity_type)
     entity_name = clean_value(entity_name, blank_text="").strip()
     entity_id = clean_value(entity_id, blank_text="").strip()
@@ -9565,8 +9843,7 @@ def save_multiple_entity_onedrive_photos_parallel(
     reserved_source_ids = set()
     group_size = len(uploads)
 
-    # Streamlitの状態を触るカメラバックアップ検索は安全のため直列のまま行う。
-    # 一致した元写真は予約し、同じ写真を2回移動しない。
+    # カメラバックアップ照合は従来どおり直列。表示用WebPは通信前に作る。
     for upload_index, upload in enumerate(uploads):
         original_name = Path(str(upload.get("name") or "file")).name
         content = bytes(upload.get("content") or b"")
@@ -9589,6 +9866,11 @@ def save_multiple_entity_onedrive_photos_parallel(
                     reserved_source_ids.add(source_item_id)
             timestamp = get_jst_now().strftime("%Y%m%d_%H%M%S")
             stored_name = f"{timestamp}_{uuid.uuid4().hex[:8]}_{original_name}"
+            display = prepare_onedrive_display_image(
+                content,
+                original_name,
+                stored_name,
+            )
             prepared_jobs.append(
                 {
                     "index": upload_index,
@@ -9597,6 +9879,7 @@ def save_multiple_entity_onedrive_photos_parallel(
                     "mime_type": mime_type,
                     "stored_name": stored_name,
                     "source_item": source_item,
+                    "display": display,
                 }
             )
         except Exception as exc:
@@ -9604,40 +9887,75 @@ def save_multiple_entity_onedrive_photos_parallel(
 
     def save_to_onedrive(job):
         source_item = job.get("source_item") or {}
+        display = job.get("display") or {}
         moved_source = None
-        if source_item:
-            source_parent_reference = source_item.get("parentReference") or {}
-            source_item_id = clean_value(source_item.get("id"), blank_text="")
-            source_parent_id = clean_value(source_parent_reference.get("id"), blank_text="")
-            source_name = (
-                clean_value(source_item.get("name"), blank_text="")
-                or job["original_name"]
-            )
-            if not source_item_id or not source_parent_id:
-                raise RuntimeError(
-                    "OneDriveの元写真の保存場所を確認できませんでした。"
-                    "誤移動を防ぐため保存を停止しました。"
+        uploaded_item = None
+        display_item = None
+        try:
+            if source_item:
+                source_parent_reference = source_item.get("parentReference") or {}
+                source_item_id = clean_value(source_item.get("id"), blank_text="")
+                source_parent_id = clean_value(source_parent_reference.get("id"), blank_text="")
+                source_name = (
+                    clean_value(source_item.get("name"), blank_text="")
+                    or job["original_name"]
                 )
-            uploaded_item = move_onedrive_item(
-                access_token,
-                source_item_id,
-                target_folder_id,
-                job["stored_name"],
-            )
-            moved_source = {
-                "item_id": source_item_id,
-                "parent_id": source_parent_id,
-                "name": source_name,
-            }
-        else:
-            uploaded_item = upload_onedrive_file_to_existing_folder(
-                access_token,
-                folder_path,
-                job["stored_name"],
-                job["content"],
-                job["mime_type"],
-            )
-        return job, uploaded_item, moved_source
+                if not source_item_id or not source_parent_id:
+                    raise RuntimeError(
+                        "OneDriveの元写真の保存場所を確認できませんでした。"
+                        "誤移動を防ぐため保存を停止しました。"
+                    )
+                uploaded_item = move_onedrive_item(
+                    access_token,
+                    source_item_id,
+                    target_folder_id,
+                    job["stored_name"],
+                )
+                moved_source = {
+                    "item_id": source_item_id,
+                    "parent_id": source_parent_id,
+                    "name": source_name,
+                }
+            else:
+                uploaded_item = upload_onedrive_file_to_existing_folder(
+                    access_token,
+                    folder_path,
+                    job["stored_name"],
+                    job["content"],
+                    job["mime_type"],
+                )
+
+            if display:
+                display_item = upload_onedrive_file_to_existing_folder(
+                    access_token,
+                    folder_path,
+                    display["stored_name"],
+                    display["content"],
+                    display["mime_type"],
+                )
+            return job, uploaded_item, display_item, moved_source
+        except Exception:
+            if display_item and display_item.get("id"):
+                try:
+                    delete_onedrive_file(access_token, display_item["id"])
+                except Exception:
+                    pass
+            if moved_source:
+                try:
+                    move_onedrive_item(
+                        access_token,
+                        moved_source["item_id"],
+                        moved_source["parent_id"],
+                        moved_source["name"],
+                    )
+                except Exception:
+                    pass
+            elif uploaded_item and uploaded_item.get("id"):
+                try:
+                    delete_onedrive_file(access_token, uploaded_item["id"])
+                except Exception:
+                    pass
+            raise
 
     onedrive_results = {}
     worker_count = max(1, min(int(max_workers or 1), 3, len(prepared_jobs)))
@@ -9658,12 +9976,13 @@ def save_multiple_entity_onedrive_photos_parallel(
                     )
 
     saved_items = []
-    # Supabase登録と失敗時ロールバックは、結果順を保って1件ずつ確実に行う。
+    # Supabase登録と失敗時ロールバックは、従来どおり結果順に直列で行う。
     for upload_index in range(group_size):
         result = onedrive_results.get(upload_index)
         if result is None:
             continue
-        job, uploaded_item, moved_source = result
+        job, uploaded_item, display_item, moved_source = result
+        display = job.get("display") or {}
         try:
             attachment = build_entity_onedrive_attachment_record(
                 entity_type,
@@ -9681,6 +10000,9 @@ def save_multiple_entity_onedrive_photos_parallel(
                 group_id=group_id,
                 group_index=upload_index,
                 group_size=group_size,
+                display_item=display_item,
+                requested_display_name=display.get("stored_name", ""),
+                display_content=display.get("content", b""),
             )
             saved_items.append(
                 register_entity_onedrive_attachment(
@@ -9700,7 +10022,6 @@ def save_multiple_entity_onedrive_photos_parallel(
         for index in sorted(failed_by_index)
     ]
     return saved_items, failed_items
-
 
 def save_entity_onedrive_attachment(
     entity_type,
@@ -9743,34 +10064,51 @@ def save_entity_onedrive_attachment(
     original_name = Path(str(uploaded_name or "file")).name
     timestamp = get_jst_now().strftime("%Y%m%d_%H%M%S")
     stored_name = f"{timestamp}_{uuid.uuid4().hex[:8]}_{original_name}"
+    display = (
+        prepare_onedrive_display_image(content, original_name, stored_name)
+        if file_kind == "image"
+        else None
+    )
+
     moved_source = None
-    if file_kind == "image" and move_from_camera_roll:
-        source_item = find_matching_onedrive_camera_roll_file(
-            access_token,
-            original_name,
-            content,
-        )
-        if source_item:
-            source_parent_reference = source_item.get("parentReference") or {}
-            source_item_id = clean_value(source_item.get("id"), blank_text="")
-            source_parent_id = clean_value(source_parent_reference.get("id"), blank_text="")
-            source_name = clean_value(source_item.get("name"), blank_text="") or original_name
-            if not source_item_id or not source_parent_id:
-                raise RuntimeError(
-                    "OneDriveの元写真の保存場所を確認できませんでした。"
-                    "誤移動を防ぐため保存を停止しました。"
-                )
-            uploaded_item = move_onedrive_file_to_folder(
+    uploaded_item = None
+    display_item = None
+    try:
+        if file_kind == "image" and move_from_camera_roll:
+            source_item = find_matching_onedrive_camera_roll_file(
                 access_token,
-                source_item_id,
-                folder_path,
-                stored_name,
+                original_name,
+                content,
             )
-            moved_source = {
-                "item_id": source_item_id,
-                "parent_id": source_parent_id,
-                "name": source_name,
-            }
+            if source_item:
+                source_parent_reference = source_item.get("parentReference") or {}
+                source_item_id = clean_value(source_item.get("id"), blank_text="")
+                source_parent_id = clean_value(source_parent_reference.get("id"), blank_text="")
+                source_name = clean_value(source_item.get("name"), blank_text="") or original_name
+                if not source_item_id or not source_parent_id:
+                    raise RuntimeError(
+                        "OneDriveの元写真の保存場所を確認できませんでした。"
+                        "誤移動を防ぐため保存を停止しました。"
+                    )
+                uploaded_item = move_onedrive_file_to_folder(
+                    access_token,
+                    source_item_id,
+                    folder_path,
+                    stored_name,
+                )
+                moved_source = {
+                    "item_id": source_item_id,
+                    "parent_id": source_parent_id,
+                    "name": source_name,
+                }
+            else:
+                uploaded_item = upload_onedrive_file(
+                    access_token,
+                    folder_path,
+                    stored_name,
+                    content,
+                    mime_type,
+                )
         else:
             uploaded_item = upload_onedrive_file(
                 access_token,
@@ -9779,58 +10117,21 @@ def save_entity_onedrive_attachment(
                 content,
                 mime_type,
             )
-    else:
-        uploaded_item = upload_onedrive_file(
-            access_token,
-            folder_path,
-            stored_name,
-            content,
-            mime_type,
-        )
-    file_id = clean_value(uploaded_item.get("id"), blank_text="")
-    if not file_id:
-        raise RuntimeError("OneDriveから保存済みファイルIDを取得できませんでした。")
 
-    profile = {}
-    try:
-        profile = get_onedrive_profile(access_token)
+        if display:
+            display_item = upload_onedrive_file_to_existing_folder(
+                access_token,
+                folder_path,
+                display["stored_name"],
+                display["content"],
+                display["mime_type"],
+            )
     except Exception:
-        profile = {}
-    uploaded_by = (
-        clean_value(profile.get("displayName"), blank_text="")
-        or clean_value(profile.get("mail"), blank_text="")
-        or clean_value(profile.get("userPrincipalName"), blank_text="")
-    )
-    attachment = {
-        "entity_type": entity_type,
-        "entity_id": entity_id,
-        "entity_name": entity_name,
-        "file_id": file_id,
-        "original_name": original_name,
-        "stored_name": clean_value(uploaded_item.get("name"), blank_text="") or stored_name,
-        "file_type": file_kind,
-        "mime_type": mime_type or mimetypes.guess_type(original_name)[0] or "application/octet-stream",
-        "size": int(uploaded_item.get("size") or len(content)),
-        "onedrive_path": folder_path,
-        "web_url": clean_value(uploaded_item.get("webUrl"), blank_text=""),
-        "tags": normalize_attachment_tags(tags),
-        "remarks": str(remarks or "").strip(),
-        "uploaded_by": uploaded_by,
-        "created_at": get_jst_now().isoformat(),
-        "group_id": str(group_id or "").strip(),
-        "group_index": int(group_index or 0),
-        "group_size": max(1, int(group_size or 1)),
-    }
-    storage_key = attachment_storage_key(entity_type, entity_id, entity_name)
-    try:
-        insert_customer_information(
-            entity_name,
-            storage_key,
-            make_onedrive_attachment_field_name(),
-            serialize_onedrive_attachment(attachment),
-            int(time.time()),
-        )
-    except Exception as exc:
+        if display_item and display_item.get("id"):
+            try:
+                delete_onedrive_file(access_token, display_item["id"])
+            except Exception:
+                pass
         if moved_source:
             try:
                 move_onedrive_item(
@@ -9839,20 +10140,41 @@ def save_entity_onedrive_attachment(
                     moved_source["parent_id"],
                     moved_source["name"],
                 )
-            except Exception as rollback_exc:
-                raise RuntimeError(
-                    "写真はOneDrive内で移動されましたが、アプリへの登録に失敗し、"
-                    "元のカメラロールへ戻せませんでした。"
-                    f"OneDriveで「{stored_name}」を確認してください。"
-                ) from rollback_exc
-        else:
+            except Exception:
+                pass
+        elif uploaded_item and uploaded_item.get("id"):
             try:
-                delete_onedrive_file(access_token, file_id)
+                delete_onedrive_file(access_token, uploaded_item["id"])
             except Exception:
                 pass
         raise
-    return attachment
 
+    uploaded_by = get_attachment_uploaded_by(access_token)
+    attachment = build_entity_onedrive_attachment_record(
+        entity_type,
+        entity_name,
+        entity_id,
+        original_name,
+        content,
+        mime_type,
+        tags,
+        remarks,
+        uploaded_item,
+        stored_name,
+        folder_path,
+        uploaded_by,
+        group_id=group_id,
+        group_index=group_index,
+        group_size=group_size,
+        display_item=display_item,
+        requested_display_name=(display or {}).get("stored_name", ""),
+        display_content=(display or {}).get("content", b""),
+    )
+    return register_entity_onedrive_attachment(
+        attachment,
+        access_token,
+        moved_source=moved_source,
+    )
 
 def save_customer_onedrive_attachment(
     customer_name,
@@ -10775,48 +11097,10 @@ def render_customer_attachments_section(
                                 st.error("表示するにはOneDriveへ接続してください。")
                             else:
                                 if attachment.get("file_type") == "image":
-                                    image_items = []
-                                    missing_names = []
-                                    other_errors = []
-                                    with st.spinner("ファイルを読み込んでいます…"):
-                                        for image_attachment in group_items:
-                                            image_item_id = image_attachment.get("file_id", "")
-                                            image_name = image_attachment.get(
-                                                "original_name",
-                                                "名称未設定",
-                                            )
-                                            if not image_item_id:
-                                                missing_names.append(image_name)
-                                                continue
-                                            try:
-                                                image_content = download_onedrive_attachment_file(
-                                                    access_token,
-                                                    image_attachment,
-                                                )
-                                                image_items.append(
-                                                    {
-                                                        "content": image_content,
-                                                        "filename": image_name,
-                                                    }
-                                                )
-                                            except Exception as exc:
-                                                if is_onedrive_not_found_error(exc):
-                                                    missing_names.append(image_name)
-                                                else:
-                                                    other_errors.append((image_name, str(exc)))
-                                    if image_items:
-                                        show_onedrive_image_gallery_dialog(image_items)
-                                    if missing_names:
-                                        st.warning(
-                                            "OneDrive上に見つからない画像があります："
-                                            + "、".join(missing_names)
-                                        )
-                                    if other_errors:
-                                        st.error(
-                                            "表示できない画像があります："
-                                            + "、".join(name for name, _ in other_errors)
-                                            + f"（{other_errors[0][1]}）"
-                                        )
+                                    open_onedrive_image_group_gallery(
+                                        access_token,
+                                        group_items,
+                                    )
                                 else:
                                     try:
                                         with st.spinner("ファイルを読み込んでいます…"):
@@ -11196,48 +11480,10 @@ def show_attachment_search_page():
                         st.error("表示するにはOneDriveへ接続してください。")
                     else:
                         if attachment.get("file_type") == "image":
-                            image_items = []
-                            missing_names = []
-                            other_errors = []
-                            with st.spinner("ファイルを読み込んでいます…"):
-                                for image_attachment in group_items:
-                                    image_item_id = image_attachment.get("file_id", "")
-                                    image_name = image_attachment.get(
-                                        "original_name",
-                                        "名称未設定",
-                                    )
-                                    if not image_item_id:
-                                        missing_names.append(image_name)
-                                        continue
-                                    try:
-                                        image_content = download_onedrive_attachment_file(
-                                            access_token,
-                                            image_attachment,
-                                        )
-                                        image_items.append(
-                                            {
-                                                "content": image_content,
-                                                "filename": image_name,
-                                            }
-                                        )
-                                    except Exception as exc:
-                                        if is_onedrive_not_found_error(exc):
-                                            missing_names.append(image_name)
-                                        else:
-                                            other_errors.append((image_name, str(exc)))
-                            if image_items:
-                                show_onedrive_image_gallery_dialog(image_items)
-                            if missing_names:
-                                st.warning(
-                                    "OneDrive上に見つからない画像があります："
-                                    + "、".join(missing_names)
-                                )
-                            if other_errors:
-                                st.error(
-                                    "表示できない画像があります："
-                                    + "、".join(name for name, _ in other_errors)
-                                    + f"（{other_errors[0][1]}）"
-                                )
+                            open_onedrive_image_group_gallery(
+                                access_token,
+                                group_items,
+                            )
                         else:
                             try:
                                 with st.spinner("ファイルを読み込んでいます…"):
