@@ -3071,9 +3071,18 @@ def build_onedrive_image_gallery_items(access_token, attachments):
     other_errors = []
     for index, attachment in enumerate(image_attachments):
         filename = str(attachment.get("original_name") or "名称未設定")
+        original_url = clean_value(
+            attachment.get("web_url"), blank_text=""
+        ).strip()
         direct_url, error_text = results.get(index, ("", ""))
         if direct_url:
-            gallery_items.append({"url": direct_url, "filename": filename})
+            gallery_items.append(
+                {
+                    "url": direct_url,
+                    "filename": filename,
+                    "original_url": original_url,
+                }
+            )
         elif error_text and ("404" in error_text or "見つか" in error_text):
             missing_names.append(filename)
         elif error_text:
@@ -4233,18 +4242,21 @@ def show_onedrive_image_gallery_dialog(image_items):
             image_content = item.get("content")
             filename = item.get("filename")
             direct_url = str(item.get("url") or "").strip()
+            original_url = str(item.get("original_url") or "").strip()
         else:
             try:
                 image_content, filename = item
             except Exception:
                 continue
             direct_url = ""
+            original_url = ""
         safe_filename = str(filename or "画像")
         if direct_url:
             prepared.append(
                 {
                     "filename": safe_filename,
                     "url": direct_url,
+                    "original_url": original_url,
                     "size": 0,
                 }
             )
@@ -4260,6 +4272,7 @@ def show_onedrive_image_gallery_dialog(image_items):
             {
                 "filename": safe_filename,
                 "url": f"data:{guessed_type};base64,{encoded}",
+                "original_url": original_url,
                 "size": len(image_bytes),
             }
         )
@@ -4275,7 +4288,11 @@ def show_onedrive_image_gallery_dialog(image_items):
         viewer_signature.encode("utf-8")
     ).hexdigest()[:16]
     browser_images = [
-        {"filename": item["filename"], "url": item["url"]}
+        {
+            "filename": item["filename"],
+            "url": item["url"],
+            "originalUrl": item.get("original_url", ""),
+        }
         for item in prepared
     ]
 
@@ -4307,6 +4324,7 @@ def show_onedrive_image_gallery_dialog(image_items):
             <div class="odv-toolbar">
               <div class="odv-filename"></div>
               <div class="odv-count"></div>
+              <button class="odv-original" type="button" aria-label="原寸を開く" title="原寸を開く">原寸</button>
               <button class="odv-fullscreen" type="button" aria-label="全画面表示">⛶</button>
               <button class="odv-close" type="button" aria-label="閉じる">×</button>
             </div>
@@ -4395,6 +4413,15 @@ def show_onedrive_image_gallery_dialog(image_items):
               cursor: pointer;
               touch-action: manipulation;
             }}
+            #${{viewerId}} .odv-original {{
+              width: 54px;
+              flex-basis: 54px;
+              font-size: 13px;
+              font-weight: 700;
+            }}
+            #${{viewerId}} .odv-original:disabled {{
+              display: none;
+            }}
             #${{viewerId}} .odv-fullscreen {{ font-size: 22px; }}
             #${{viewerId}} .odv-nav {{
               position:absolute;
@@ -4438,6 +4465,7 @@ def show_onedrive_image_gallery_dialog(image_items):
           const stage = overlay.querySelector('.odv-stage');
           const image = overlay.querySelector('.odv-image');
           const closeButton = overlay.querySelector('.odv-close');
+          const originalButton = overlay.querySelector('.odv-original');
           const fullscreenButton = overlay.querySelector('.odv-fullscreen');
           const filenameNode = overlay.querySelector('.odv-filename');
           const countNode = overlay.querySelector('.odv-count');
@@ -4479,6 +4507,8 @@ def show_onedrive_image_gallery_dialog(image_items):
             image.alt = current.filename;
             image.src = current.url;
             filenameNode.textContent = current.filename;
+            originalButton.disabled = !current.originalUrl;
+            originalButton.style.display = current.originalUrl ? '' : 'none';
             countNode.textContent = images.length > 1
               ? `${{currentIndex + 1}} / ${{images.length}}`
               : '';
@@ -4554,6 +4584,14 @@ def show_onedrive_image_gallery_dialog(image_items):
           closeButton.addEventListener('click', closeViewer);
           prevButton.addEventListener('click', () => showImage(currentIndex - 1));
           nextButton.addEventListener('click', () => showImage(currentIndex + 1));
+          originalButton.addEventListener('click', () => {{
+            const current = images[currentIndex];
+            const originalUrl = current && current.originalUrl
+              ? String(current.originalUrl)
+              : '';
+            if (!originalUrl) return;
+            parentWindow.open(originalUrl, '_blank', 'noopener,noreferrer');
+          }});
 
           fullscreenButton.addEventListener('click', async () => {{
             try {{
