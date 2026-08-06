@@ -385,6 +385,9 @@ ONEDRIVE_FIXED_TAGS = ("設備", "名刺", "納品場所", "商品", "トラブ�
 ONEDRIVE_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
 ONEDRIVE_PDF_EXTENSIONS = {".pdf"}
 ONEDRIVE_PAGE_SIZE = 12
+ONEDRIVE_RECENT_CAMERA_DAYS = 14
+ONEDRIVE_RECENT_CAMERA_MAX_ITEMS = 100
+ONEDRIVE_RECENT_CAMERA_PAGE_SIZE = 12
 # Secretsのrefresh_token由来かを、サーバー内の一時トークンだけで識別する。
 # Microsoftのトークン本体やこの印はSupabase・OneDriveへ保存しない。
 ONEDRIVE_CONFIGURED_TOKEN_SOURCE_KEY = "_aoyama_configured_refresh_source"
@@ -2690,6 +2693,65 @@ def find_matching_onedrive_camera_roll_file(
 
     # OneDrive内に同じ写真がない場合は、呼び出し側で新規アップロードする。
     return None
+
+
+def load_recent_onedrive_camera_photos(
+    access_token,
+    days=ONEDRIVE_RECENT_CAMERA_DAYS,
+    max_items=ONEDRIVE_RECENT_CAMERA_MAX_ITEMS,
+):
+    """OneDriveのカメラバックアップから、対応形式の最近の写真だけを返す。"""
+    camera_roll = get_onedrive_camera_roll_folder(access_token) or {}
+    camera_roll_id = clean_value(camera_roll.get("id"), blank_text="")
+    if not camera_roll_id:
+        return []
+
+    folder_hints = get_onedrive_camera_folder_hints(camera_roll_id)
+    candidates = collect_onedrive_camera_backup_images(
+        access_token,
+        camera_roll,
+        preferred_folder_ids=folder_hints,
+        max_folders=30,
+        max_items=800,
+        max_depth=4,
+        max_seconds=8,
+    )
+    cutoff = datetime.now(timezone.utc) - timedelta(days=max(1, int(days or 1)))
+    allowed_mime_types = {"image/jpeg", "image/png", "image/webp"}
+    recent_items = []
+
+    for item in candidates:
+        if not isinstance(item, dict) or item.get("folder"):
+            continue
+        item_id = clean_value(item.get("id"), blank_text="")
+        name = Path(str(item.get("name") or "")).name
+        suffix = Path(name).suffix.casefold()
+        mime_type = clean_value(
+            (item.get("file") or {}).get("mimeType"),
+            blank_text="",
+        ).casefold()
+        if not item_id or not name:
+            continue
+        # 既存アプリと同じ対応形式だけを表示し、HEIC等を新たに許可しない。
+        if suffix not in ONEDRIVE_IMAGE_EXTENSIONS and mime_type not in allowed_mime_types:
+            continue
+
+        modified_at = parse_onedrive_datetime(
+            item.get("lastModifiedDateTime") or item.get("createdDateTime")
+        )
+        if modified_at is None or modified_at < cutoff:
+            continue
+        recent_items.append(item)
+
+    recent_items.sort(
+        key=lambda item: str(
+            item.get("lastModifiedDateTime")
+            or item.get("createdDateTime")
+            or ""
+        ),
+        reverse=True,
+    )
+    return recent_items[:max(1, int(max_items or 1))]
 
 
 def move_onedrive_item(access_token, item_id, parent_id, filename):
@@ -10238,6 +10300,193 @@ def save_multiple_entity_onedrive_photos_parallel(
     ]
     return saved_items, failed_items
 
+def save_selected_onedrive_camera_photos_parallel(
+    entity_type,
+    entity_name,
+    entity_id,
+    selected_items,
+    tags,
+    remarks,
+    access_token,
+    group_id="",
+    max_workers=3,
+):
+    """選択済みの正確なOneDriveファイルIDを使い、照合せず最大3件ずつ保存する。"""
+    entity_type = normalize_attachment_entity_type(entity_type)
+    entity_name = clean_value(entity_name, blank_text="").strip()
+    entity_id = clean_value(entity_id, blank_text="").strip()
+    items = [item for item in list(selected_items or []) if isinstance(item, dict)]
+    if not items:
+        raise ValueError("OneDriveの写真を選んでください。")
+
+    folder_key = get_attachment_onedrive_folder_key(
+        entity_type,
+        entity_id,
+        entity_name,
+    )
+    folder_path = "/".join(
+        [
+            ONEDRIVE_ROOT_FOLDER,
+            attachment_entity_folder(entity_type),
+            folder_key,
+            "写真",
+        ]
+    )
+    target_folder = ensure_onedrive_folder_path(access_token, folder_path)
+    target_folder_id = clean_value(target_folder.get("id"), blank_text="")
+    if not target_folder_id:
+        raise RuntimeError("OneDriveの移動先フォルダIDを取得できませんでした。")
+    uploaded_by = get_attachment_uploaded_by(access_token)
+    group_size = len(items)
+    allowed_mime_types = {"image/jpeg", "image/png", "image/webp"}
+
+    def rollback_saved_files(display_item, moved_source, stored_name):
+        if display_item and display_item.get("id"):
+            try:
+                delete_onedrive_file(access_token, display_item["id"])
+            except Exception:
+                pass
+        if moved_source:
+            try:
+                move_onedrive_item(
+                    access_token,
+                    moved_source["item_id"],
+                    moved_source["parent_id"],
+                    moved_source["name"],
+                )
+            except Exception as rollback_exc:
+                raise RuntimeError(
+                    "写真はOneDrive内で移動されましたが、保存処理に失敗し、"
+                    "元のカメラロールへ戻せませんでした。"
+                    f"OneDriveで「{stored_name}」を確認してください。"
+                ) from rollback_exc
+
+    def save_to_onedrive(index, source_item):
+        source_item_id = clean_value(source_item.get("id"), blank_text="")
+        source_parent_reference = source_item.get("parentReference") or {}
+        source_parent_id = clean_value(source_parent_reference.get("id"), blank_text="")
+        original_name = Path(str(source_item.get("name") or "file")).name
+        mime_type = clean_value(
+            (source_item.get("file") or {}).get("mimeType"),
+            blank_text="",
+        ) or mimetypes.guess_type(original_name)[0] or "application/octet-stream"
+        suffix = Path(original_name).suffix.casefold()
+        if not source_item_id or not source_parent_id:
+            raise RuntimeError("OneDriveの元写真の保存場所を確認できませんでした。")
+        if suffix not in ONEDRIVE_IMAGE_EXTENSIONS and mime_type.casefold() not in allowed_mime_types:
+            raise ValueError("JPG・JPEG・PNG・WEBPの写真だけ保存できます。")
+
+        content = download_onedrive_file(access_token, source_item_id)
+        if not content:
+            raise RuntimeError("OneDriveの元写真を読み込めませんでした。")
+        timestamp = get_jst_now().strftime("%Y%m%d_%H%M%S")
+        stored_name = f"{timestamp}_{uuid.uuid4().hex[:8]}_{original_name}"
+        display = prepare_onedrive_display_image(content, original_name, stored_name)
+        moved_source = {
+            "item_id": source_item_id,
+            "parent_id": source_parent_id,
+            "name": original_name,
+        }
+        moved_item = None
+        display_item = None
+        try:
+            moved_item = move_onedrive_item(
+                access_token,
+                source_item_id,
+                target_folder_id,
+                stored_name,
+            )
+            if display:
+                display_item = upload_onedrive_file_to_existing_folder(
+                    access_token,
+                    folder_path,
+                    display["stored_name"],
+                    display["content"],
+                    display["mime_type"],
+                )
+            return {
+                "index": index,
+                "original_name": original_name,
+                "content": content,
+                "mime_type": mime_type,
+                "stored_name": stored_name,
+                "display": display or {},
+                "moved_item": moved_item,
+                "display_item": display_item,
+                "moved_source": moved_source,
+            }
+        except Exception:
+            rollback_saved_files(display_item, moved_source if moved_item else None, stored_name)
+            raise
+
+    prepared_results = {}
+    failed_by_index = {}
+    worker_count = max(1, min(int(max_workers or 1), 3, len(items)))
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        future_map = {
+            executor.submit(save_to_onedrive, index, item): index
+            for index, item in enumerate(items)
+        }
+        for future in as_completed(future_map):
+            index = future_map[future]
+            try:
+                prepared_results[index] = future.result()
+            except Exception as exc:
+                original_name = Path(str(items[index].get("name") or "名称未設定")).name
+                failed_by_index[index] = (original_name, str(exc))
+
+    saved_items = []
+    for index in range(group_size):
+        result = prepared_results.get(index)
+        if result is None:
+            continue
+        registration_started = False
+        try:
+            display = result.get("display") or {}
+            attachment = build_entity_onedrive_attachment_record(
+                entity_type,
+                entity_name,
+                entity_id,
+                result["original_name"],
+                result["content"],
+                result["mime_type"],
+                tags,
+                remarks,
+                result["moved_item"],
+                result["stored_name"],
+                folder_path,
+                uploaded_by,
+                group_id=group_id,
+                group_index=index if group_id else 0,
+                group_size=group_size if group_id else 1,
+                display_item=result.get("display_item"),
+                requested_display_name=display.get("stored_name", ""),
+                display_content=display.get("content", b""),
+            )
+            registration_started = True
+            saved_items.append(
+                register_entity_onedrive_attachment(
+                    attachment,
+                    access_token,
+                    moved_source=result.get("moved_source"),
+                )
+            )
+        except Exception as exc:
+            if not registration_started:
+                try:
+                    rollback_saved_files(
+                        result.get("display_item"),
+                        result.get("moved_source"),
+                        result.get("stored_name", ""),
+                    )
+                except Exception as rollback_exc:
+                    exc = rollback_exc
+            failed_by_index[index] = (result.get("original_name", "名称未設定"), str(exc))
+
+    failed_items = [failed_by_index[index] for index in sorted(failed_by_index)]
+    return saved_items, failed_items
+
+
 def save_entity_onedrive_attachment(
     entity_type,
     entity_name,
@@ -10759,10 +11008,17 @@ def render_customer_attachments_section(
     suffix = hashlib.sha256(str(identity).encode("utf-8")).hexdigest()[:16]
     add_form_version_key = f"onedrive_attachment_add_form_version_{suffix}"
     camera_form_version_key = f"onedrive_attachment_camera_form_version_{suffix}"
+    recent_form_version_key = f"onedrive_attachment_recent_form_version_{suffix}"
     add_form_version = int(st.session_state.get(add_form_version_key, 0) or 0)
     camera_form_version = int(st.session_state.get(camera_form_version_key, 0) or 0)
+    recent_form_version = int(st.session_state.get(recent_form_version_key, 0) or 0)
     add_widget_suffix = f"{suffix}_{add_form_version}"
     camera_widget_suffix = f"{suffix}_{camera_form_version}"
+    recent_widget_suffix = f"{suffix}_{recent_form_version}"
+    recent_items_key = f"onedrive_attachment_recent_items_{suffix}"
+    recent_limit_key = f"onedrive_attachment_recent_limit_{suffix}"
+    recent_loaded_key = f"onedrive_attachment_recent_loaded_{suffix}"
+    recent_error_key = f"onedrive_attachment_recent_error_{suffix}"
     success_key = f"onedrive_attachment_success_{suffix}"
     upload_error_key = f"onedrive_attachment_upload_error_{suffix}"
     edit_key = f"onedrive_attachment_edit_{suffix}"
@@ -10870,6 +11126,244 @@ def render_customer_attachments_section(
                     st.error(f"OneDriveへの接続を開始できませんでした：{exc}")
             else:
                 st.markdown("#### 追加")
+                st.markdown("##### ☁️ OneDriveの最近の写真から選ぶ")
+                st.caption(
+                    "OneDriveのカメラバックアップにある直近14日以内の写真を、"
+                    "スマホから再送信せずに追加します。写真は最後の保存ボタンを押すまで移動しません。"
+                )
+                recent_items = st.session_state.get(recent_items_key, [])
+                if not isinstance(recent_items, list):
+                    recent_items = []
+                load_recent_label = "一覧を更新" if recent_items else "最近の写真を読み込む"
+                if st.button(
+                    load_recent_label,
+                    key=f"onedrive_attachment_recent_load_{suffix}",
+                    use_container_width=True,
+                ):
+                    try:
+                        with st.spinner("OneDriveの最近の写真を確認しています…"):
+                            recent_items = load_recent_onedrive_camera_photos(access_token)
+                        st.session_state[recent_items_key] = recent_items
+                        st.session_state[recent_limit_key] = ONEDRIVE_RECENT_CAMERA_PAGE_SIZE
+                        st.session_state[recent_loaded_key] = True
+                        st.session_state.pop(recent_error_key, None)
+                        st.session_state[recent_form_version_key] = recent_form_version + 1
+                        st.rerun()
+                    except Exception as exc:
+                        st.session_state[recent_error_key] = str(exc)
+                        st.rerun()
+
+                recent_error = st.session_state.pop(recent_error_key, None)
+                if recent_error:
+                    st.warning(f"最近の写真を読み込めませんでした：{recent_error}")
+
+                recent_items = st.session_state.get(recent_items_key, [])
+                if isinstance(recent_items, list) and recent_items:
+                    recent_limit = int(
+                        st.session_state.get(
+                            recent_limit_key,
+                            ONEDRIVE_RECENT_CAMERA_PAGE_SIZE,
+                        )
+                        or ONEDRIVE_RECENT_CAMERA_PAGE_SIZE
+                    )
+                    visible_recent_items = recent_items[:recent_limit]
+                    recent_ids = [
+                        clean_value(item.get("id"), blank_text="")
+                        for item in visible_recent_items
+                        if clean_value(item.get("id"), blank_text="")
+                    ]
+                    recent_thumbnails = download_onedrive_thumbnail_batch(
+                        access_token,
+                        tuple(recent_ids),
+                    ) if recent_ids else {}
+                    selected_recent_items = []
+                    recent_grid_count = 2 if mobile_browser else 3
+                    recent_columns = []
+                    for recent_index, recent_item in enumerate(visible_recent_items):
+                        if recent_index % recent_grid_count == 0:
+                            recent_columns = st.columns(recent_grid_count, gap="small")
+                        item_id = clean_value(recent_item.get("id"), blank_text="")
+                        original_name = Path(
+                            str(recent_item.get("name") or "名称未設定")
+                        ).name
+                        item_key = hashlib.sha256(item_id.encode("utf-8")).hexdigest()[:16]
+                        modified_at = parse_onedrive_datetime(
+                            recent_item.get("lastModifiedDateTime")
+                            or recent_item.get("createdDateTime")
+                        )
+                        modified_text = ""
+                        if modified_at is not None:
+                            modified_text = modified_at.astimezone(
+                                timezone(timedelta(hours=9))
+                            ).strftime("%m/%d %H:%M")
+                        with recent_columns[recent_index % recent_grid_count]:
+                            with st.container(border=True):
+                                thumbnail = recent_thumbnails.get(item_id)
+                                if isinstance(thumbnail, bytes):
+                                    st.image(thumbnail, use_container_width=True)
+                                else:
+                                    st.caption("サムネイルを表示できません")
+                                selected = st.checkbox(
+                                    "この写真を選ぶ",
+                                    key=(
+                                        "onedrive_attachment_recent_select_"
+                                        f"{recent_widget_suffix}_{item_key}"
+                                    ),
+                                )
+                                st.caption(
+                                    original_name
+                                    + (f"　{modified_text}" if modified_text else "")
+                                )
+                                if selected:
+                                    selected_recent_items.append(recent_item)
+
+                    st.caption(
+                        f"{len(recent_items)}件中 {len(visible_recent_items)}件を表示　｜　"
+                        f"{len(selected_recent_items)}件を選択中"
+                    )
+                    if len(recent_items) > recent_limit:
+                        if st.button(
+                            "さらに表示",
+                            key=f"onedrive_attachment_recent_more_{suffix}",
+                            use_container_width=True,
+                        ):
+                            st.session_state[recent_limit_key] = (
+                                recent_limit + ONEDRIVE_RECENT_CAMERA_PAGE_SIZE
+                            )
+                            st.rerun()
+
+                    recent_tag_options = (
+                        load_tag_history_options_for_action()
+                        if selected_recent_items
+                        else []
+                    )
+                    recent_history_tags = st.multiselect(
+                        "選択した写真のタグ",
+                        recent_tag_options,
+                        key=f"onedrive_attachment_recent_history_tags_{recent_widget_suffix}",
+                    )
+                    recent_new_tags_text = st.text_input(
+                        "選択した写真の新しいタグ",
+                        placeholder="例：北海道、タンク、要確認",
+                        key=f"onedrive_attachment_recent_new_tags_{recent_widget_suffix}",
+                    )
+                    recent_remarks = st.text_area(
+                        "選択した写真の備考",
+                        placeholder="写真について残したい内容",
+                        height=90,
+                        key=f"onedrive_attachment_recent_remarks_{recent_widget_suffix}",
+                    )
+                    if st.button(
+                        "選択した写真を保存",
+                        type="primary",
+                        use_container_width=True,
+                        key=f"onedrive_attachment_recent_save_{recent_widget_suffix}",
+                    ):
+                        if not selected_recent_items:
+                            st.warning("保存する写真を選んでください。")
+                        else:
+                            recent_tags = list(recent_history_tags) + normalize_attachment_tags(
+                                recent_new_tags_text
+                            )
+                            recent_group_id = (
+                                uuid.uuid4().hex if len(selected_recent_items) > 1 else ""
+                            )
+                            with st.spinner("選択した写真をOneDrive内で保存しています…"):
+                                try:
+                                    recent_saved_items, recent_failed_items = (
+                                        save_selected_onedrive_camera_photos_parallel(
+                                            entity_type,
+                                            entity_name,
+                                            entity_id,
+                                            selected_recent_items,
+                                            recent_tags,
+                                            recent_remarks,
+                                            access_token,
+                                            group_id=recent_group_id,
+                                            max_workers=3,
+                                        )
+                                    )
+                                except Exception as exc:
+                                    recent_saved_items = []
+                                    recent_failed_items = [
+                                        (
+                                            Path(
+                                                str(item.get("name") or "名称未設定")
+                                            ).name,
+                                            str(exc),
+                                        )
+                                        for item in selected_recent_items
+                                    ]
+
+                            for saved in recent_saved_items:
+                                remember_change_history_warning(
+                                    record_change_history_safely(
+                                        attachment_entity_label(entity_type),
+                                        entity_id or "",
+                                        entity_name,
+                                        "追加",
+                                        {
+                                            "ファイル": (
+                                                "",
+                                                saved.get("original_name", ""),
+                                            ),
+                                            "タグ": (
+                                                "",
+                                                " ".join(
+                                                    f"#{tag}"
+                                                    for tag in saved.get("tags", [])
+                                                ),
+                                            ),
+                                        },
+                                        section="写真・資料",
+                                    )
+                                )
+
+                            if recent_saved_items:
+                                saved_ids = {
+                                    clean_value(saved.get("file_id"), blank_text="")
+                                    for saved in recent_saved_items
+                                }
+                                st.session_state[recent_items_key] = [
+                                    item
+                                    for item in recent_items
+                                    if clean_value(item.get("id"), blank_text="")
+                                    not in saved_ids
+                                ]
+                                st.session_state[success_key] = (
+                                    "写真・資料を保存しました。"
+                                    if len(recent_saved_items) == 1
+                                    else f"写真・資料を{len(recent_saved_items)}件保存しました。"
+                                )
+                                st.session_state[limit_key] = ONEDRIVE_PAGE_SIZE
+                                st.session_state[recent_limit_key] = (
+                                    ONEDRIVE_RECENT_CAMERA_PAGE_SIZE
+                                )
+                                st.session_state[recent_form_version_key] = (
+                                    recent_form_version + 1
+                                )
+                            if recent_failed_items:
+                                failed_names = "、".join(
+                                    name for name, _ in recent_failed_items
+                                )
+                                first_error = recent_failed_items[0][1]
+                                st.session_state[upload_error_key] = (
+                                    f"{len(recent_failed_items)}件保存できませんでした："
+                                    f"{failed_names}"
+                                    + (f"（{first_error}）" if first_error else "")
+                                )
+                            if recent_saved_items or recent_failed_items:
+                                st.rerun()
+                elif bool(st.session_state.get(recent_loaded_key, False)):
+                    st.info("直近14日以内のJPG・JPEG・PNG・WEBP写真は見つかりませんでした。")
+                elif isinstance(recent_items, list):
+                    st.caption(
+                        "直近14日以内の対応画像がまだ読み込まれていません。"
+                        "上のボタンで確認してください。"
+                    )
+
+                st.markdown("---")
+                st.markdown("##### 端末から画像・PDFを追加")
                 # Androidなどで3枚以上をまとめて選ぶと、拡張子フィルター付きの
                 # 写真ピッカーがStreamlitへ結果を返さない場合がある。
                 # スマホだけ汎用ファイル選択に切り替え、受け取り後に画像形式を厳密に確認する。
