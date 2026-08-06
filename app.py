@@ -5862,13 +5862,29 @@ def delivery_record_fingerprint(source, row_number, values):
 
 
 @st.cache_data(ttl=60, show_spinner=False)
-def read_product_delivery_history_from_bytes(content, customer_name, product_name):
-    """配達履歴と次回配達日シートの現在行を、修正用の一覧として返す。"""
+def read_product_delivery_history_from_bytes(
+    content,
+    customer_name,
+    product_name,
+    limit=20,
+):
+    """
+    配達履歴と次回配達日シートの現在行を、修正用の一覧として返す。
+
+    画面に必要な新しい順の件数だけを保持し、古い履歴すべての辞書化・指紋計算・
+    並べ替えは行わない。履歴自体は削除せず、表示順と修正ルールも従来どおり。
+    """
+    try:
+        requested_limit = max(1, int(limit))
+    except (TypeError, ValueError):
+        requested_limit = 20
+
+    # 読み取り専用なのでVBA本体を展開しない。元ファイルやマクロには一切変更を加えない。
     workbook = load_workbook(
         BytesIO(content),
-        keep_vba=True,
+        keep_vba=False,
         data_only=False,
-        read_only=False,
+        read_only=True,
     )
     try:
         if DELIVERY_SHEET_NAME not in workbook.sheetnames:
@@ -5876,27 +5892,52 @@ def read_product_delivery_history_from_bytes(content, customer_name, product_nam
         if DELIVERY_HISTORY_SHEET_NAME not in workbook.sheetnames:
             raise ValueError("配達履歴シートが見つかりません。")
 
+        target_customer = normalize_match_value(customer_name)
+        target_product = normalize_match_value(product_name)
         delivery_ws = workbook[DELIVERY_SHEET_NAME]
-        _, active_rows, _ = find_product_rows_by_usage(
-            delivery_ws,
-            customer_name,
-            product_name,
-        )
+        active_rows = []
+        for row_number, values in enumerate(
+            delivery_ws.iter_rows(min_row=1, max_col=14, values_only=True),
+            start=1,
+        ):
+            values = tuple(values or ())
+            row_customer = normalize_match_value(values[1] if len(values) >= 2 else None)
+            row_product = normalize_match_value(values[4] if len(values) >= 5 else None)
+            if row_customer != target_customer or row_product != target_product:
+                continue
+            usage = values[6] if len(values) >= 7 else None
+            if not is_blank_or_zero(usage):
+                active_rows.append((row_number, values))
+
         if len(active_rows) > 1:
             raise ValueError("同じ顧客名・商品名の使用中行が複数見つかりました。確認してください。")
         if not active_rows:
             raise ValueError("使用中の商品行が見つからないため、納品履歴を表示できません。")
 
-        current_row = active_rows[0]
-        current_values = tuple(
-            delivery_ws.cell(current_row, column).value
-            for column in range(1, 15)
-        )
+        current_row, current_values = active_rows[0]
         target_identity = delivery_history_identity(current_values)
         if target_identity is None:
             raise ValueError("顧客・商品を履歴と結び付ける情報が見つかりません。")
 
-        records = []
+        def candidate_sort_key(source, row_number, values):
+            event_date = to_date(values[10] if len(values) >= 11 else None) or date.min
+            return (
+                event_date,
+                1 if source == "current" else 0,
+                int(row_number),
+            )
+
+        # 候補は画面に必要な件数だけ保持する。全履歴件数は「さらに表示」のため数える。
+        candidates = [
+            {
+                "source": "current",
+                "row_number": current_row,
+                "values": current_values,
+                "sort_key": candidate_sort_key("current", current_row, current_values),
+            }
+        ]
+        total_count = 1
+
         history_ws = workbook[DELIVERY_HISTORY_SHEET_NAME]
         for row_number, values in enumerate(
             history_ws.iter_rows(min_row=2, max_col=14, values_only=True),
@@ -5905,14 +5946,45 @@ def read_product_delivery_history_from_bytes(content, customer_name, product_nam
             values = tuple(values or ())
             if delivery_history_identity(values) != target_identity:
                 continue
+
+            total_count += 1
+            candidate = {
+                "source": "history",
+                "row_number": row_number,
+                "values": values,
+                "sort_key": candidate_sort_key("history", row_number, values),
+            }
+            if len(candidates) < requested_limit:
+                candidates.append(candidate)
+                continue
+
+            oldest_index = min(
+                range(len(candidates)),
+                key=lambda index: candidates[index]["sort_key"],
+            )
+            if candidate["sort_key"] > candidates[oldest_index]["sort_key"]:
+                candidates[oldest_index] = candidate
+
+        candidates.sort(key=lambda item: item["sort_key"], reverse=True)
+
+        records = []
+        for candidate in candidates:
+            source = candidate["source"]
+            row_number = candidate["row_number"]
+            values = candidate["values"]
+            next_delivery = (
+                calculate_delivery_values(values)[0]
+                if source == "current"
+                else (values[12] if len(values) >= 13 else None)
+            )
             records.append(
                 {
-                    "record_key": f"history:{row_number}",
-                    "source": "history",
+                    "record_key": f"{source}:{row_number}",
+                    "source": source,
                     "row_number": row_number,
                     "identity": target_identity,
                     "fingerprint": delivery_record_fingerprint(
-                        "history",
+                        source,
                         row_number,
                         values,
                     ),
@@ -5922,42 +5994,14 @@ def read_product_delivery_history_from_bytes(content, customer_name, product_nam
                     "kg/本": values[9] if len(values) >= 10 else None,
                     "配達日": values[10] if len(values) >= 11 else None,
                     "配達数量": values[11] if len(values) >= 12 else None,
-                    "次回配達予定": values[12] if len(values) >= 13 else None,
+                    "次回配達予定": next_delivery,
                 }
             )
 
-        current_next_delivery, _ = calculate_delivery_values(current_values)
-        records.append(
-            {
-                "record_key": f"current:{current_row}",
-                "source": "current",
-                "row_number": current_row,
-                "identity": target_identity,
-                "fingerprint": delivery_record_fingerprint(
-                    "current",
-                    current_row,
-                    current_values,
-                ),
-                "メーカー": current_values[5] if len(current_values) >= 6 else None,
-                "在庫本数": current_values[7] if len(current_values) >= 8 else None,
-                "本数": current_values[8] if len(current_values) >= 9 else None,
-                "kg/本": current_values[9] if len(current_values) >= 10 else None,
-                "配達日": current_values[10] if len(current_values) >= 11 else None,
-                "配達数量": current_values[11] if len(current_values) >= 12 else None,
-                "次回配達予定": current_next_delivery,
-            }
-        )
-
-        # 修正後に日付の前後が変わっても、画面は日付の新しい順で表示する。
-        records.sort(
-            key=lambda item: (
-                to_date(item.get("配達日")) or date.min,
-                1 if item.get("source") == "current" else 0,
-                int(item.get("row_number") or 0),
-            ),
-            reverse=True,
-        )
-        return records
+        return {
+            "records": records,
+            "total_count": total_count,
+        }
     finally:
         workbook.close()
 
@@ -13639,7 +13683,8 @@ def rebuild_sheet1_from_formula_references(excel_source):
     # 飛び飛びに読むと非常に遅いため、iter_rows()で各シートを1回だけ走査する。
     workbook = load_workbook(
         BytesIO(content),
-        keep_vba=True,
+        # 読み取り専用処理ではVBA本体を展開しない。元のExcel・マクロは変更しない。
+        keep_vba=False,
         data_only=False,
         read_only=True,
     )
@@ -14209,12 +14254,20 @@ def render_customer_delivery_history_editor(
         st.rerun()
 
     try:
+        history_limit = max(20, int(st.session_state.get(history_limit_key, 20)))
+    except (TypeError, ValueError):
+        history_limit = 20
+
+    try:
         content = get_cached_dropbox_excel_content()
-        records = read_product_delivery_history_from_bytes(
+        history_result = read_product_delivery_history_from_bytes(
             content,
             customer_name,
             product_name,
+            history_limit,
         )
+        records = list(history_result.get("records") or [])
+        total_count = int(history_result.get("total_count") or 0)
     except Exception as exc:
         st.error(f"納品履歴を読み込めませんでした：{exc}")
         return
@@ -14224,13 +14277,8 @@ def render_customer_delivery_history_editor(
         return
 
     active_record_key = st.session_state.get(history_edit_key)
-    try:
-        history_limit = max(20, int(st.session_state.get(history_limit_key, 20)))
-    except (TypeError, ValueError):
-        history_limit = 20
-    visible_records = records[:history_limit]
 
-    for record in visible_records:
+    for record in records:
         record_key = record["record_key"]
         with st.container(border=True):
             title = format_date(record.get("配達日"))
@@ -14384,8 +14432,8 @@ def render_customer_delivery_history_editor(
                 except Exception as exc:
                     st.error(f"納品履歴を修正できませんでした：{exc}")
 
-    if len(records) > history_limit:
-        remaining_count = len(records) - history_limit
+    if total_count > len(records):
+        remaining_count = total_count - len(records)
         if st.button(
             f"さらに表示（残り{remaining_count}件）",
             key=f"delivery_history_more_{key_suffix}_{history_limit}",
