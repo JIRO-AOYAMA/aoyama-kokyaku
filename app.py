@@ -17582,68 +17582,82 @@ from app_modules.dispatch_filters import (
 
 def show_dispatch_filters(df):
     """Excelフィルターに近いAND条件の絞り込みを表示する。"""
-    with st.expander("🔎 絞り込み", expanded=False):
-        pickup_mode = st.selectbox(
-            "引取日",
-            ["すべて", "今日", "明日", "今週", "期間指定", "未入力"],
-            key="dispatch_filter_pickup_mode",
-        )
-        pickup_range = None
-        if pickup_mode == "期間指定":
-            pickup_range = st.date_input(
-                "引取日の期間",
-                value=(date.today(), date.today()),
-                key="dispatch_filter_pickup_range",
+    st.markdown(
+        """
+        <style>
+        div[class*="st-key-dispatch_filter_white_panel"] [data-testid="stExpander"] details,
+        div[class*="st-key-dispatch_filter_white_panel"] [data-testid="stExpander"] summary,
+        div[class*="st-key-dispatch_filter_white_panel"] [data-testid="stExpanderDetails"] {
+            background: #ffffff !important;
+            background-color: #ffffff !important;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+    with st.container(key="dispatch_filter_white_panel"):
+        with st.expander("🔎 絞り込み", expanded=False):
+            pickup_mode = st.selectbox(
+                "引取日",
+                ["すべて", "今日", "明日", "今週", "期間指定", "未入力"],
+                key="dispatch_filter_pickup_mode",
+            )
+            pickup_range = None
+            if pickup_mode == "期間指定":
+                pickup_range = st.date_input(
+                    "引取日の期間",
+                    value=(date.today(), date.today()),
+                    key="dispatch_filter_pickup_range",
+                )
+
+            arrival_mode = st.selectbox(
+                "着日",
+                ["すべて", "今日", "明日", "今週", "期間指定", "未入力"],
+                key="dispatch_filter_arrival_mode",
+            )
+            arrival_range = None
+            if arrival_mode == "期間指定":
+                arrival_range = st.date_input(
+                    "着日の期間",
+                    value=(date.today(), date.today()),
+                    key="dispatch_filter_arrival_range",
+                )
+
+            selected_pickups = st.multiselect(
+                "引取先",
+                dispatch_filter_options(df["引取先"]),
+                key="dispatch_filter_pickup_places",
+                placeholder="入力して候補を検索",
+            )
+            selected_products = st.multiselect(
+                "商品名",
+                dispatch_filter_options(df["商品名"]),
+                key="dispatch_filter_products",
+                placeholder="入力して候補を検索",
+            )
+            quantity_keyword = st.text_input(
+                "数量",
+                key="dispatch_filter_quantity",
+                placeholder="例：450㎏、44本",
+            ).strip()
+            selected_carriers = st.multiselect(
+                "運送会社",
+                dispatch_filter_options(df["運送会社"]),
+                key="dispatch_filter_carriers",
+                placeholder="入力して候補を検索",
+            )
+            selected_destinations = st.multiselect(
+                "納品先",
+                dispatch_filter_options(df["納品先"]),
+                key="dispatch_filter_destinations",
+                placeholder="入力して候補を検索",
             )
 
-        arrival_mode = st.selectbox(
-            "着日",
-            ["すべて", "今日", "明日", "今週", "期間指定", "未入力"],
-            key="dispatch_filter_arrival_mode",
-        )
-        arrival_range = None
-        if arrival_mode == "期間指定":
-            arrival_range = st.date_input(
-                "着日の期間",
-                value=(date.today(), date.today()),
-                key="dispatch_filter_arrival_range",
-            )
-
-        selected_pickups = st.multiselect(
-            "引取先",
-            dispatch_filter_options(df["引取先"]),
-            key="dispatch_filter_pickup_places",
-            placeholder="入力して候補を検索",
-        )
-        selected_products = st.multiselect(
-            "商品名",
-            dispatch_filter_options(df["商品名"]),
-            key="dispatch_filter_products",
-            placeholder="入力して候補を検索",
-        )
-        quantity_keyword = st.text_input(
-            "数量",
-            key="dispatch_filter_quantity",
-            placeholder="例：450㎏、44本",
-        ).strip()
-        selected_carriers = st.multiselect(
-            "運送会社",
-            dispatch_filter_options(df["運送会社"]),
-            key="dispatch_filter_carriers",
-            placeholder="入力して候補を検索",
-        )
-        selected_destinations = st.multiselect(
-            "納品先",
-            dispatch_filter_options(df["納品先"]),
-            key="dispatch_filter_destinations",
-            placeholder="入力して候補を検索",
-        )
-
-        if st.button("条件をすべて解除", use_container_width=True, key="dispatch_filter_clear"):
-            for key in list(st.session_state.keys()):
-                if key.startswith("dispatch_filter_"):
-                    del st.session_state[key]
-            st.rerun()
+            if st.button("条件をすべて解除", use_container_width=True, key="dispatch_filter_clear"):
+                for key in list(st.session_state.keys()):
+                    if key.startswith("dispatch_filter_"):
+                        del st.session_state[key]
+                st.rerun()
 
     filtered = apply_dispatch_date_filter(df, "_引取日", pickup_mode, pickup_range)
     filtered = apply_dispatch_date_filter(filtered, "_着日", arrival_mode, arrival_range)
