@@ -79,7 +79,7 @@ FULL_DATA_BACKUP_DROPBOX_FOLDER = st.secrets.get(
 )
 DROPBOX_FAST_CACHE_FILE = "/1共有　青山商店　本社/配車表-北海道-/顧客検索キャッシュ.json"
 # Excelの列構成や読み込み処理を変更した時は、この番号を上げて古いJSONを無効化する。
-DROPBOX_FAST_CACHE_VERSION = 4
+DROPBOX_FAST_CACHE_VERSION = 5
 DISPATCH_DROPBOX_DEFAULT_FILE_PATH = "/1共有　青山商店　本社/配車表-次郎-/配車表1.xlsm"
 DISPATCH_DROPBOX_FILE_PATH = st.secrets.get(
     "DISPATCH_DROPBOX_FILE_PATH",
@@ -149,6 +149,8 @@ DISPATCH_REQUIRED_COLUMNS = [
     "着日",
 ]
 DELIVERY_SHEET_NAME = "次回配達日"
+DELIVERY_HISTORY_SHEET_NAME = "配達履歴"
+MANAGEMENT_SHEET_NAME = "管理"
 SHEET1_CUSTOMER_COLUMN = 2   # B列：顧客名
 SHEET1_HIRAGANA_COLUMN = 9   # I列：ひらがな
 SHEET1_ADDRESS_COLUMN = 10   # J列：住所
@@ -5773,9 +5775,10 @@ def read_edit_values_from_bytes(content, customer_name, product_name):
             row = active_rows[0]
             product_values = {
                 "メーカー": delivery_ws.cell(row, 6).value,
-                "本数": delivery_ws.cell(row, 8).value,
-                "kg/本": delivery_ws.cell(row, 9).value,
-                "配達日": delivery_ws.cell(row, 10).value,
+                "在庫本数": delivery_ws.cell(row, 8).value,
+                "本数": delivery_ws.cell(row, 9).value,
+                "kg/本": delivery_ws.cell(row, 10).value,
+                "配達日": delivery_ws.cell(row, 11).value,
             }
 
         customer_ws = workbook[SHEET_NAME]
@@ -5820,9 +5823,10 @@ def read_customer_edit_bundle_from_bytes(content, customer_name):
             selected_row = active_rows[0] if len(active_rows) == 1 else None
             products[product] = {
                 "メーカー": delivery_ws.cell(selected_row, 6).value if selected_row else None,
-                "本数": delivery_ws.cell(selected_row, 8).value if selected_row else None,
-                "kg/本": delivery_ws.cell(selected_row, 9).value if selected_row else None,
-                "配達日": delivery_ws.cell(selected_row, 10).value if selected_row else None,
+                "在庫本数": delivery_ws.cell(selected_row, 8).value if selected_row else None,
+                "本数": delivery_ws.cell(selected_row, 9).value if selected_row else None,
+                "kg/本": delivery_ws.cell(selected_row, 10).value if selected_row else None,
+                "配達日": delivery_ws.cell(selected_row, 11).value if selected_row else None,
                 "商品一致件数": len(active_rows),
                 "商品全行件数": len(rows),
             }
@@ -5982,9 +5986,75 @@ def refresh_fast_dropbox_cache_after_save(content, excel_revision, access_token)
         return "保存は完了しましたが、表示用キャッシュを更新できませんでした。更新ボタンを押してください。"
 
 
+def find_next_delivery_history_row(ws):
+    """配達履歴A列の最終データ行の次を返す。書式だけの空行は数えない。"""
+    row = max(int(ws.max_row or 1), 1)
+    while row > 1 and is_blank_excel_value(ws.cell(row, 1).value):
+        row -= 1
+    return row + 1
+
+
+def copy_previous_delivery_state_to_history(
+    workbook,
+    cached_workbook,
+    delivery_ws,
+    product_row,
+    changed_cells,
+):
+    """Excelの入力マクロと同じく、更新前のA:Nを配達履歴へ1行追加する。"""
+    if DELIVERY_HISTORY_SHEET_NAME not in workbook.sheetnames:
+        raise ValueError("配達履歴シートが見つからないため、在庫・配達情報を安全に保存できません。")
+    if MANAGEMENT_SHEET_NAME not in workbook.sheetnames:
+        raise ValueError("管理シートが見つからないため、在庫・配達情報を安全に保存できません。")
+
+    history_ws = workbook[DELIVERY_HISTORY_SHEET_NAME]
+    management_ws = workbook[MANAGEMENT_SHEET_NAME]
+    cached_delivery_ws = (
+        cached_workbook[DELIVERY_SHEET_NAME]
+        if cached_workbook is not None and DELIVERY_SHEET_NAME in cached_workbook.sheetnames
+        else None
+    )
+    history_row = find_next_delivery_history_row(history_ws)
+
+    old_values = [delivery_ws.cell(product_row, column).value for column in range(1, 17)]
+    calculated_next_delivery, _ = calculate_delivery_values(old_values)
+
+    for column in range(1, 15):
+        value = delivery_ws.cell(product_row, column).value
+        if isinstance(value, str) and value.startswith("="):
+            cached_value = (
+                cached_delivery_ws.cell(product_row, column).value
+                if cached_delivery_ws is not None
+                else None
+            )
+            if cached_value is not None:
+                value = cached_value
+            elif column == 13:
+                value = calculated_next_delivery
+            else:
+                value = None
+        history_ws.cell(history_row, column).value = value
+        changed_cells.append((DELIVERY_HISTORY_SHEET_NAME, history_row, column, value))
+
+    history_count = history_row - 1
+    management_ws["B8"] = history_count
+    changed_cells.append((MANAGEMENT_SHEET_NAME, 8, 2, history_count))
+
+
 def update_workbook_bytes(original_content, customer_name, product_name, proposed):
-    """指定項目とK列の配達数量だけを変更し、再オープン検証したbytesを返す。"""
+    """H列の在庫本数・I列の配達本数を含む指定項目とL列配達数量を安全に更新する。"""
     workbook = load_workbook(BytesIO(original_content), keep_vba=True, data_only=False, read_only=False)
+    cached_workbook = None
+    try:
+        cached_workbook = load_workbook(
+            BytesIO(original_content),
+            keep_vba=False,
+            data_only=True,
+            read_only=False,
+        )
+    except Exception:
+        cached_workbook = None
+
     original_sheets = list(workbook.sheetnames)
     changed_cells = []
     try:
@@ -6002,29 +6072,59 @@ def update_workbook_bytes(original_content, customer_name, product_name, propose
             raise ValueError("使用数量/日に値が入っている行が見つからないため編集できません。")
 
         product_row = active_rows[0]
-        for label, column in {"メーカー": 6, "本数": 8, "kg/本": 9, "配達日": 10}.items():
+        column_mapping = {
+            "メーカー": 6,
+            "在庫本数": 8,
+            "本数": 9,
+            "kg/本": 10,
+            "配達日": 11,
+        }
+
+        event_changed = any(
+            not same_excel_value(delivery_ws.cell(product_row, column).value, proposed.get(label))
+            for label, column in {
+                "在庫本数": 8,
+                "本数": 9,
+                "配達日": 11,
+            }.items()
+        )
+        if event_changed:
+            copy_previous_delivery_state_to_history(
+                workbook,
+                cached_workbook,
+                delivery_ws,
+                product_row,
+                changed_cells,
+            )
+
+        for label, column in column_mapping.items():
             cell = delivery_ws.cell(product_row, column)
-            new_value = proposed[label]
+            new_value = proposed.get(label)
             if not same_excel_value(cell.value, new_value):
                 cell.value = new_value
                 changed_cells.append((DELIVERY_SHEET_NAME, product_row, column, new_value))
 
-        # PC版ExcelではマクロがK列「配達数量」を本数×kg/本で記載する。
-        # アプリ保存時も同じ値をK列へ入れ、Excelとアプリの次回配達予定を一致させる。
-        try:
-            delivery_quantity = float(proposed.get("本数")) * float(proposed.get("kg/本"))
-            if math.isfinite(delivery_quantity):
-                if delivery_quantity.is_integer():
-                    delivery_quantity = int(delivery_quantity)
-                quantity_cell = delivery_ws.cell(product_row, 11)
-                if not same_excel_value(quantity_cell.value, delivery_quantity):
-                    quantity_cell.value = delivery_quantity
-                    changed_cells.append(
-                        (DELIVERY_SHEET_NAME, product_row, 11, delivery_quantity)
-                    )
-        except (TypeError, ValueError, OverflowError):
-            # 既存データで本数またはkg/本が数値でない場合は、従来どおり他項目の保存を続ける。
-            pass
+        # L列「配達数量」は、H列在庫本数＋I列本数（今回配達本数）の合計×kg/本。
+        inventory_count = inventory_usage_number(proposed.get("在庫本数"))
+        delivery_count = inventory_usage_number(proposed.get("本数"))
+        kg_per_bottle = inventory_usage_number(proposed.get("kg/本"))
+        delivery_quantity = None
+        if inventory_count is not None or delivery_count is not None:
+            if kg_per_bottle is None or kg_per_bottle <= 0:
+                raise ValueError("在庫本数または本数を入力する場合は、kg/本に0より大きい数値が必要です。")
+            delivery_quantity = (inventory_count or 0) + (delivery_count or 0)
+            delivery_quantity *= kg_per_bottle
+            if not math.isfinite(delivery_quantity):
+                raise ValueError("配達数量を正しく計算できませんでした。")
+            if delivery_quantity.is_integer():
+                delivery_quantity = int(delivery_quantity)
+
+        quantity_cell = delivery_ws.cell(product_row, 12)
+        if not same_excel_value(quantity_cell.value, delivery_quantity):
+            quantity_cell.value = delivery_quantity
+            changed_cells.append(
+                (DELIVERY_SHEET_NAME, product_row, 12, delivery_quantity)
+            )
 
         # 商品・在庫の保存では住所とマップ位置を変更しない。
         # 住所・マップ位置は専用の編集処理だけで保存する。
@@ -6036,20 +6136,29 @@ def update_workbook_bytes(original_content, customer_name, product_name, propose
         workbook.save(output)
     finally:
         workbook.close()
+        if cached_workbook is not None:
+            cached_workbook.close()
 
     saved_content = output.getvalue()
     verified = load_workbook(BytesIO(saved_content), keep_vba=True, data_only=False, read_only=False)
     try:
         if list(verified.sheetnames) != original_sheets:
             raise ValueError("保存後にシート構成が変わったため、更新を中止しました。")
-        if DELIVERY_SHEET_NAME not in verified.sheetnames or SHEET_NAME not in verified.sheetnames:
+        required_sheets = {
+            DELIVERY_SHEET_NAME,
+            SHEET_NAME,
+            DELIVERY_HISTORY_SHEET_NAME,
+            MANAGEMENT_SHEET_NAME,
+        }
+        if not required_sheets.issubset(set(verified.sheetnames)):
             raise ValueError("保存後の検証で必要なシートが見つかりません。")
         if verified.vba_archive is None:
             raise ValueError("保存後の検証でVBAプロジェクトを確認できません。")
         for sheet, row, column, expected in changed_cells:
             actual = verified[sheet].cell(row, column).value
             if not same_excel_value(actual, expected):
-                raise ValueError(f"保存後の検証で{sheet}!{verified[sheet].cell(row, column).coordinate}の値が一致しません。")
+                coordinate = verified[sheet].cell(row, column).coordinate
+                raise ValueError(f"保存後の検証で{sheet}!{coordinate}の値が一致しません。")
     finally:
         verified.close()
     return saved_content, changed_cells
@@ -12946,6 +13055,119 @@ def render_customer_information_card(customer_name, customer_key=None):
 # =========================
 # Excel読み込み・整形
 # =========================
+def delivery_history_identity(values):
+    """IDを優先し、IDがない場合だけ顧客名で履歴と現在行を結ぶ。"""
+    values = list(values or [])
+    customer_id = clean_value(values[0] if len(values) >= 1 else None, blank_text="").strip()
+    customer_name = normalize_match_value(values[1] if len(values) >= 2 else None)
+    product_name = normalize_match_value(values[4] if len(values) >= 5 else None)
+    if not product_name:
+        return None
+    if customer_id:
+        return "id", customer_id, product_name
+    if customer_name:
+        return "name", customer_name, product_name
+    return None
+
+
+def calculate_predicted_daily_usage_from_states(states):
+    """
+    H列の実在庫確認を基準に、間にあるI列の配達本数を加味してkg/日の予想使用量を返す。
+
+    HとIが同時入力された行では、Hは配達前の実在庫、Iはその日に配達した本数。
+    次回の基準在庫はH+Iとし、今回の予想使用量には同日のIを含めない。
+    """
+    last_observation_date = None
+    last_post_delivery_inventory_kg = None
+    deliveries_since_observation_kg = 0.0
+    # 新しいH列が使われる前は、従来のI列「本数」が次回配達計算の基準在庫だった。
+    # 最初の実在庫確認だけは、直前の従来基準から予想使用量を計算できるようにする。
+    legacy_baseline_date = None
+    legacy_baseline_inventory_kg = None
+    latest_prediction = None
+
+    for values in states:
+        values = list(values or [])
+        inventory_count = inventory_usage_number(values[7] if len(values) >= 8 else None)
+        delivery_count = inventory_usage_number(values[8] if len(values) >= 9 else None)
+        kg_per_bottle = inventory_usage_number(values[9] if len(values) >= 10 else None)
+        event_date = to_date(values[10] if len(values) >= 11 else None)
+
+        if event_date is None or kg_per_bottle is None or kg_per_bottle <= 0:
+            continue
+        if inventory_count is not None and inventory_count < 0:
+            continue
+        if delivery_count is not None and delivery_count < 0:
+            continue
+
+        delivery_kg = (delivery_count or 0) * kg_per_bottle
+
+        if inventory_count is None:
+            if last_observation_date is not None:
+                if delivery_count is not None:
+                    deliveries_since_observation_kg += delivery_kg
+            elif delivery_count is not None:
+                # H列導入前の行は、I列本数をその時点の運用上の基準在庫として扱う。
+                # 古い行を合算せず、実在庫確認の直前にある最新基準だけを使う。
+                legacy_baseline_date = event_date
+                legacy_baseline_inventory_kg = delivery_kg
+            continue
+
+        current_inventory_kg = inventory_count * kg_per_bottle
+        if last_observation_date is not None and last_post_delivery_inventory_kg is not None:
+            elapsed_days = (event_date - last_observation_date).days
+            used_kg = (
+                last_post_delivery_inventory_kg
+                + deliveries_since_observation_kg
+                - current_inventory_kg
+            )
+            if elapsed_days > 0 and used_kg >= 0 and math.isfinite(used_kg):
+                latest_prediction = used_kg / elapsed_days
+        elif legacy_baseline_date is not None and legacy_baseline_inventory_kg is not None:
+            elapsed_days = (event_date - legacy_baseline_date).days
+            used_kg = legacy_baseline_inventory_kg - current_inventory_kg
+            if elapsed_days > 0 and used_kg >= 0 and math.isfinite(used_kg):
+                latest_prediction = used_kg / elapsed_days
+
+        # 同じ日の配達は今回の使用量計算には含めず、次回期間の開始在庫へ加える。
+        last_observation_date = event_date
+        last_post_delivery_inventory_kg = current_inventory_kg + delivery_kg
+        deliveries_since_observation_kg = 0.0
+
+    return latest_prediction
+
+
+def build_predicted_usage_map(workbook, current_delivery_rows):
+    """配達履歴と現在行を1回ずつ読み、各ID・顧客・商品の最新予想使用量を返す。"""
+    target_keys = {
+        key
+        for values in current_delivery_rows.values()
+        if (key := delivery_history_identity(values)) is not None
+    }
+    if not target_keys:
+        return {}
+
+    grouped_states = {key: [] for key in target_keys}
+    if DELIVERY_HISTORY_SHEET_NAME in workbook.sheetnames:
+        history_ws = workbook[DELIVERY_HISTORY_SHEET_NAME]
+        for values in history_ws.iter_rows(min_row=2, max_col=14, values_only=True):
+            key = delivery_history_identity(values)
+            if key in grouped_states:
+                grouped_states[key].append(values)
+
+    # 配達履歴には更新前の状態が入り、現在の最新状態は次回配達日シートに残る。
+    for row_number in sorted(current_delivery_rows):
+        values = current_delivery_rows[row_number]
+        key = delivery_history_identity(values)
+        if key in grouped_states:
+            grouped_states[key].append(values)
+
+    return {
+        key: calculate_predicted_daily_usage_from_states(states)
+        for key, states in grouped_states.items()
+    }
+
+
 def calculate_delivery_values(delivery_row_values):
     """
     Excelの最新入力値から、次回配達予定と今日時点の残数をアプリ側で計算する。
@@ -12959,9 +13181,9 @@ def calculate_delivery_values(delivery_row_values):
         return delivery_row_values[index] if index < len(delivery_row_values) else None
 
     usage = column_value(7)
-    kg_per_bottle = column_value(9)
-    delivery_date = column_value(10)
-    stored_delivery_quantity = column_value(11)
+    kg_per_bottle = column_value(10)
+    delivery_date = column_value(11)
+    stored_delivery_quantity = column_value(12)
 
     delivery_day = to_date(delivery_date)
     next_delivery = None
@@ -12977,7 +13199,7 @@ def calculate_delivery_values(delivery_row_values):
     except Exception:
         return None, None
 
-    # ExcelのL列と同じく、K列「配達数量」を使って次回配達予定を計算する。
+    # ExcelのM列と同じく、L列「配達数量」を使って次回配達予定を計算する。
     if delivery_day is not None:
         next_delivery = delivery_day + timedelta(
             days=math.floor(delivery_quantity / daily_usage)
@@ -13062,13 +13284,15 @@ def rebuild_sheet1_from_formula_references(excel_source):
         required_source_rows = {record["source_row"] for record in sheet1_records}
         delivery_rows = {}
         for row_number, values in enumerate(
-            delivery.iter_rows(min_row=1, max_col=15, values_only=True),
+            delivery.iter_rows(min_row=1, max_col=16, values_only=True),
             start=1,
         ):
             if row_number in required_source_rows:
                 delivery_rows[row_number] = values
                 if len(delivery_rows) == len(required_source_rows):
                     break
+
+        predicted_usage_map = build_predicted_usage_map(workbook, delivery_rows)
 
         rows = []
         for sheet1_record in sheet1_records:
@@ -13085,6 +13309,7 @@ def rebuild_sheet1_from_formula_references(excel_source):
                 continue
 
             next_delivery, remaining = calculate_delivery_values(delivery_values)
+            history_key = delivery_history_identity(delivery_values)
             rows.append(
                 {
                     "ID": delivery_values[0] if len(delivery_values) >= 1 else None,
@@ -13092,16 +13317,18 @@ def rebuild_sheet1_from_formula_references(excel_source):
                     "地域": delivery_values[2] if len(delivery_values) >= 3 else None,
                     "商品名": product_name,
                     "使用数量/日": delivery_values[6] if len(delivery_values) >= 7 else None,
+                    "予想使用量/日": predicted_usage_map.get(history_key),
                     "次回配達予定": next_delivery,
                     "残数": remaining,
                     "ひらがな": sheet1_record["ひらがな"],
                     "住所": sheet1_record["住所"],
                     "マップ位置": sheet1_record["マップ位置"],
                     "メーカー": delivery_values[5] if len(delivery_values) >= 6 else None,
-                    "本数": delivery_values[7] if len(delivery_values) >= 8 else None,
-                    "kg/本": delivery_values[8] if len(delivery_values) >= 9 else None,
-                    "配達日": delivery_values[9] if len(delivery_values) >= 10 else None,
-                    "_配達数量": delivery_values[10] if len(delivery_values) >= 11 else None,
+                    "在庫本数": delivery_values[7] if len(delivery_values) >= 8 else None,
+                    "本数": delivery_values[8] if len(delivery_values) >= 9 else None,
+                    "kg/本": delivery_values[9] if len(delivery_values) >= 10 else None,
+                    "配達日": delivery_values[10] if len(delivery_values) >= 11 else None,
+                    "_配達数量": delivery_values[11] if len(delivery_values) >= 12 else None,
                 }
             )
         return pd.DataFrame(rows)
@@ -13215,11 +13442,11 @@ def recalculate_customer_inventory_for_today(df):
 
     recalculated = df.copy()
     for index, row in recalculated.iterrows():
-        delivery_values = [None] * 11
+        delivery_values = [None] * 12
         delivery_values[6] = row.get("使用数量/日")
-        delivery_values[8] = row.get("kg/本")
-        delivery_values[9] = row.get("配達日")
-        delivery_values[10] = row.get("_配達数量")
+        delivery_values[9] = row.get("kg/本")
+        delivery_values[10] = row.get("配達日")
+        delivery_values[11] = row.get("_配達数量")
         next_delivery, remaining = calculate_delivery_values(delivery_values)
         recalculated.at[index, "次回配達予定"] = next_delivery
         recalculated.at[index, "残数"] = remaining
@@ -13563,14 +13790,18 @@ def render_customer_excel_editor(customer_name, customer_key, product_name, curr
 
     st.caption("メーカー")
     st.markdown(f"**{clean_value(current.get('メーカー'))}**")
-    col_a, col_b, col_c = st.columns(3)
+    col_a, col_b = st.columns(2)
     with col_a:
+        st.caption("在庫本数")
+        st.markdown(f"**{format_number(current.get('在庫本数'))}**")
+    with col_b:
         st.caption("本数")
         st.markdown(f"**{format_number(current.get('本数'))}**")
-    with col_b:
+    col_c, col_d = st.columns(2)
+    with col_c:
         st.caption("kg/本")
         st.markdown(f"**{format_number(current.get('kg/本'))}**")
-    with col_c:
+    with col_d:
         st.caption("配達日")
         st.markdown(f"**{format_date(current.get('配達日'))}**")
 
@@ -13591,13 +13822,7 @@ def render_customer_excel_editor(customer_name, customer_key, product_name, curr
                 try:
                     with st.spinner("バックアップを作成して保存しています…"):
                         result = save_customer_excel_changes(customer_name, product_name, pending["proposed"])
-                        result["usage_warning"] = save_customer_inventory_usage_snapshot_safely(
-                            customer_name,
-                            customer_key,
-                            product_name,
-                            pending["proposed"],
-                            pending["changes"],
-                        )
+                        result["usage_warning"] = ""
                         result["history_warning"] = record_change_history_safely(
                             "顧客",
                             "",
@@ -13631,10 +13856,20 @@ def render_customer_excel_editor(customer_name, customer_key, product_name, curr
             placeholder="メーカー名を入力",
             help=VOICE_INPUT_HELP,
         )
+        st.caption(
+            "在庫本数＝配達前に確認した本数、本数＝今回配達する本数です。"
+            "両方入力した場合は合計で次回配達予定を計算します。"
+        )
+        inventory_bottles = st.text_input(
+            "在庫本数",
+            value="",
+            placeholder="確認できた場合：例 3本",
+            help=VOICE_INPUT_HELP,
+        )
         bottles = st.text_input(
             "本数",
             value="",
-            placeholder="例：44本",
+            placeholder="今回配達：例 10本",
             help=VOICE_INPUT_HELP,
         )
         kg_per_bottle = st.text_input(
@@ -13660,16 +13895,32 @@ def render_customer_excel_editor(customer_name, customer_key, product_name, curr
         st.rerun()
     if proceed:
         try:
+            inventory_text = str(inventory_bottles).strip()
+            bottles_text = str(bottles).strip()
+            delivery_date_text = str(delivery_date).strip()
+            event_input = bool(inventory_text or bottles_text or delivery_date_text)
+
+            if event_input and not delivery_date_text:
+                raise ValueError("在庫本数または本数を入力する場合は、配達日も入力してください。")
+            if delivery_date_text and not (inventory_text or bottles_text):
+                raise ValueError("配達日を入力する場合は、在庫本数または本数も入力してください。")
+
             proposed = {
-                # 空欄は既存値を維持し、入力された項目だけ更新する。
                 "メーカー": (
                     str(maker).strip()
                     or normalize_existing_excel_value(current.get("メーカー"))
                 ),
+                # 新しい在庫・配達を登録するときは、空欄側をそのまま空欄として保存する。
+                # メーカーやkg/本だけを直す場合は、現在の在庫・配達値を維持する。
+                "在庫本数": (
+                    parse_optional_nonnegative_number(inventory_bottles, integer=True)
+                    if inventory_text
+                    else (None if event_input else normalize_existing_excel_value(current.get("在庫本数")))
+                ),
                 "本数": (
                     parse_optional_nonnegative_number(bottles, integer=True)
-                    if str(bottles).strip()
-                    else normalize_existing_excel_value(current.get("本数"))
+                    if bottles_text
+                    else (None if event_input else normalize_existing_excel_value(current.get("本数")))
                 ),
                 "kg/本": (
                     parse_optional_nonnegative_number(kg_per_bottle, integer=False)
@@ -13678,7 +13929,7 @@ def render_customer_excel_editor(customer_name, customer_key, product_name, curr
                 ),
                 "配達日": (
                     parse_optional_date(delivery_date)
-                    if str(delivery_date).strip()
+                    if delivery_date_text
                     else normalize_existing_excel_value(current.get("配達日"))
                 ),
             }
@@ -13696,13 +13947,7 @@ def render_customer_excel_editor(customer_name, customer_key, product_name, curr
                         product_name,
                         proposed,
                     )
-                    result["usage_warning"] = save_customer_inventory_usage_snapshot_safely(
-                        customer_name,
-                        customer_key,
-                        product_name,
-                        proposed,
-                        changes,
-                    )
+                    result["usage_warning"] = ""
                     result["history_warning"] = record_change_history_safely(
                         "顧客",
                         "",
@@ -13976,27 +14221,13 @@ def show_customer_detail(df, customer_name):
         seen_products.add(candidate_product)
         visible_products.append(candidate_row)
 
-    predicted_usage_by_product = {}
-    if visible_products and has_supabase_config():
-        try:
-            predicted_usage_by_product = get_customer_inventory_usage_snapshot_map(
-                customer_name,
-                customer_key,
-            )
-        except Exception:
-            # 予想使用量の取得失敗で、既存の商品・在庫表示を止めない。
-            predicted_usage_by_product = {}
 
     for row in visible_products:
         product_name = clean_value(row["商品名"])
         customer_id = clean_value(row["ID"])
         usage = format_number(row["使用数量/日"])
-        prediction = predicted_usage_by_product.get(
-            normalize_match_value(product_name),
-            {},
-        )
         predicted_usage = format_number(
-            prediction.get("predicted_daily_usage"),
+            row.get("予想使用量/日"),
             blank_text="",
         )
         next_date = format_date(row["次回配達予定"])
@@ -14018,7 +14249,7 @@ def show_customer_detail(df, customer_name):
                 if predicted_usage:
                     st.markdown(f"**{predicted_usage}**")
                 else:
-                    # 今日から履歴を開始するため、比較元がない最初の保存後は空白表示。
+                    # 比較できる前回基準がない場合だけ空白表示。
                     st.markdown("&nbsp;", unsafe_allow_html=True)
 
             with col2:
@@ -14036,6 +14267,7 @@ def show_customer_detail(df, customer_name):
             )
             current_edit_values = {
                 "メーカー": row.get("メーカー"),
+                "在庫本数": row.get("在庫本数"),
                 "本数": row.get("本数"),
                 "kg/本": row.get("kg/本"),
                 "配達日": row.get("配達日"),
