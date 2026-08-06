@@ -16456,11 +16456,15 @@ def show_customer_search(df=None, show_home_link=False):
         return
 
     # ログイン直後はExcelを読まず、実際に検索が始まった時だけ取得する。
+    # 通常は共通検索と同じ小さな索引を再利用し、全行の整形を繰り返さない。
     if df is None:
         with st.spinner("顧客データを読み込んでいます…"):
-            df = load_data()
-
-    customers = find_customer_search_candidates(df, keyword)
+            customers = find_global_customer_search_candidates(
+                load_global_customer_search_index(),
+                keyword,
+            )
+    else:
+        customers = find_customer_search_candidates(df, keyword)
 
     if customers.empty:
         st.warning("該当する顧客がありません。")
@@ -16516,6 +16520,12 @@ def get_product_search_rows(df):
         & (rows["_顧客名検索"] != "")
     ].copy()
     return rows
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def load_product_search_index():
+    """商品検索用に必要な行だけを整形し、5分間再利用する。"""
+    return get_product_search_rows(load_data())
 
 
 def get_product_search_candidates(product_rows, keyword):
@@ -16769,9 +16779,9 @@ def show_product_search(df=None):
 
     if df is None:
         with st.spinner("商品データを読み込んでいます…"):
-            df = load_data()
-
-    product_rows = get_product_search_rows(df)
+            product_rows = load_product_search_index()
+    else:
+        product_rows = get_product_search_rows(df)
     candidates = get_product_search_candidates(product_rows, keyword)
 
     if not candidates:
@@ -16793,7 +16803,26 @@ def show_product_search(df=None):
 # =========================
 # 地域検索
 # =========================
-def show_region_search(df):
+@st.cache_data(ttl=300, show_spinner=False)
+def load_region_search_index():
+    """地域検索に必要な顧客名・地域だけを整形し、5分間再利用する。"""
+    df = load_data()
+    required = ["顧客名", "地域"]
+    if not isinstance(df, pd.DataFrame) or not set(required).issubset(df.columns):
+        return pd.DataFrame(columns=required + ["_地域検索"])
+    index = df[required].copy()
+    index["顧客名"] = index["顧客名"].apply(
+        lambda value: clean_value(value, blank_text="").strip()
+    )
+    index["地域"] = index["地域"].apply(
+        lambda value: clean_value(value, blank_text="").strip()
+    )
+    index = index[index["顧客名"] != ""].drop_duplicates()
+    index["_地域検索"] = index["地域"].str.casefold()
+    return index.reset_index(drop=True)
+
+
+def show_region_search(df=None):
     st.subheader("📍 地域検索")
     show_back_home_button("region_back_home")
     st.caption(f"🎤 {VOICE_INPUT_HELP}")
@@ -16816,8 +16845,27 @@ def show_region_search(df):
         st.info("地域名を入力してください。")
         return
 
-    region_text = df["地域"].fillna("").astype(str).str.strip()
-    hit = df[region_text.str.contains(keyword, na=False)]
+    if df is None:
+        search_index = load_region_search_index()
+    else:
+        required = ["顧客名", "地域"]
+        if not isinstance(df, pd.DataFrame) or not set(required).issubset(df.columns):
+            search_index = pd.DataFrame(columns=required + ["_地域検索"])
+        else:
+            search_index = df[required].copy()
+            search_index["顧客名"] = search_index["顧客名"].apply(
+                lambda value: clean_value(value, blank_text="").strip()
+            )
+            search_index["地域"] = search_index["地域"].apply(
+                lambda value: clean_value(value, blank_text="").strip()
+            )
+            search_index = search_index[search_index["顧客名"] != ""].drop_duplicates()
+            search_index["_地域検索"] = search_index["地域"].str.casefold()
+
+    target = keyword.casefold()
+    hit = search_index[
+        search_index["_地域検索"].str.contains(target, na=False, regex=False)
+    ]
 
     if hit.empty:
         st.warning("該当する地域の顧客が見つかりません。")
@@ -22201,6 +22249,22 @@ def show_trade_partner_directory(partner_type):
     render_trade_partner_directory_cards(rows, partner_type)
 
 
+@st.cache_data(ttl=300, show_spinner=False)
+def load_trade_partner_search_index(partner_type):
+    """仕入先・運送会社検索用の文字列を作り、5分間再利用する。"""
+    data = load_trade_partner_data()
+    rows = []
+    for source in get_trade_partner_master_rows(data, partner_type):
+        row = dict(source)
+        haystack = " ".join(
+            trade_partner_text(row.get(field))
+            for field in ("会社名", "会社名かな", "地域")
+        )
+        row["_検索文字"] = normalize_match_value(haystack).casefold()
+        rows.append(row)
+    return rows
+
+
 def show_trade_partner_search(partner_type):
     show_trade_partner_home_link(partner_type)
     label = trade_partner_type_label(partner_type)
@@ -22219,16 +22283,11 @@ def show_trade_partner_search(partner_type):
     if not keyword:
         st.info("検索文字を入力してください。")
         return
-    data = load_trade_partner_data()
-    target = normalize_match_value(keyword).lower()
-    matches = []
-    for row in get_trade_partner_master_rows(data, partner_type):
-        haystack = " ".join(
-            trade_partner_text(row.get(field))
-            for field in ("会社名", "会社名かな", "地域")
-        ).lower()
-        if target in normalize_match_value(haystack).lower():
-            matches.append(row)
+    target = normalize_match_value(keyword).casefold()
+    matches = [
+        row for row in load_trade_partner_search_index(partner_type)
+        if target in str(row.get("_検索文字") or "")
+    ]
     matches.sort(key=trade_partner_sort_key)
     if not matches:
         st.warning("一致する会社が見つかりません。")
@@ -23871,8 +23930,7 @@ try:
         show_customer_directory()
 
     elif st.session_state["page"] == "region":
-        df = load_data()
-        show_region_search(df)
+        show_region_search()
 
     elif st.session_state["page"] == "product":
         show_product_search()
