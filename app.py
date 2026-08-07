@@ -17636,6 +17636,48 @@ from app_modules.dispatch_filters import (
 )
 
 
+def mobile_dispatch_multiselect(label, options, key):
+    """スマホでは通常の文字入力で候補を絞り、候補自体はタップして複数選択する。"""
+    option_list = list(options or [])
+    current_values = st.session_state.get(key, [])
+    if not isinstance(current_values, (list, tuple, set)):
+        current_values = []
+    current_values = [value for value in current_values if value in option_list]
+
+    query = st.text_input(
+        f"{label}を検索",
+        key=f"{key}_mobile_search",
+        placeholder=f"{label}の一部を入力",
+    ).strip()
+    query_text = normalize_dispatch_text(query).casefold()
+
+    if query_text:
+        visible_options = [
+            value
+            for value in option_list
+            if query_text in normalize_dispatch_text(value).casefold()
+        ]
+    else:
+        visible_options = option_list
+
+    # 検索文字を変えても、すでに選んだ値は候補から外さず保持する。
+    merged_options = []
+    seen = set()
+    for value in [*current_values, *visible_options]:
+        marker = str(value)
+        if marker in seen:
+            continue
+        seen.add(marker)
+        merged_options.append(value)
+
+    return st.multiselect(
+        label,
+        merged_options,
+        key=key,
+        placeholder="候補をタップして選択",
+    )
+
+
 def show_dispatch_filters(df):
     """Excelフィルターに近いAND条件の絞り込みを表示する。"""
     st.markdown(
@@ -17679,35 +17721,62 @@ def show_dispatch_filters(df):
                     key="dispatch_filter_arrival_range",
                 )
 
-            selected_pickups = st.multiselect(
-                "引取先",
-                dispatch_filter_options(df["引取先"]),
-                key="dispatch_filter_pickup_places",
-                placeholder="入力して候補を検索",
-            )
-            selected_products = st.multiselect(
-                "商品名",
-                dispatch_filter_options(df["商品名"]),
-                key="dispatch_filter_products",
-                placeholder="入力して候補を検索",
-            )
+            mobile_filter_mode = is_mobile_browser()
+            if mobile_filter_mode:
+                selected_pickups = mobile_dispatch_multiselect(
+                    "引取先",
+                    dispatch_filter_options(df["引取先"]),
+                    key="dispatch_filter_pickup_places",
+                )
+                selected_products = mobile_dispatch_multiselect(
+                    "商品名",
+                    dispatch_filter_options(df["商品名"]),
+                    key="dispatch_filter_products",
+                )
+            else:
+                selected_pickups = st.multiselect(
+                    "引取先",
+                    dispatch_filter_options(df["引取先"]),
+                    key="dispatch_filter_pickup_places",
+                    placeholder="入力して候補を検索",
+                )
+                selected_products = st.multiselect(
+                    "商品名",
+                    dispatch_filter_options(df["商品名"]),
+                    key="dispatch_filter_products",
+                    placeholder="入力して候補を検索",
+                )
+
             quantity_keyword = st.text_input(
                 "数量",
                 key="dispatch_filter_quantity",
                 placeholder="例：450㎏、44本",
             ).strip()
-            selected_carriers = st.multiselect(
-                "運送会社",
-                dispatch_filter_options(df["運送会社"]),
-                key="dispatch_filter_carriers",
-                placeholder="入力して候補を検索",
-            )
-            selected_destinations = st.multiselect(
-                "納品先",
-                dispatch_filter_options(df["納品先"]),
-                key="dispatch_filter_destinations",
-                placeholder="入力して候補を検索",
-            )
+
+            if mobile_filter_mode:
+                selected_carriers = mobile_dispatch_multiselect(
+                    "運送会社",
+                    dispatch_filter_options(df["運送会社"]),
+                    key="dispatch_filter_carriers",
+                )
+                selected_destinations = mobile_dispatch_multiselect(
+                    "納品先",
+                    dispatch_filter_options(df["納品先"]),
+                    key="dispatch_filter_destinations",
+                )
+            else:
+                selected_carriers = st.multiselect(
+                    "運送会社",
+                    dispatch_filter_options(df["運送会社"]),
+                    key="dispatch_filter_carriers",
+                    placeholder="入力して候補を検索",
+                )
+                selected_destinations = st.multiselect(
+                    "納品先",
+                    dispatch_filter_options(df["納品先"]),
+                    key="dispatch_filter_destinations",
+                    placeholder="入力して候補を検索",
+                )
 
             if st.button("条件をすべて解除", use_container_width=True, key="dispatch_filter_clear"):
                 for key in list(st.session_state.keys()):
