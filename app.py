@@ -17636,46 +17636,45 @@ from app_modules.dispatch_filters import (
 )
 
 
-def mobile_dispatch_multiselect(label, options, key):
-    """スマホでは通常の文字入力で候補を絞り、候補自体はタップして複数選択する。"""
-    option_list = list(options or [])
-    current_values = st.session_state.get(key, [])
-    if not isinstance(current_values, (list, tuple, set)):
-        current_values = []
-    current_values = [value for value in current_values if value in option_list]
+def dispatch_mobile_text_filter(df, column, keyword):
+    """スマホ配車表の文字入力を、指定列の部分一致で絞り込む。"""
+    keyword_text = normalize_dispatch_text(keyword).strip().casefold()
+    if not keyword_text:
+        return df
+    target_text = df[column].map(normalize_dispatch_text).str.casefold()
+    return df[target_text.str.contains(keyword_text, regex=False, na=False)]
 
-    query = st.text_input(
-        f"{label}を検索",
-        key=f"{key}_mobile_search",
-        placeholder=f"{label}の一部を入力",
-    ).strip()
-    query_text = normalize_dispatch_text(query).casefold()
 
-    if query_text:
-        visible_options = [
-            value
-            for value in option_list
-            if query_text in normalize_dispatch_text(value).casefold()
+def dispatch_mobile_date_search_text(value):
+    """スマホの日付入力で、一般的な日付表記を同じ日として検索できる文字列を作る。"""
+    target = to_date(value)
+    if target is None:
+        return "未入力"
+    weekdays = "月火水木金土日"
+    weekday = weekdays[target.weekday()]
+    return " ".join(
+        [
+            f"{target.year}/{target.month}/{target.day}",
+            f"{target.year}/{target.month:02d}/{target.day:02d}",
+            f"{target.year}-{target.month:02d}-{target.day:02d}",
+            f"{target.month}/{target.day}",
+            f"{target.month:02d}/{target.day:02d}",
+            f"{target.month}月{target.day}日",
+            f"{target.month}月",
+            f"{target.day}日",
+            f"{weekday}",
+            f"{weekday}曜日",
         ]
-    else:
-        visible_options = option_list
+    ).casefold()
 
-    # 検索文字を変えても、すでに選んだ値は候補から外さず保持する。
-    merged_options = []
-    seen = set()
-    for value in [*current_values, *visible_options]:
-        marker = str(value)
-        if marker in seen:
-            continue
-        seen.add(marker)
-        merged_options.append(value)
 
-    return st.multiselect(
-        label,
-        merged_options,
-        key=key,
-        placeholder="候補をタップして選択",
-    )
+def dispatch_mobile_date_filter(df, column, keyword):
+    """スマホ配車表の日付を文字入力の部分一致で絞り込む。"""
+    keyword_text = normalize_dispatch_text(keyword).strip().casefold()
+    if not keyword_text:
+        return df
+    target_text = df[column].map(dispatch_mobile_date_search_text)
+    return df[target_text.str.contains(keyword_text, regex=False, na=False)]
 
 
 def show_dispatch_filters(df):
@@ -17693,47 +17692,75 @@ def show_dispatch_filters(df):
         """,
         unsafe_allow_html=True,
     )
+    mobile_filter_mode = is_mobile_browser()
+
     with st.container(key="dispatch_filter_white_panel"):
         with st.expander("🔎 絞り込み", expanded=False):
-            pickup_mode = st.selectbox(
-                "引取日",
-                ["すべて", "今日", "明日", "今週", "期間指定", "未入力"],
-                key="dispatch_filter_pickup_mode",
-            )
-            pickup_range = None
-            if pickup_mode == "期間指定":
-                pickup_range = st.date_input(
-                    "引取日の期間",
-                    value=(date.today(), date.today()),
-                    key="dispatch_filter_pickup_range",
-                )
-
-            arrival_mode = st.selectbox(
-                "着日",
-                ["すべて", "今日", "明日", "今週", "期間指定", "未入力"],
-                key="dispatch_filter_arrival_mode",
-            )
-            arrival_range = None
-            if arrival_mode == "期間指定":
-                arrival_range = st.date_input(
-                    "着日の期間",
-                    value=(date.today(), date.today()),
-                    key="dispatch_filter_arrival_range",
-                )
-
-            mobile_filter_mode = is_mobile_browser()
             if mobile_filter_mode:
-                selected_pickups = mobile_dispatch_multiselect(
+                # スマホはPCと同じ7項目だけを並べ、各項目へ直接文字入力して絞り込む。
+                mobile_pickup_date = st.text_input(
+                    "引取日",
+                    key="dispatch_filter_mobile_pickup_date",
+                    placeholder="例：8/7、8月7日",
+                ).strip()
+                mobile_arrival_date = st.text_input(
+                    "着日",
+                    key="dispatch_filter_mobile_arrival_date",
+                    placeholder="例：8/8、8月8日",
+                ).strip()
+                mobile_pickup_place = st.text_input(
                     "引取先",
-                    dispatch_filter_options(df["引取先"]),
-                    key="dispatch_filter_pickup_places",
-                )
-                selected_products = mobile_dispatch_multiselect(
+                    key="dispatch_filter_mobile_pickup_place",
+                    placeholder="引取先の一部を入力",
+                ).strip()
+                mobile_product = st.text_input(
                     "商品名",
-                    dispatch_filter_options(df["商品名"]),
-                    key="dispatch_filter_products",
-                )
+                    key="dispatch_filter_mobile_product",
+                    placeholder="商品名の一部を入力",
+                ).strip()
+                quantity_keyword = st.text_input(
+                    "数量",
+                    key="dispatch_filter_quantity",
+                    placeholder="例：450㎏、44本",
+                ).strip()
+                mobile_carrier = st.text_input(
+                    "運送会社",
+                    key="dispatch_filter_mobile_carrier",
+                    placeholder="運送会社の一部を入力",
+                ).strip()
+                mobile_destination = st.text_input(
+                    "納品先",
+                    key="dispatch_filter_mobile_destination",
+                    placeholder="納品先の一部を入力",
+                ).strip()
             else:
+                # PCは従来の操作・項目・絞り込みルールをそのまま維持する。
+                pickup_mode = st.selectbox(
+                    "引取日",
+                    ["すべて", "今日", "明日", "今週", "期間指定", "未入力"],
+                    key="dispatch_filter_pickup_mode",
+                )
+                pickup_range = None
+                if pickup_mode == "期間指定":
+                    pickup_range = st.date_input(
+                        "引取日の期間",
+                        value=(date.today(), date.today()),
+                        key="dispatch_filter_pickup_range",
+                    )
+
+                arrival_mode = st.selectbox(
+                    "着日",
+                    ["すべて", "今日", "明日", "今週", "期間指定", "未入力"],
+                    key="dispatch_filter_arrival_mode",
+                )
+                arrival_range = None
+                if arrival_mode == "期間指定":
+                    arrival_range = st.date_input(
+                        "着日の期間",
+                        value=(date.today(), date.today()),
+                        key="dispatch_filter_arrival_range",
+                    )
+
                 selected_pickups = st.multiselect(
                     "引取先",
                     dispatch_filter_options(df["引取先"]),
@@ -17746,25 +17773,11 @@ def show_dispatch_filters(df):
                     key="dispatch_filter_products",
                     placeholder="入力して候補を検索",
                 )
-
-            quantity_keyword = st.text_input(
-                "数量",
-                key="dispatch_filter_quantity",
-                placeholder="例：450㎏、44本",
-            ).strip()
-
-            if mobile_filter_mode:
-                selected_carriers = mobile_dispatch_multiselect(
-                    "運送会社",
-                    dispatch_filter_options(df["運送会社"]),
-                    key="dispatch_filter_carriers",
-                )
-                selected_destinations = mobile_dispatch_multiselect(
-                    "納品先",
-                    dispatch_filter_options(df["納品先"]),
-                    key="dispatch_filter_destinations",
-                )
-            else:
+                quantity_keyword = st.text_input(
+                    "数量",
+                    key="dispatch_filter_quantity",
+                    placeholder="例：450㎏、44本",
+                ).strip()
                 selected_carriers = st.multiselect(
                     "運送会社",
                     dispatch_filter_options(df["運送会社"]),
@@ -17784,17 +17797,26 @@ def show_dispatch_filters(df):
                         del st.session_state[key]
                 st.rerun()
 
-    filtered = apply_dispatch_date_filter(df, "_引取日", pickup_mode, pickup_range)
-    filtered = apply_dispatch_date_filter(filtered, "_着日", arrival_mode, arrival_range)
-    filtered = apply_dispatch_choice_filter(filtered, "引取先", selected_pickups)
-    filtered = apply_dispatch_choice_filter(filtered, "商品名", selected_products)
-    filtered = apply_dispatch_choice_filter(filtered, "運送会社", selected_carriers)
-    filtered = apply_dispatch_choice_filter(filtered, "納品先", selected_destinations)
+    if mobile_filter_mode:
+        # スマホも各項目をAND条件で適用する。PC側の既存フィルター処理には触れない。
+        filtered = dispatch_mobile_date_filter(df, "_引取日", mobile_pickup_date)
+        filtered = dispatch_mobile_date_filter(filtered, "_着日", mobile_arrival_date)
+        filtered = dispatch_mobile_text_filter(filtered, "引取先", mobile_pickup_place)
+        filtered = dispatch_mobile_text_filter(filtered, "商品名", mobile_product)
+        filtered = dispatch_mobile_text_filter(filtered, "運送会社", mobile_carrier)
+        filtered = dispatch_mobile_text_filter(filtered, "納品先", mobile_destination)
+    else:
+        filtered = apply_dispatch_date_filter(df, "_引取日", pickup_mode, pickup_range)
+        filtered = apply_dispatch_date_filter(filtered, "_着日", arrival_mode, arrival_range)
+        filtered = apply_dispatch_choice_filter(filtered, "引取先", selected_pickups)
+        filtered = apply_dispatch_choice_filter(filtered, "商品名", selected_products)
+        filtered = apply_dispatch_choice_filter(filtered, "運送会社", selected_carriers)
+        filtered = apply_dispatch_choice_filter(filtered, "納品先", selected_destinations)
+
     if quantity_keyword:
         quantity_text = filtered["数量"].map(normalize_dispatch_text)
         filtered = filtered[quantity_text.str.contains(quantity_keyword, regex=False, na=False)]
     return filtered
-
 
 def render_dispatch_board_card(row):
     pickup_date = dispatch_date_label(row.get("_引取日"))
