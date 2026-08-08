@@ -6785,32 +6785,250 @@ def confirm_dropbox_upload(target_path, access_token, changed_cells):
     return uploaded_content, get_download_revision(response)
 
 
+def _xlsx_column_number_from_reference(cell_reference):
+    """A1形式のセル参照から列番号だけを返す。"""
+    match = re.match(r"^([A-Za-z]+)", str(cell_reference or ""))
+    if not match:
+        return 0
+    number = 0
+    for char in match.group(1).upper():
+        number = number * 26 + (ord(char) - ord("A") + 1)
+    return number
+
+
+def _xlsx_cell_reference(row_number, column_number):
+    """行・列番号をA1形式へ変換する。"""
+    column_number = int(column_number)
+    letters = []
+    while column_number > 0:
+        column_number, remainder = divmod(column_number - 1, 26)
+        letters.append(chr(ord("A") + remainder))
+    return "".join(reversed(letters)) + str(int(row_number))
+
+
+def _xlsx_workbook_info(archive):
+    """xlsm ZIP内のシート順・XMLパス・日付基準を取得する。"""
+    main_ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+    office_rel_ns = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+    package_rel_ns = "http://schemas.openxmlformats.org/package/2006/relationships"
+
+    workbook_root = ET.fromstring(archive.read("xl/workbook.xml"))
+    rels_root = ET.fromstring(archive.read("xl/_rels/workbook.xml.rels"))
+    rel_targets = {
+        rel.attrib.get("Id", ""): rel.attrib.get("Target", "")
+        for rel in rels_root.findall(f"{{{package_rel_ns}}}Relationship")
+    }
+
+    sheet_names = []
+    sheet_paths = {}
+    sheets = workbook_root.find(f"{{{main_ns}}}sheets")
+    if sheets is not None:
+        for sheet in sheets:
+            name = str(sheet.attrib.get("name") or "")
+            relation_id = str(sheet.attrib.get(f"{{{office_rel_ns}}}id") or "")
+            target = str(rel_targets.get(relation_id) or "").replace("\\", "/")
+            if not name or not target:
+                continue
+            if target.startswith("/"):
+                path = target.lstrip("/")
+            elif target.startswith("xl/"):
+                path = posixpath.normpath(target)
+            else:
+                path = posixpath.normpath(posixpath.join("xl", target))
+            sheet_names.append(name)
+            sheet_paths[name] = path
+
+    workbook_pr = workbook_root.find(f"{{{main_ns}}}workbookPr")
+    date1904 = False
+    if workbook_pr is not None:
+        date1904 = str(workbook_pr.attrib.get("date1904") or "").strip().lower() in {
+            "1",
+            "true",
+        }
+    return sheet_names, sheet_paths, date1904
+
+
+def _xlsx_shared_strings(archive):
+    """sharedStrings.xmlがあるブックだけ共有文字列を読む。openpyxl保存後は通常空。"""
+    path = "xl/sharedStrings.xml"
+    if path not in archive.namelist():
+        return []
+    main_ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+    root = ET.fromstring(archive.read(path))
+    values = []
+    for item in root.findall(f"{{{main_ns}}}si"):
+        values.append("".join(node.text or "" for node in item.iter(f"{{{main_ns}}}t")))
+    return values
+
+
+def _xlsx_excel_datetime(number, date1904=False):
+    """Excelシリアル値をdatetimeへ変換する。"""
+    epoch = datetime(1904, 1, 1) if date1904 else datetime(1899, 12, 30)
+    return epoch + timedelta(days=float(number))
+
+
+def _xlsx_cell_value(cell, shared_strings, date1904=False, force_date=False):
+    """openpyxlを起動せず、worksheet XMLの1セルをPython値へ戻す。"""
+    main_ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+    formula = cell.find(f"{{{main_ns}}}f")
+    if formula is not None:
+        return "=" + str(formula.text or "")
+
+    cell_type = str(cell.attrib.get("t") or "")
+    if cell_type == "inlineStr":
+        inline = cell.find(f"{{{main_ns}}}is")
+        if inline is None:
+            return ""
+        return "".join(node.text or "" for node in inline.iter(f"{{{main_ns}}}t"))
+
+    value_node = cell.find(f"{{{main_ns}}}v")
+    value_text = value_node.text if value_node is not None else None
+    if value_text is None:
+        return None
+
+    if cell_type == "s":
+        try:
+            return shared_strings[int(value_text)]
+        except Exception:
+            return None
+    if cell_type == "b":
+        return str(value_text).strip() == "1"
+    if cell_type in {"str", "e"}:
+        return str(value_text)
+    if cell_type == "d":
+        try:
+            return datetime.fromisoformat(str(value_text).replace("Z", "+00:00"))
+        except Exception:
+            return str(value_text)
+
+    try:
+        number = float(value_text)
+    except Exception:
+        return str(value_text)
+    if force_date:
+        try:
+            return _xlsx_excel_datetime(number, date1904=date1904)
+        except Exception:
+            return number
+    return int(number) if number.is_integer() else number
+
+
+def _xlsx_iter_sheet_rows(
+    archive,
+    sheet_path,
+    shared_strings,
+    max_col,
+    date1904=False,
+    date_columns=None,
+):
+    """worksheet XMLを1回だけ流し読みし、必要列だけタプルで返す。"""
+    main_ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+    row_tag = f"{{{main_ns}}}row"
+    cell_tag = f"{{{main_ns}}}c"
+    date_columns = set(date_columns or ())
+
+    with archive.open(sheet_path) as stream:
+        for _, element in ET.iterparse(stream, events=("end",)):
+            if element.tag != row_tag:
+                continue
+            try:
+                row_number = int(element.attrib.get("r") or 0)
+            except Exception:
+                row_number = 0
+            values = [None] * int(max_col)
+            for cell in element:
+                if cell.tag != cell_tag:
+                    continue
+                column_number = _xlsx_column_number_from_reference(cell.attrib.get("r"))
+                if column_number < 1 or column_number > max_col:
+                    continue
+                values[column_number - 1] = _xlsx_cell_value(
+                    cell,
+                    shared_strings,
+                    date1904=date1904,
+                    force_date=column_number in date_columns,
+                )
+            element.clear()
+            if row_number > 0:
+                yield row_number, tuple(values)
+
+
+def _xlsx_verify_changed_cells(
+    archive,
+    sheet_paths,
+    shared_strings,
+    changed_cells,
+    date1904=False,
+):
+    """変更セルだけをworksheet XMLから確認する。空欄セルはXMLに無くても正常扱い。"""
+    main_ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+    cell_tag = f"{{{main_ns}}}c"
+    targets_by_sheet = {}
+    for sheet, row, column, expected in changed_cells:
+        targets_by_sheet.setdefault(sheet, {})[_xlsx_cell_reference(row, column)] = expected
+
+    for sheet, targets in targets_by_sheet.items():
+        sheet_path = sheet_paths.get(sheet)
+        if not sheet_path or sheet_path not in archive.namelist():
+            raise ValueError(f"保存後の検証で{sheet}シートが見つかりません。")
+
+        remaining = dict(targets)
+        with archive.open(sheet_path) as stream:
+            for _, element in ET.iterparse(stream, events=("end",)):
+                if element.tag != cell_tag:
+                    continue
+                reference = str(element.attrib.get("r") or "")
+                if reference not in remaining:
+                    element.clear()
+                    continue
+                expected = remaining.pop(reference)
+                force_date = isinstance(expected, (datetime, date))
+                actual = _xlsx_cell_value(
+                    element,
+                    shared_strings,
+                    date1904=date1904,
+                    force_date=force_date,
+                )
+                element.clear()
+                if not same_excel_value(actual, expected):
+                    raise ValueError(
+                        f"保存後の検証で{sheet}!{reference}の値が一致しません。"
+                    )
+                if not remaining:
+                    break
+
+        for reference, expected in remaining.items():
+            # openpyxlも未作成セルをNoneとして読むため、空欄期待なら一致扱いにする。
+            if not is_blank_excel_value(expected):
+                raise ValueError(
+                    f"保存後の検証で{sheet}!{reference}の値を確認できません。"
+                )
+
+
 def rebuild_changed_customer_product_record(
     content,
     customer_name,
     product_name,
     base_record,
 ):
-    """保存済みExcelから、変更した顧客・商品の表示用1行だけを正確に作り直す。"""
-    workbook = load_workbook(
-        BytesIO(content),
-        keep_vba=False,
-        data_only=False,
-        read_only=True,
-    )
-    try:
-        if DELIVERY_SHEET_NAME not in workbook.sheetnames:
+    """保存済みxlsmのXMLを直接読み、変更した1商品の表示値だけを正確に作り直す。"""
+    with zipfile.ZipFile(BytesIO(content), "r") as archive:
+        _, sheet_paths, date1904 = _xlsx_workbook_info(archive)
+        if DELIVERY_SHEET_NAME not in sheet_paths:
             raise ValueError("次回配達日シートが見つかりません。")
 
+        shared_strings = _xlsx_shared_strings(archive)
         target_customer = normalize_match_value(customer_name)
         target_product = normalize_match_value(product_name)
-        delivery_ws = workbook[DELIVERY_SHEET_NAME]
         active_rows = []
-        for row_number, values in enumerate(
-            delivery_ws.iter_rows(min_row=1, max_col=16, values_only=True),
-            start=1,
+        for row_number, values in _xlsx_iter_sheet_rows(
+            archive,
+            sheet_paths[DELIVERY_SHEET_NAME],
+            shared_strings,
+            max_col=16,
+            date1904=date1904,
+            date_columns={11, 13},
         ):
-            values = tuple(values or ())
             if normalize_match_value(values[1] if len(values) >= 2 else None) != target_customer:
                 continue
             if normalize_match_value(values[4] if len(values) >= 5 else None) != target_product:
@@ -6828,12 +7046,15 @@ def rebuild_changed_customer_product_record(
         predicted_usage = None
         if history_key is not None:
             states = []
-            if DELIVERY_HISTORY_SHEET_NAME in workbook.sheetnames:
-                history_ws = workbook[DELIVERY_HISTORY_SHEET_NAME]
-                for history_values in history_ws.iter_rows(
-                    min_row=2,
+            history_path = sheet_paths.get(DELIVERY_HISTORY_SHEET_NAME)
+            if history_path and history_path in archive.namelist():
+                for _, history_values in _xlsx_iter_sheet_rows(
+                    archive,
+                    history_path,
+                    shared_strings,
                     max_col=14,
-                    values_only=True,
+                    date1904=date1904,
+                    date_columns={11, 13},
                 ):
                     if delivery_history_identity(history_values) == history_key:
                         states.append(history_values)
@@ -6863,8 +7084,7 @@ def rebuild_changed_customer_product_record(
             }
         )
         return refreshed_record
-    finally:
-        workbook.close()
+
 
 
 def try_refresh_fast_dropbox_cache_for_changed_product(
@@ -7044,66 +7264,28 @@ def verify_saved_workbook_lightweight(
     required_sheets,
     changed_cells,
 ):
-    """保存後の確認項目はそのままに、読み取り専用で必要箇所だけ検証する。"""
-    verified = load_workbook(
-        BytesIO(saved_content),
-        keep_vba=False,
-        data_only=False,
-        read_only=True,
-    )
+    """openpyxlで再オープンせず、xlsm内XMLから従来と同じ確認項目を検証する。"""
     try:
-        if list(verified.sheetnames) != original_sheets:
-            raise ValueError("保存後にシート構成が変わったため、更新を中止しました。")
-        if not set(required_sheets).issubset(set(verified.sheetnames)):
-            raise ValueError("保存後の検証で必要なシートが見つかりません。")
+        with zipfile.ZipFile(BytesIO(saved_content), "r") as archive:
+            saved_sheets, sheet_paths, date1904 = _xlsx_workbook_info(archive)
+            if list(saved_sheets) != list(original_sheets):
+                raise ValueError("保存後にシート構成が変わったため、更新を中止しました。")
+            if not set(required_sheets).issubset(set(saved_sheets)):
+                raise ValueError("保存後の検証で必要なシートが見つかりません。")
+            if "xl/vbaProject.bin" not in archive.namelist():
+                raise ValueError("保存後の検証でVBAプロジェクトを確認できません。")
 
-        targets_by_sheet = {}
-        for sheet, row, column, expected in changed_cells:
-            targets_by_sheet.setdefault(sheet, {}).setdefault(int(row), {})[int(column)] = expected
-
-        for sheet, row_targets in targets_by_sheet.items():
-            if sheet not in verified.sheetnames:
-                raise ValueError(f"保存後の検証で{sheet}シートが見つかりません。")
-            ws = verified[sheet]
-            target_rows = sorted(row_targets)
-            min_row = target_rows[0]
-            max_row = target_rows[-1]
-            max_col = max(
-                column
-                for columns in row_targets.values()
-                for column in columns
+            shared_strings = _xlsx_shared_strings(archive)
+            _xlsx_verify_changed_cells(
+                archive,
+                sheet_paths,
+                shared_strings,
+                changed_cells,
+                date1904=date1904,
             )
-            seen_rows = set()
-            for row_number, values in enumerate(
-                ws.iter_rows(
-                    min_row=min_row,
-                    max_row=max_row,
-                    min_col=1,
-                    max_col=max_col,
-                    values_only=True,
-                ),
-                start=min_row,
-            ):
-                if row_number not in row_targets:
-                    continue
-                seen_rows.add(row_number)
-                values = tuple(values or ())
-                for column, expected in row_targets[row_number].items():
-                    actual = values[column - 1] if len(values) >= column else None
-                    if not same_excel_value(actual, expected):
-                        # 不一致時だけ座標名を取り直す。正常時の速度には影響しない。
-                        coordinate = ws.cell(row_number, column).coordinate
-                        raise ValueError(
-                            f"保存後の検証で{sheet}!{coordinate}の値が一致しません。"
-                        )
-            missing_rows = set(row_targets) - seen_rows
-            if missing_rows:
-                missing_row = min(missing_rows)
-                raise ValueError(
-                    f"保存後の検証で{sheet}の{missing_row}行目を確認できません。"
-                )
-    finally:
-        verified.close()
+    except zipfile.BadZipFile as exc:
+        raise ValueError("保存後の検証でExcelファイルを開けません。") from exc
+
 
 
 def copy_previous_delivery_state_to_history(
