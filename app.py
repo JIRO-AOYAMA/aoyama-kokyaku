@@ -8435,9 +8435,12 @@ def update_workbook_bytes(
                 proposed,
                 diagnostic_timings=diagnostic_timings,
             )
-        except Exception:
+        except Exception as exc:
             # PrivateテストのXML直接保存で少しでも問題があれば、
             # 本番で実績のある従来openpyxl方式へその場で戻す。
+            # 診断版では、フォールバック理由だけを保存時間診断へ残す。
+            if diagnostic_timings is not None:
+                diagnostic_timings["XML直接保存エラー"] = f"{type(exc).__name__}: {exc}"
             pass
     diagnostic_step_started = time.perf_counter()
     workbook = load_workbook(BytesIO(original_content), keep_vba=True, data_only=False, read_only=False)
@@ -8701,8 +8704,11 @@ def update_delivery_history_record_bytes(
                 proposed,
                 diagnostic_timings=diagnostic_timings,
             )
-        except Exception:
+        except Exception as exc:
             # 過去履歴以外・XML条件不一致・検証失敗は従来方式へ戻す。
+            # 診断版では、フォールバック理由だけを保存時間診断へ残す。
+            if diagnostic_timings is not None:
+                diagnostic_timings["XML直接保存エラー"] = f"{type(exc).__name__}: {exc}"
             pass
     diagnostic_step_started = time.perf_counter()
     workbook = load_workbook(
@@ -17865,6 +17871,9 @@ def show_customer_detail(df, customer_name):
             diagnostic_fast_error = diagnostic_timings.get("表示高速経路エラー")
             if diagnostic_fast_error:
                 st.write(f"**表示高速経路エラー：{diagnostic_fast_error}**")
+            diagnostic_xml_error = diagnostic_timings.get("XML直接保存エラー")
+            if diagnostic_xml_error:
+                st.write(f"**XML直接保存エラー：{diagnostic_xml_error}**")
             try:
                 diagnostic_save_seconds = float(success.get("diagnostic_save_seconds") or 0)
             except (TypeError, ValueError):
