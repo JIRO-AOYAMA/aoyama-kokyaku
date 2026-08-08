@@ -16100,8 +16100,7 @@ def show_customer_detail(df, customer_name):
                             st.toast("LINEを○にしました。")
                             st.rerun()
 
-    st.write(f"**地域：** {region}")
-    st.write(f"**コンサル：** {consultant}")
+    st.write(f"**地域：** {region}　　**コンサル：** {consultant}")
     st.write(f"**商品数：** {len(visible_detail)}件")
 
     success = st.session_state.pop("excel_save_success", None)
