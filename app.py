@@ -17716,6 +17716,84 @@ from app_modules.dispatch_excel import (
 )
 
 
+def read_dispatch_selected_month_sheet(excel_source, selected_month):
+    """
+    既存の配車表読み込みルールをそのまま使い、表示対象月の明細行だけを読む。
+
+    12か月すべてのシート存在確認とA～H列の見出し確認は従来どおり行う。
+    違いは、2行目以降の明細走査を selected_month の1シートだけに限定する点だけ。
+    """
+    selected_month = str(selected_month or "").strip()
+    if selected_month not in DISPATCH_MONTH_SHEETS:
+        raise ValueError(f"表示月が正しくありません：{selected_month}")
+
+    if isinstance(excel_source, BytesIO):
+        source = BytesIO(excel_source.getvalue())
+    else:
+        source = excel_source
+
+    workbook = load_workbook(source, read_only=True, data_only=True)
+    rows = []
+    try:
+        # 従来どおり、1月～12月がすべて存在することを確認する。
+        missing_sheets = [
+            name for name in DISPATCH_MONTH_SHEETS
+            if name not in workbook.sheetnames
+        ]
+        if missing_sheets:
+            raise ValueError("月別シートが見つかりません：" + "、".join(missing_sheets))
+
+        # 従来どおり、全12シートのA～H列見出しを確認する。
+        # 明細行はここでは読まないため、この確認は軽い。
+        for sheet_name in DISPATCH_MONTH_SHEETS:
+            ws = workbook[sheet_name]
+            headers = [
+                normalize_dispatch_text(ws.cell(1, column).value)
+                for column in range(1, 9)
+            ]
+            if headers != DISPATCH_REQUIRED_COLUMNS:
+                raise ValueError(
+                    f"{sheet_name}のA～H列の見出しが想定と異なります。\n"
+                    f"読み取った見出し：{' / '.join(headers)}"
+                )
+
+        # 明細行だけ、現在表示している月に限定して読む。
+        ws = workbook[selected_month]
+        for values in ws.iter_rows(min_row=2, max_col=8, values_only=True):
+            if not any(
+                value is not None and normalize_dispatch_text(value)
+                for value in values
+            ):
+                continue
+
+            record = dict(zip(DISPATCH_REQUIRED_COLUMNS, values))
+            record["参照シート"] = selected_month
+            rows.append(record)
+    finally:
+        workbook.close()
+
+    df = pd.DataFrame(
+        rows,
+        columns=DISPATCH_REQUIRED_COLUMNS + ["参照シート"],
+    )
+    if df.empty:
+        return df
+
+    # 以下の整形は従来の read_dispatch_month_sheets と同一。
+    for column in ["引取先", "商品名", "数量", "運送会社", "納品先"]:
+        df[column] = df[column].map(normalize_dispatch_text)
+
+    pickup_dates = pd.to_datetime(df["引取日"], errors="coerce")
+    arrival_dates = pd.to_datetime(df["着日"], errors="coerce")
+    df["_引取日"] = pickup_dates.map(
+        lambda value: value.date() if pd.notna(value) else None
+    )
+    df["_着日"] = arrival_dates.map(
+        lambda value: value.date() if pd.notna(value) else None
+    )
+    return df
+
+
 @st.cache_data(ttl=60, show_spinner=False)
 def get_cached_dispatch_dropbox_content():
     access_token = get_dropbox_access_token()
@@ -17746,6 +17824,39 @@ def load_dispatch_board_data():
             message += f"\nDropbox取得エラー：{dropbox_error}"
         raise FileNotFoundError(message)
     return read_dispatch_month_sheets(local_path)
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def load_dispatch_board_month_data(selected_month):
+    """
+    配車表画面専用。表示中の月だけを読み、失敗した場合は従来の全月読み込みへ戻す。
+    """
+    selected_month = str(selected_month or "").strip()
+    if selected_month not in DISPATCH_MONTH_SHEETS:
+        return load_dispatch_board_data()
+
+    if has_dropbox_auth_config():
+        try:
+            return read_dispatch_selected_month_sheet(
+                BytesIO(get_cached_dispatch_dropbox_content()),
+                selected_month,
+            )
+        except Exception:
+            # 高速経路だけの問題で配車表を止めない。従来処理へ安全に切り戻す。
+            full_df = load_dispatch_board_data()
+            return full_df[full_df["参照シート"] == selected_month].copy()
+
+    local_path = Path(str(DISPATCH_LOCAL_FILE or "").strip())
+    if not local_path.exists():
+        # エラー文やDropboxフォールバックを含め、従来関数へ任せる。
+        full_df = load_dispatch_board_data()
+        return full_df[full_df["参照シート"] == selected_month].copy()
+
+    try:
+        return read_dispatch_selected_month_sheet(local_path, selected_month)
+    except Exception:
+        full_df = load_dispatch_board_data()
+        return full_df[full_df["参照シート"] == selected_month].copy()
 
 
 def dispatch_date_label(value):
@@ -18382,13 +18493,19 @@ def show_dispatch_board():
     )
     st.caption("配車表1.xlsmの月別シートを、元のExcelに近い一覧で表示します。")
 
-    with st.spinner("配車表を読み込んでいます…"):
-        df = load_dispatch_board_data()
-    if df.empty:
-        st.warning("1月～12月シートに表示できるデータがありません。")
-        return
-
     selected_month = get_dispatch_table_month_name()
+    with st.spinner("配車表を読み込んでいます…"):
+        df = load_dispatch_board_month_data(selected_month)
+
+    if df.empty:
+        # 従来は全12か月を読んだ結果が空の時だけこの警告を出していた。
+        # 表示月だけが空の場合との区別を保つため、その場合だけ従来処理で確認する。
+        full_df = load_dispatch_board_data()
+        if full_df.empty:
+            st.warning("1月～12月シートに表示できるデータがありません。")
+            return
+        df = full_df[full_df["参照シート"] == selected_month].copy()
+
     show_dispatch_table_month_switcher(df, selected_month, key_suffix="top")
 
     month_df = df[df["参照シート"] == selected_month].copy()
