@@ -6448,6 +6448,13 @@ def trim_old_dropbox_backups(access_token, keep=30):
     return "削除できなかった古いバックアップ: " + ", ".join(warnings) if warnings else ""
 
 
+def _trim_old_dropbox_backups_timed(access_token, keep=30):
+    """バックアップ整理の既存処理をそのまま実行し、実処理時間だけ返す。"""
+    started = time.perf_counter()
+    warning = trim_old_dropbox_backups(access_token, keep=keep)
+    return warning, time.perf_counter() - started
+
+
 def normalize_match_value(value):
     return clean_value(value, blank_text="").strip()
 
@@ -9075,24 +9082,34 @@ def save_customer_excel_changes(customer_name, product_name, proposed):
     )
     diagnostic_timings["保存結果確認"] = time.perf_counter() - diagnostic_step_started
 
-    # Use the already verified local bytes to rebuild the immediate-display JSON.
-    diagnostic_step_started = time.perf_counter()
-    cache_warning = refresh_fast_dropbox_cache_after_save(
-        saved_content,
-        confirmed_revision,
-        access_token,
-        previous_revision=revision,
-        customer_name=customer_name,
-        product_name=product_name,
-        changed_cells=changed_cells,
-        diagnostic_timings=diagnostic_timings,
-    )
-    diagnostic_timings["表示用データ更新"] = time.perf_counter() - diagnostic_step_started
+    # 本番Excelの保存・検証は完了済み。
+    # 以降の「表示用JSON更新」と「古いバックアップ整理」は別ファイル/別フォルダの処理なので、
+    # バックアップ保持数30件という既存ルールを変えず、待ち時間だけ重ねる。
+    with ThreadPoolExecutor(max_workers=1) as cleanup_executor:
+        cleanup_future = cleanup_executor.submit(
+            _trim_old_dropbox_backups_timed,
+            access_token,
+            30,
+        )
 
-    # Keep the existing exact rule: retain the newest 30 backups.
-    diagnostic_step_started = time.perf_counter()
-    cleanup_warning = trim_old_dropbox_backups(access_token, keep=30)
-    diagnostic_timings["バックアップ整理"] = time.perf_counter() - diagnostic_step_started
+        # Use the already verified local bytes to rebuild the immediate-display JSON.
+        diagnostic_step_started = time.perf_counter()
+        cache_warning = refresh_fast_dropbox_cache_after_save(
+            saved_content,
+            confirmed_revision,
+            access_token,
+            previous_revision=revision,
+            customer_name=customer_name,
+            product_name=product_name,
+            changed_cells=changed_cells,
+            diagnostic_timings=diagnostic_timings,
+        )
+        diagnostic_timings["表示用データ更新"] = time.perf_counter() - diagnostic_step_started
+
+        # Keep the existing exact rule: retain the newest 30 backups.
+        cleanup_warning, cleanup_seconds = cleanup_future.result()
+        diagnostic_timings["バックアップ整理"] = cleanup_seconds
+
     warnings = [warning for warning in (cleanup_warning, cache_warning) if warning]
     # 在庫保存では顧客Excelに関係するキャッシュだけを更新する。
     # 他機能のキャッシュを残し、保存直後の画面再表示を軽くする。
@@ -9412,22 +9429,33 @@ def save_customer_delivery_history_correction(
     )
     diagnostic_timings["保存結果確認"] = time.perf_counter() - diagnostic_step_started
 
-    # 過去履歴の訂正でも予想使用量が変わるため、表示用JSONを必ず作り直す。
-    diagnostic_step_started = time.perf_counter()
-    cache_warning = refresh_fast_dropbox_cache_after_save(
-        saved_content,
-        confirmed_revision,
-        access_token,
-        previous_revision=revision,
-        customer_name=customer_name,
-        product_name=product_name,
-        changed_cells=changed_cells,
-        diagnostic_timings=diagnostic_timings,
-    )
-    diagnostic_timings["表示用データ更新"] = time.perf_counter() - diagnostic_step_started
-    diagnostic_step_started = time.perf_counter()
-    cleanup_warning = trim_old_dropbox_backups(access_token, keep=30)
-    diagnostic_timings["バックアップ整理"] = time.perf_counter() - diagnostic_step_started
+    # 本番Excelの保存・検証は完了済み。
+    # 納品履歴訂正でも、表示用JSON更新と古いバックアップ整理の待ち時間だけを重ねる。
+    # バックアップ保持数30件・表示内容・保存結果の確認ルールは変えない。
+    with ThreadPoolExecutor(max_workers=1) as cleanup_executor:
+        cleanup_future = cleanup_executor.submit(
+            _trim_old_dropbox_backups_timed,
+            access_token,
+            30,
+        )
+
+        # 過去履歴の訂正でも予想使用量が変わるため、表示用JSONを必ず作り直す。
+        diagnostic_step_started = time.perf_counter()
+        cache_warning = refresh_fast_dropbox_cache_after_save(
+            saved_content,
+            confirmed_revision,
+            access_token,
+            previous_revision=revision,
+            customer_name=customer_name,
+            product_name=product_name,
+            changed_cells=changed_cells,
+            diagnostic_timings=diagnostic_timings,
+        )
+        diagnostic_timings["表示用データ更新"] = time.perf_counter() - diagnostic_step_started
+
+        cleanup_warning, cleanup_seconds = cleanup_future.result()
+        diagnostic_timings["バックアップ整理"] = cleanup_seconds
+
     warnings = [warning for warning in (cleanup_warning, cache_warning) if warning]
     # 納品履歴の訂正でも、顧客Excelに関係するキャッシュだけを更新する。
     # 写真・メモ・OneDrive・配車表・取引先など、納品履歴修正と無関係な
