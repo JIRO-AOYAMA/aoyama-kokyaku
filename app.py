@@ -7161,7 +7161,11 @@ def try_refresh_fast_dropbox_cache_for_changed_product(
     product_name,
     display_patch=None,
 ):
-    """直前revと一致する表示用JSONがある時だけ、変更した1商品を差し替える。"""
+    """保存直前revと一致するJSONを土台に、保存直後の画面表示だけを軽く更新する。
+
+    Dropbox上のJSON自体はここでは更新しない。次の通常読み込み時に既存のrev比較で
+    Excel変更が検出され、従来どおり最新ExcelからJSONが再生成される。
+    """
     cache_content, _ = download_dropbox_file(
         DROPBOX_FAST_CACHE_FILE,
         access_token,
@@ -7179,17 +7183,36 @@ def try_refresh_fast_dropbox_cache_for_changed_product(
     if not isinstance(records, list) or not records:
         return None
 
-    base_df = recalculate_customer_inventory_for_today(pd.DataFrame(records))
+    # JSONは保存直前のExcelと同じrevであることを上で確認済み。
+    # 全顧客を再計算せず、今表示している顧客の行だけ従来と同じ計算を行う。
+    base_df = pd.DataFrame(records)
     target_customer = normalize_match_value(customer_name)
     target_product = normalize_match_value(product_name)
-    matching_indexes = [
+    customer_indexes = [
         index
         for index, row in base_df.iterrows()
         if normalize_match_value(row.get("顧客名")) == target_customer
-        and normalize_match_value(row.get("商品名")) == target_product
+    ]
+    matching_indexes = [
+        index
+        for index in customer_indexes
+        if normalize_match_value(base_df.loc[index].get("商品名")) == target_product
     ]
     if len(matching_indexes) != 1:
         return None
+
+    required_columns = {"使用数量/日", "kg/本", "配達日", "_配達数量"}
+    if required_columns.issubset(base_df.columns):
+        for index in customer_indexes:
+            row = base_df.loc[index]
+            delivery_values = [None] * 12
+            delivery_values[6] = row.get("使用数量/日")
+            delivery_values[9] = row.get("kg/本")
+            delivery_values[10] = row.get("配達日")
+            delivery_values[11] = row.get("_配達数量")
+            next_delivery, remaining = calculate_delivery_values(delivery_values)
+            base_df.at[index, "次回配達予定"] = next_delivery
+            base_df.at[index, "残数"] = remaining
 
     target_index = matching_indexes[0]
     refreshed_record = None
@@ -7200,7 +7223,7 @@ def try_refresh_fast_dropbox_cache_for_changed_product(
             refreshed_record = dict(base_df.loc[target_index].to_dict())
             refreshed_record.update(display_patch)
 
-    # 表示用パッチを安全に使えない時だけ、従来どおり保存済みxlsmを読み直す。
+    # 表示用パッチを安全に使えない時だけ、保存済みxlsmのXMLから対象1件を再構築する。
     if not isinstance(refreshed_record, dict):
         refreshed_record = rebuild_changed_customer_product_record(
             content,
@@ -7224,13 +7247,17 @@ def refresh_fast_dropbox_cache_after_save(
     product_name="",
     display_patch=None,
 ):
-    """保存直後の表示用JSONを更新する。安全に差分更新できない時は従来の全体再生成へ戻す。"""
+    """保存直後の画面表示だけを更新し、重いJSON再生成は次の通常読み込みへ任せる。
+
+    Excel本体はこの関数に来る前に保存・検証済み。Dropboxの表示用JSONは意図的に
+    保存直前revのまま残すため、次回load_fast_dropbox_data()が既存ルールどおり
+    rev不一致を検出し、最新ExcelからJSONを再生成する。
+    """
     try:
         refreshed_df = None
 
         # 保存直前のExcel revと既存JSONのrevが完全一致する場合だけ、
-        # 変更した顧客・商品1行の差分更新を使う。
-        # 条件が1つでも合わない場合は、従来どおりExcel全体から作り直す。
+        # そのJSONを土台に変更した顧客・商品を差分更新する。
         if previous_revision and customer_name and product_name:
             try:
                 refreshed_df = try_refresh_fast_dropbox_cache_for_changed_product(
@@ -7244,43 +7271,18 @@ def refresh_fast_dropbox_cache_after_save(
             except Exception:
                 refreshed_df = None
 
+        # 安全に差分更新できない場合だけ、従来どおり保存済みExcel全体から作り直す。
         if not isinstance(refreshed_df, pd.DataFrame) or refreshed_df.empty:
             refreshed_df = rebuild_sheet1_from_formula_references(BytesIO(content))
         if refreshed_df.empty:
             return "保存は完了しましたが、表示用キャッシュを更新できませんでした。更新ボタンを押してください。"
 
-        # Dropbox側の更新番号やJSONの反映待ちに左右されず、保存直後の1回目の
-        # 再表示では、今保存したExcelから作った最新データをそのまま使用する。
-        # 次の画面実行で1度だけ取り出し、その後は従来どおりDropboxキャッシュを使う。
+        # 保存直後の1回目は、今保存した内容を反映したDataFrameをそのまま表示する。
+        # Dropbox上のJSONはここでは更新しない。次の通常読み込み時にrev差で自動再生成される。
         st.session_state["customer_excel_immediate_df"] = refreshed_df.copy()
-
-        records = json.loads(
-            refreshed_df.to_json(
-                orient="records",
-                date_format="iso",
-                force_ascii=False,
-            )
-        )
-        cache_payload = json.dumps(
-            {
-                "cache_version": DROPBOX_FAST_CACHE_VERSION,
-                "excel_revision": excel_revision,
-                "records": records,
-            },
-            ensure_ascii=False,
-            separators=(",", ":"),
-        ).encode("utf-8")
-        cache_response = upload_dropbox_file(
-            DROPBOX_FAST_CACHE_FILE,
-            cache_payload,
-            access_token,
-            mode="overwrite",
-        )
-        if cache_response.status_code != 200:
-            return "保存は完了しましたが、表示用キャッシュを更新できませんでした。更新ボタンを押してください。"
         return ""
     except Exception:
-        # 本番Excelの保存と検証は完了しているため、キャッシュ更新失敗だけで保存失敗にはしない。
+        # 本番Excelの保存と検証は完了しているため、表示更新失敗だけで保存失敗にはしない。
         return "保存は完了しましたが、表示用キャッシュを更新できませんでした。更新ボタンを押してください。"
 
 
