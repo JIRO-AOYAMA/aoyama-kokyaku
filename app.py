@@ -7260,6 +7260,199 @@ def _xlsx_matching_history_states_lightweight(
     return states
 
 
+
+def _xlsx_fast_row_cell_bytes(row_body, row_number, column_letter):
+    """表示用の読み取り専用高速経路。1行XMLから指定セル部分だけを取り出す。"""
+    marker = f'r="{column_letter}{int(row_number)}"'.encode("ascii")
+    marker_pos = row_body.find(marker)
+    if marker_pos < 0:
+        return None, None
+
+    cell_start = row_body.rfind(b"<c", 0, marker_pos)
+    if cell_start < 0:
+        raise ValueError("セル開始位置を確認できません。")
+
+    open_end = row_body.find(b">", marker_pos)
+    if open_end < 0:
+        raise ValueError("セル開始タグを確認できません。")
+
+    attributes = row_body[cell_start + 2:open_end]
+    if row_body[open_end - 1:open_end] == b"/":
+        return attributes, b""
+
+    cell_end = row_body.find(b"</c>", open_end + 1)
+    if cell_end < 0:
+        raise ValueError("セル終了位置を確認できません。")
+    return attributes, row_body[open_end + 1:cell_end]
+
+
+def _xlsx_fast_cell_value_from_bytes(
+    attributes,
+    cell_body,
+    shared_strings,
+    date1904=False,
+    force_date=False,
+):
+    """既存の_xlsx_cell_valueと同じ値を、読み取り専用でセル断片から復元する。"""
+    if attributes is None:
+        return None
+
+    formula_match = re.search(rb"<f(?:\s[^>]*)?>(.*?)</f>", cell_body, flags=re.S)
+    if formula_match is not None:
+        return "=" + html.unescape(formula_match.group(1).decode("utf-8"))
+
+    type_match = re.search(rb'\bt="([^"]+)"', attributes)
+    cell_type = type_match.group(1).decode("ascii") if type_match else ""
+
+    if cell_type == "inlineStr":
+        text_parts = re.findall(
+            rb"<t(?:\s[^>]*)?>(.*?)</t>",
+            cell_body,
+            flags=re.S,
+        )
+        return "".join(
+            html.unescape(part.decode("utf-8"))
+            for part in text_parts
+        )
+
+    value_match = re.search(rb"<v>(.*?)</v>", cell_body, flags=re.S)
+    if value_match is None:
+        return None
+    value_text = html.unescape(value_match.group(1).decode("utf-8"))
+
+    if cell_type == "s":
+        try:
+            return shared_strings[int(value_text)]
+        except Exception:
+            return None
+    if cell_type == "b":
+        return value_text.strip() == "1"
+    if cell_type in {"str", "e"}:
+        return value_text
+    if cell_type == "d":
+        try:
+            return datetime.fromisoformat(value_text.replace("Z", "+00:00"))
+        except Exception:
+            return value_text
+
+    try:
+        number = float(value_text)
+    except Exception:
+        return value_text
+    if force_date:
+        try:
+            return _xlsx_excel_datetime(number, date1904=date1904)
+        except Exception:
+            return number
+    return int(number) if number.is_integer() else number
+
+
+def _xlsx_matching_history_states_readonly_fast(
+    archive,
+    sheet_path,
+    shared_strings,
+    history_key,
+    date1904=False,
+):
+    """
+    配達履歴を表示用に読むだけの高速経路。
+
+    Excel本体は一切書き換えない。想定外のXML形式なら例外にして、呼び出し元で
+    従来のElementTree流し読みへそのまま戻す。
+    """
+    history_xml = archive.read(sheet_path)
+    row_parts = history_xml.split(b"<row ")
+    if len(row_parts) <= 1:
+        raise ValueError("高速表示用の行形式を確認できません。")
+
+    states = []
+    parsed_rows = 0
+    row_number_pattern = re.compile(rb'\br="([0-9]+)"')
+
+    for row_part in row_parts[1:]:
+        attributes_end = row_part.find(b">")
+        row_end = row_part.find(b"</row>", attributes_end + 1)
+        if attributes_end < 0 or row_end < 0:
+            raise ValueError("高速表示用の行構造を確認できません。")
+
+        row_attributes = row_part[:attributes_end]
+        row_body = row_part[attributes_end + 1:row_end]
+        row_match = row_number_pattern.search(row_attributes)
+        if row_match is None:
+            raise ValueError("高速表示用の行番号を確認できません。")
+        row_number = int(row_match.group(1))
+        parsed_rows += 1
+
+        identity_values = [None] * 14
+        for column_letter, value_index in (("A", 0), ("B", 1), ("E", 4)):
+            cell_attributes, cell_body = _xlsx_fast_row_cell_bytes(
+                row_body,
+                row_number,
+                column_letter,
+            )
+            identity_values[value_index] = _xlsx_fast_cell_value_from_bytes(
+                cell_attributes,
+                cell_body,
+                shared_strings,
+                date1904=date1904,
+                force_date=False,
+            )
+
+        if delivery_history_identity(identity_values) != history_key:
+            continue
+
+        values = list(identity_values)
+        for column_letter, value_index, force_date in (
+            ("H", 7, False),
+            ("I", 8, False),
+            ("J", 9, False),
+            ("K", 10, True),
+        ):
+            cell_attributes, cell_body = _xlsx_fast_row_cell_bytes(
+                row_body,
+                row_number,
+                column_letter,
+            )
+            values[value_index] = _xlsx_fast_cell_value_from_bytes(
+                cell_attributes,
+                cell_body,
+                shared_strings,
+                date1904=date1904,
+                force_date=force_date,
+            )
+        states.append(tuple(values))
+
+    if parsed_rows <= 0:
+        raise ValueError("高速表示用の履歴行を確認できません。")
+    return states
+
+
+def _xlsx_matching_history_states_for_display(
+    archive,
+    sheet_path,
+    shared_strings,
+    history_key,
+    date1904=False,
+):
+    """表示専用。高速読込が使えない時は従来処理へ完全に戻す。"""
+    try:
+        return _xlsx_matching_history_states_readonly_fast(
+            archive,
+            sheet_path,
+            shared_strings,
+            history_key,
+            date1904=date1904,
+        )
+    except Exception:
+        return _xlsx_matching_history_states_lightweight(
+            archive,
+            sheet_path,
+            shared_strings,
+            history_key,
+            date1904=date1904,
+        )
+
+
 def rebuild_changed_customer_product_record(
     content,
     customer_name,
@@ -7292,7 +7485,7 @@ def rebuild_changed_customer_product_record(
                 if not history_path or history_path not in archive.namelist():
                     raise ValueError("配達履歴シートが見つかりません。")
                 shared_strings = _xlsx_shared_strings(archive)
-                states = _xlsx_matching_history_states_lightweight(
+                states = _xlsx_matching_history_states_for_display(
                     archive,
                     history_path,
                     shared_strings,
