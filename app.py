@@ -7568,6 +7568,856 @@ def copy_previous_delivery_state_to_history(
     changed_cells.append((MANAGEMENT_SHEET_NAME, 8, 2, history_count))
 
 
+def is_test_xml_fast_save_enabled():
+    """Privateテスト環境で明示的に有効化した時だけXML直接保存を使う。"""
+    try:
+        value = st.secrets.get("TEST_XML_FAST_SAVE", False)
+    except Exception:
+        return False
+    if isinstance(value, bool):
+        return value
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+class _XmlFastSaveUnavailable(Exception):
+    """安全にXML直接保存できない条件では従来方式へ戻すための内部例外。"""
+
+
+def _xml_fast_root_start_tag(xml_bytes):
+    """XML宣言の直後にあるルート要素の開始タグを返す。"""
+    match = re.search(br"<([A-Za-z_][\\w:.-]*)(?:\\s[^>]*)?>", bytes(xml_bytes or b""))
+    return match
+
+
+def _xml_fast_register_original_namespaces(original_xml):
+    """元XMLのnamespace prefixをElementTreeへ登録し、既存prefixを極力維持する。"""
+    match = _xml_fast_root_start_tag(original_xml)
+    if not match:
+        return
+    start_tag = match.group(0)
+    namespace_pattern = re.compile(
+        br"\\s+xmlns(?::([A-Za-z_][\\w.-]*))?=(?:\"([^\"]*)\"|'([^']*)')"
+    )
+    for namespace_match in namespace_pattern.finditer(start_tag):
+        prefix = (namespace_match.group(1) or b"").decode("utf-8", errors="ignore")
+        uri_bytes = namespace_match.group(2) or namespace_match.group(3) or b""
+        uri = uri_bytes.decode("utf-8", errors="ignore")
+        if not uri:
+            continue
+        try:
+            ET.register_namespace(prefix, uri)
+        except Exception:
+            pass
+
+
+def _xml_fast_serialize(root, original_xml):
+    """未知の拡張要素を保持しつつ、元XMLのnamespace宣言も残してシリアライズする。"""
+    original_xml = bytes(original_xml or b"")
+    _xml_fast_register_original_namespaces(original_xml)
+    serialized = ET.tostring(root, encoding="utf-8", xml_declaration=True)
+
+    original_match = _xml_fast_root_start_tag(original_xml)
+    serialized_match = _xml_fast_root_start_tag(serialized)
+    if not original_match or not serialized_match:
+        return serialized
+
+    original_start = original_match.group(0)
+    serialized_start = serialized_match.group(0)
+    declaration_pattern = re.compile(
+        br"\\s+xmlns(?::[A-Za-z_][\\w.-]*)?=(?:\"[^\"]*\"|'[^']*')"
+    )
+    additions = []
+    for declaration in declaration_pattern.findall(original_start):
+        name = declaration.strip().split(b"=", 1)[0]
+        if name + b"=" not in serialized_start:
+            additions.append(declaration)
+    if not additions:
+        return serialized
+
+    new_start = serialized_start[:-1] + b"".join(additions) + serialized_start[-1:]
+    return (
+        serialized[: serialized_match.start()]
+        + new_start
+        + serialized[serialized_match.end() :]
+    )
+
+
+def _xml_fast_rebuild_zip(original_content, replacements):
+    """指定XMLだけ差し替え、その他のxlsm内部ファイルは元バイトをそのままコピーする。"""
+    output = BytesIO()
+    with zipfile.ZipFile(BytesIO(original_content), "r") as source_archive:
+        with zipfile.ZipFile(output, "w") as target_archive:
+            for info in source_archive.infolist():
+                payload = replacements.get(info.filename)
+                if payload is None:
+                    payload = source_archive.read(info.filename)
+                target_archive.writestr(info, payload)
+    return output.getvalue()
+
+
+def _xml_fast_find_row(sheet_root, row_number):
+    main_ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+    sheet_data = sheet_root.find(f"{{{main_ns}}}sheetData")
+    if sheet_data is None:
+        return None
+    target = int(row_number)
+    for row in sheet_data.findall(f"{{{main_ns}}}row"):
+        try:
+            current = int(row.attrib.get("r") or 0)
+        except Exception:
+            current = 0
+        if current == target:
+            return row
+    return None
+
+
+def _xml_fast_cell_in_row(row, column_number):
+    if row is None:
+        return None
+    main_ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+    for cell in row.findall(f"{{{main_ns}}}c"):
+        if _xlsx_column_number_from_reference(cell.attrib.get("r")) == int(column_number):
+            return cell
+    return None
+
+
+def _xml_fast_cell_value(
+    cell,
+    shared_strings,
+    date1904=False,
+    force_date=False,
+    formula_cache=False,
+):
+    """通常値または数式の保存済みキャッシュ値をXMLからPython値へ戻す。"""
+    if cell is None:
+        return None
+    main_ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+    formula = cell.find(f"{{{main_ns}}}f")
+    if formula is not None and not formula_cache:
+        return "=" + str(formula.text or "")
+
+    cell_type = str(cell.attrib.get("t") or "")
+    if cell_type == "inlineStr":
+        inline = cell.find(f"{{{main_ns}}}is")
+        if inline is None:
+            return ""
+        return "".join(node.text or "" for node in inline.iter(f"{{{main_ns}}}t"))
+
+    value_node = cell.find(f"{{{main_ns}}}v")
+    value_text = value_node.text if value_node is not None else None
+    if value_text is None:
+        return None
+    if cell_type == "s":
+        try:
+            return shared_strings[int(value_text)]
+        except Exception:
+            return None
+    if cell_type == "b":
+        return str(value_text).strip() == "1"
+    if cell_type in {"str", "e"}:
+        return str(value_text)
+    if cell_type == "d":
+        try:
+            return datetime.fromisoformat(str(value_text).replace("Z", "+00:00"))
+        except Exception:
+            return str(value_text)
+
+    try:
+        number = float(value_text)
+    except Exception:
+        return str(value_text)
+    if force_date:
+        try:
+            return _xlsx_excel_datetime(number, date1904=date1904)
+        except Exception:
+            return number
+    return int(number) if number.is_integer() else number
+
+
+def _xml_fast_row_values(
+    row,
+    shared_strings,
+    max_col=16,
+    date1904=False,
+    date_columns=None,
+    formula_cache=False,
+):
+    date_columns = set(date_columns or ())
+    values = [None] * int(max_col)
+    if row is None:
+        return tuple(values)
+    main_ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+    for cell in row.findall(f"{{{main_ns}}}c"):
+        column_number = _xlsx_column_number_from_reference(cell.attrib.get("r"))
+        if column_number < 1 or column_number > max_col:
+            continue
+        values[column_number - 1] = _xml_fast_cell_value(
+            cell,
+            shared_strings,
+            date1904=date1904,
+            force_date=column_number in date_columns,
+            formula_cache=formula_cache,
+        )
+    return tuple(values)
+
+
+def _xml_fast_excel_serial(value, date1904=False):
+    if isinstance(value, date) and not isinstance(value, datetime):
+        value = datetime.combine(value, datetime.min.time())
+    if not isinstance(value, datetime):
+        raise TypeError("Excel日付へ変換できない値です。")
+    if value.tzinfo is not None:
+        value = value.replace(tzinfo=None)
+    epoch = datetime(1904, 1, 1) if date1904 else datetime(1899, 12, 30)
+    delta = value - epoch
+    return delta.days + (delta.seconds + delta.microseconds / 1_000_000) / 86400
+
+
+def _xml_fast_insert_cell_sorted(row, cell, column_number):
+    main_ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+    for index, other in enumerate(list(row)):
+        if other.tag != f"{{{main_ns}}}c":
+            continue
+        other_column = _xlsx_column_number_from_reference(other.attrib.get("r"))
+        if other_column > int(column_number):
+            row.insert(index, cell)
+            return
+    row.append(cell)
+
+
+def _xml_fast_set_cell_value(
+    row,
+    row_number,
+    column_number,
+    value,
+    date1904=False,
+    date_style=None,
+):
+    """既存styleを保持し、値だけをExcel XMLへ書く。新規日付は履歴の既存日付styleを継承する。"""
+    main_ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+    cell = _xml_fast_cell_in_row(row, column_number)
+    if cell is None:
+        cell = ET.Element(
+            f"{{{main_ns}}}c",
+            {"r": _xlsx_cell_reference(row_number, column_number)},
+        )
+        _xml_fast_insert_cell_sorted(row, cell, column_number)
+
+    if isinstance(value, (date, datetime)) and date_style and not cell.attrib.get("s"):
+        cell.attrib["s"] = str(date_style)
+
+    for child in list(cell):
+        cell.remove(child)
+    cell.attrib.pop("t", None)
+
+    if value is None:
+        return cell
+    if isinstance(value, bool):
+        cell.attrib["t"] = "b"
+        ET.SubElement(cell, f"{{{main_ns}}}v").text = "1" if value else "0"
+        return cell
+    if isinstance(value, (date, datetime)):
+        serial = _xml_fast_excel_serial(value, date1904=date1904)
+        cell.attrib["t"] = "n"
+        ET.SubElement(cell, f"{{{main_ns}}}v").text = (
+            str(int(serial)) if float(serial).is_integer() else str(serial)
+        )
+        return cell
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        if isinstance(value, float) and not math.isfinite(value):
+            raise ValueError("有限でない数値はExcelへ保存できません。")
+        cell.attrib["t"] = "n"
+        number_text = str(int(value)) if isinstance(value, float) and value.is_integer() else str(value)
+        ET.SubElement(cell, f"{{{main_ns}}}v").text = number_text
+        return cell
+
+    text = str(value)
+    if text.startswith("="):
+        formula = ET.SubElement(cell, f"{{{main_ns}}}f")
+        formula.text = text[1:]
+        ET.SubElement(cell, f"{{{main_ns}}}v")
+        return cell
+
+    cell.attrib["t"] = "inlineStr"
+    inline = ET.SubElement(cell, f"{{{main_ns}}}is")
+    text_node = ET.SubElement(inline, f"{{{main_ns}}}t")
+    if text[:1].isspace() or text[-1:].isspace():
+        text_node.attrib["{http://www.w3.org/XML/1998/namespace}space"] = "preserve"
+    text_node.text = text
+    return cell
+
+
+def _xml_fast_clear_formula_caches(row):
+    """変更行の数式は式を残し、古い計算済み値だけ空にしてExcel再計算へ任せる。"""
+    if row is None:
+        return
+    main_ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+    for cell in row.findall(f"{{{main_ns}}}c"):
+        if cell.find(f"{{{main_ns}}}f") is None:
+            continue
+        value_node = cell.find(f"{{{main_ns}}}v")
+        if value_node is None:
+            value_node = ET.SubElement(cell, f"{{{main_ns}}}v")
+        value_node.text = None
+
+
+def _xml_fast_update_dimension(sheet_root, last_row):
+    main_ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+    dimension = sheet_root.find(f"{{{main_ns}}}dimension")
+    if dimension is None:
+        return
+    current = str(dimension.attrib.get("ref") or "")
+    if ":" not in current:
+        return
+    first, last = current.split(":", 1)
+    match = re.match(r"^([A-Za-z]+)", last)
+    last_column = match.group(1) if match else "A"
+    dimension.attrib["ref"] = f"{first}:{last_column}{int(last_row)}"
+
+
+def _xml_fast_find_recent_date_style(sheet_data, column_number):
+    if sheet_data is None:
+        return None
+    main_ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+    rows = sheet_data.findall(f"{{{main_ns}}}row")
+    for row in reversed(rows):
+        cell = _xml_fast_cell_in_row(row, column_number)
+        if cell is not None and cell.attrib.get("s"):
+            return cell.attrib.get("s")
+    return None
+
+
+def _xml_fast_patch_recalculation(workbook_root):
+    main_ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+    calculation = workbook_root.find(f"{{{main_ns}}}calcPr")
+    if calculation is None:
+        calculation = ET.SubElement(workbook_root, f"{{{main_ns}}}calcPr")
+    calculation.attrib["calcMode"] = "auto"
+    calculation.attrib["fullCalcOnLoad"] = "1"
+    calculation.attrib["forceFullCalc"] = "1"
+
+
+def _xml_fast_validate_vba_unchanged(original_vba, saved_content):
+    try:
+        with zipfile.ZipFile(BytesIO(saved_content), "r") as archive:
+            saved_vba = archive.read("xl/vbaProject.bin")
+    except (KeyError, zipfile.BadZipFile) as exc:
+        raise ValueError("保存後の検証でVBAプロジェクトを確認できません。") from exc
+    if saved_vba != original_vba:
+        raise ValueError("保存後にVBAプロジェクトが変化したため、更新を中止しました。")
+
+
+def _xml_fast_find_active_product_row(
+    delivery_root,
+    shared_strings,
+    customer_name,
+    product_name,
+    date1904=False,
+):
+    main_ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+    sheet_data = delivery_root.find(f"{{{main_ns}}}sheetData")
+    if sheet_data is None:
+        raise _XmlFastSaveUnavailable("次回配達日シートのデータを確認できません。")
+
+    matched_rows = []
+    active_rows = []
+    for row in sheet_data.findall(f"{{{main_ns}}}row"):
+        values = _xml_fast_row_values(
+            row,
+            shared_strings,
+            max_col=7,
+            date1904=date1904,
+            date_columns=(),
+        )
+        if (
+            normalize_match_value(values[1]) == customer_name
+            and normalize_match_value(values[4]) == product_name
+        ):
+            row_number = int(row.attrib.get("r") or 0)
+            matched_rows.append(row_number)
+            if not is_blank_or_zero(values[6]):
+                active_rows.append(row_number)
+
+    if not matched_rows:
+        raise ValueError("顧客名・商品名が一致する行が見つかりません。")
+    if len(active_rows) > 1:
+        raise ValueError("同じ顧客名・商品名の行が複数見つかりました。確認してください。")
+    if not active_rows:
+        raise ValueError("使用数量/日に値が入っている行が見つからないため編集できません。")
+    return active_rows[0]
+
+
+def _xml_fast_next_history_row(history_root, shared_strings, date1904=False):
+    main_ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+    sheet_data = history_root.find(f"{{{main_ns}}}sheetData")
+    if sheet_data is None:
+        raise _XmlFastSaveUnavailable("配達履歴シートのデータを確認できません。")
+    last_nonblank_row = 1
+    for row in sheet_data.findall(f"{{{main_ns}}}row"):
+        first_cell = _xml_fast_cell_in_row(row, 1)
+        value = _xml_fast_cell_value(
+            first_cell,
+            shared_strings,
+            date1904=date1904,
+        )
+        if not is_blank_excel_value(value):
+            last_nonblank_row = max(last_nonblank_row, int(row.attrib.get("r") or 0))
+    return last_nonblank_row + 1, sheet_data
+
+
+def _update_workbook_bytes_xml_fast(
+    original_content,
+    customer_name,
+    product_name,
+    proposed,
+    diagnostic_timings=None,
+):
+    """Privateテスト用。既存xlsmの必要XMLだけを書き換え、VBA等は元バイトのまま保持する。"""
+    initial_started = time.perf_counter()
+    replacements = {}
+    changed_cells = []
+
+    with zipfile.ZipFile(BytesIO(original_content), "r") as archive:
+        original_sheets, sheet_paths, date1904 = _xlsx_workbook_info(archive)
+        required_sheets = {
+            DELIVERY_SHEET_NAME,
+            SHEET_NAME,
+            DELIVERY_HISTORY_SHEET_NAME,
+            MANAGEMENT_SHEET_NAME,
+        }
+        if not required_sheets.issubset(set(original_sheets)):
+            raise _XmlFastSaveUnavailable("必要なシートを確認できません。")
+        if "xl/vbaProject.bin" not in archive.namelist():
+            raise _XmlFastSaveUnavailable("元ExcelのVBAプロジェクトを確認できません。")
+        original_vba = archive.read("xl/vbaProject.bin")
+        shared_strings = _xlsx_shared_strings(archive)
+
+        delivery_path = sheet_paths[DELIVERY_SHEET_NAME]
+        delivery_xml = archive.read(delivery_path)
+        delivery_root = ET.fromstring(delivery_xml)
+        product_row = _xml_fast_find_active_product_row(
+            delivery_root,
+            shared_strings,
+            customer_name,
+            product_name,
+            date1904=date1904,
+        )
+        delivery_row = _xml_fast_find_row(delivery_root, product_row)
+        if delivery_row is None:
+            raise _XmlFastSaveUnavailable("編集対象行をXMLから確認できません。")
+        old_values = list(
+            _xml_fast_row_values(
+                delivery_row,
+                shared_strings,
+                max_col=16,
+                date1904=date1904,
+                date_columns={11, 13},
+            )
+        )
+        cached_values = list(
+            _xml_fast_row_values(
+                delivery_row,
+                shared_strings,
+                max_col=14,
+                date1904=date1904,
+                date_columns={11, 13},
+                formula_cache=True,
+            )
+        )
+        if diagnostic_timings is not None:
+            diagnostic_timings["　Excel① マクロ付きExcelを開く"] = (
+                time.perf_counter() - initial_started
+            )
+            diagnostic_timings["　Excel② 計算値用Excelを開く"] = 0.0
+
+        edit_started = time.perf_counter()
+        event_changed = any(
+            not same_excel_value(old_values[column - 1], proposed.get(label))
+            for label, column in {
+                "在庫本数": 8,
+                "本数": 9,
+                "配達日": 11,
+            }.items()
+        )
+
+        if event_changed:
+            history_path = sheet_paths[DELIVERY_HISTORY_SHEET_NAME]
+            history_xml = archive.read(history_path)
+            history_root = ET.fromstring(history_xml)
+            history_row_number, history_sheet_data = _xml_fast_next_history_row(
+                history_root,
+                shared_strings,
+                date1904=date1904,
+            )
+            new_history_row = ET.Element(
+                "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}row",
+                {"r": str(history_row_number)},
+            )
+            calculated_next_delivery, _ = calculate_delivery_values(old_values)
+            for column in range(1, 15):
+                value = old_values[column - 1]
+                source_cell = _xml_fast_cell_in_row(delivery_row, column)
+                if source_cell is not None and source_cell.find(
+                    "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}f"
+                ) is not None:
+                    cached_value = cached_values[column - 1]
+                    if cached_value is not None:
+                        value = cached_value
+                    elif column == 13:
+                        value = calculated_next_delivery
+                    else:
+                        value = None
+
+                if value is not None:
+                    date_style = None
+                    if isinstance(value, (date, datetime)):
+                        date_style = _xml_fast_find_recent_date_style(
+                            history_sheet_data,
+                            column,
+                        )
+                        if not date_style and source_cell is not None:
+                            date_style = source_cell.attrib.get("s")
+                    _xml_fast_set_cell_value(
+                        new_history_row,
+                        history_row_number,
+                        column,
+                        value,
+                        date1904=date1904,
+                        date_style=date_style,
+                    )
+                changed_cells.append(
+                    (DELIVERY_HISTORY_SHEET_NAME, history_row_number, column, value)
+                )
+
+            history_sheet_data.append(new_history_row)
+            _xml_fast_update_dimension(history_root, history_row_number)
+            replacements[history_path] = _xml_fast_serialize(history_root, history_xml)
+
+            management_path = sheet_paths[MANAGEMENT_SHEET_NAME]
+            management_xml = archive.read(management_path)
+            management_root = ET.fromstring(management_xml)
+            management_row = _xml_fast_find_row(management_root, 8)
+            if management_row is None:
+                raise _XmlFastSaveUnavailable("管理シートB8を確認できません。")
+            history_count = history_row_number - 1
+            _xml_fast_set_cell_value(
+                management_row,
+                8,
+                2,
+                history_count,
+                date1904=date1904,
+            )
+            changed_cells.append((MANAGEMENT_SHEET_NAME, 8, 2, history_count))
+            replacements[management_path] = _xml_fast_serialize(
+                management_root,
+                management_xml,
+            )
+
+        column_mapping = {
+            "メーカー": 6,
+            "在庫本数": 8,
+            "本数": 9,
+            "kg/本": 10,
+            "配達日": 11,
+        }
+        for label, column in column_mapping.items():
+            new_value = proposed.get(label)
+            if not same_excel_value(old_values[column - 1], new_value):
+                _xml_fast_set_cell_value(
+                    delivery_row,
+                    product_row,
+                    column,
+                    new_value,
+                    date1904=date1904,
+                )
+                changed_cells.append(
+                    (DELIVERY_SHEET_NAME, product_row, column, new_value)
+                )
+
+        inventory_count = inventory_usage_number(proposed.get("在庫本数"))
+        delivery_count = inventory_usage_number(proposed.get("本数"))
+        kg_per_bottle = inventory_usage_number(proposed.get("kg/本"))
+        delivery_quantity = None
+        if inventory_count is not None or delivery_count is not None:
+            if kg_per_bottle is None or kg_per_bottle <= 0:
+                raise ValueError(
+                    "在庫本数または本数を入力する場合は、kg/本に0より大きい数値が必要です。"
+                )
+            delivery_quantity = (inventory_count or 0) + (delivery_count or 0)
+            delivery_quantity *= kg_per_bottle
+            if not math.isfinite(delivery_quantity):
+                raise ValueError("配達数量を正しく計算できませんでした。")
+            if delivery_quantity.is_integer():
+                delivery_quantity = int(delivery_quantity)
+
+        if not same_excel_value(old_values[11], delivery_quantity):
+            _xml_fast_set_cell_value(
+                delivery_row,
+                product_row,
+                12,
+                delivery_quantity,
+                date1904=date1904,
+            )
+            changed_cells.append(
+                (DELIVERY_SHEET_NAME, product_row, 12, delivery_quantity)
+            )
+
+        if not changed_cells:
+            raise ValueError("変更された項目がありません。")
+
+        _xml_fast_clear_formula_caches(delivery_row)
+        replacements[delivery_path] = _xml_fast_serialize(delivery_root, delivery_xml)
+
+        workbook_xml = archive.read("xl/workbook.xml")
+        workbook_root = ET.fromstring(workbook_xml)
+        _xml_fast_patch_recalculation(workbook_root)
+        replacements["xl/workbook.xml"] = _xml_fast_serialize(
+            workbook_root,
+            workbook_xml,
+        )
+
+    if diagnostic_timings is not None:
+        diagnostic_timings["　Excel③ 対象検索・書換え"] = (
+            time.perf_counter() - edit_started
+        )
+
+    save_started = time.perf_counter()
+    saved_content = _xml_fast_rebuild_zip(original_content, replacements)
+    if diagnostic_timings is not None:
+        diagnostic_timings["　Excel④ xlsm保存"] = time.perf_counter() - save_started
+
+    vba_started = time.perf_counter()
+    _xml_fast_validate_vba_unchanged(original_vba, saved_content)
+    if diagnostic_timings is not None:
+        diagnostic_timings["　Excel⑤ 保存後Excelを開く"] = time.perf_counter() - vba_started
+
+    verify_started = time.perf_counter()
+    verify_saved_workbook_lightweight(
+        saved_content,
+        original_sheets,
+        required_sheets,
+        changed_cells,
+    )
+    if diagnostic_timings is not None:
+        diagnostic_timings["　Excel⑥ 保存後内容検証"] = time.perf_counter() - verify_started
+    return saved_content, changed_cells
+
+
+def _update_delivery_history_record_bytes_xml_fast(
+    original_content,
+    customer_name,
+    product_name,
+    record_ref,
+    proposed,
+    diagnostic_timings=None,
+):
+    """Privateテスト用。過去の配達履歴1行だけをXML直接更新する。現在行修正は従来方式へ戻す。"""
+    source = str((record_ref or {}).get("source") or "").strip()
+    if source != "history":
+        raise _XmlFastSaveUnavailable("現在行の履歴修正は従来方式を使用します。")
+
+    initial_started = time.perf_counter()
+    replacements = {}
+    changed_cells = []
+    row_number = int((record_ref or {}).get("row_number") or 0)
+    expected_fingerprint = str((record_ref or {}).get("fingerprint") or "").strip()
+    expected_identity = tuple((record_ref or {}).get("identity") or ())
+
+    with zipfile.ZipFile(BytesIO(original_content), "r") as archive:
+        original_sheets, sheet_paths, date1904 = _xlsx_workbook_info(archive)
+        required_sheets = {
+            DELIVERY_SHEET_NAME,
+            DELIVERY_HISTORY_SHEET_NAME,
+            MANAGEMENT_SHEET_NAME,
+            SHEET_NAME,
+        }
+        if not required_sheets.issubset(set(original_sheets)):
+            raise _XmlFastSaveUnavailable("必要なシートを確認できません。")
+        if "xl/vbaProject.bin" not in archive.namelist():
+            raise _XmlFastSaveUnavailable("元ExcelのVBAプロジェクトを確認できません。")
+        original_vba = archive.read("xl/vbaProject.bin")
+        shared_strings = _xlsx_shared_strings(archive)
+
+        sheet_name = DELIVERY_HISTORY_SHEET_NAME
+        sheet_path = sheet_paths[sheet_name]
+        sheet_xml = archive.read(sheet_path)
+        sheet_root = ET.fromstring(sheet_xml)
+        row = _xml_fast_find_row(sheet_root, row_number)
+        if row is None:
+            raise ValueError("修正対象の行が見つかりません。再読み込みしてください。")
+        row_values = list(
+            _xml_fast_row_values(
+                row,
+                shared_strings,
+                max_col=14,
+                date1904=date1904,
+                date_columns={11, 13},
+            )
+        )
+        if diagnostic_timings is not None:
+            diagnostic_timings["　Excel① マクロ付きExcelを開く"] = (
+                time.perf_counter() - initial_started
+            )
+
+        actual_identity = delivery_history_identity(row_values)
+        if expected_identity and actual_identity != expected_identity:
+            raise ValueError("修正対象の顧客・商品が変わっています。再読み込みしてください。")
+        if normalize_match_value(row_values[1]) != normalize_match_value(customer_name):
+            raise ValueError("修正対象の顧客が一致しません。再読み込みしてください。")
+        if normalize_match_value(row_values[4]) != normalize_match_value(product_name):
+            raise ValueError("修正対象の商品が一致しません。再読み込みしてください。")
+        actual_fingerprint = delivery_record_fingerprint(
+            source,
+            row_number,
+            row_values,
+        )
+        if expected_fingerprint and actual_fingerprint != expected_fingerprint:
+            raise ValueError(
+                "この納品履歴はPCまたは別端末で変更されています。"
+                "納品履歴を開き直してから修正してください。"
+            )
+
+        edit_started = time.perf_counter()
+        column_mapping = {
+            "メーカー": 6,
+            "在庫本数": 8,
+            "本数": 9,
+            "kg/本": 10,
+            "配達日": 11,
+        }
+        old_values = {
+            label: row_values[column - 1]
+            for label, column in column_mapping.items()
+        }
+        for label, column in column_mapping.items():
+            new_value = proposed.get(label)
+            if not same_excel_value(row_values[column - 1], new_value):
+                _xml_fast_set_cell_value(
+                    row,
+                    row_number,
+                    column,
+                    new_value,
+                    date1904=date1904,
+                )
+                changed_cells.append((sheet_name, row_number, column, new_value))
+
+        inventory_changed = not same_excel_value(
+            old_values.get("在庫本数"),
+            proposed.get("在庫本数"),
+        )
+        delivery_changed = not same_excel_value(
+            old_values.get("本数"),
+            proposed.get("本数"),
+        )
+        kg_changed = not same_excel_value(
+            old_values.get("kg/本"),
+            proposed.get("kg/本"),
+        )
+        date_changed = not same_excel_value(
+            old_values.get("配達日"),
+            proposed.get("配達日"),
+        )
+
+        quantity_changed = False
+        should_recalculate_quantity = inventory_changed or delivery_changed
+        if kg_changed:
+            should_recalculate_quantity = should_recalculate_quantity or (
+                inventory_usage_number(proposed.get("在庫本数")) is not None
+                or inventory_usage_number(proposed.get("本数")) is not None
+            )
+
+        if should_recalculate_quantity:
+            inventory_count = inventory_usage_number(proposed.get("在庫本数"))
+            delivery_count = inventory_usage_number(proposed.get("本数"))
+            kg_per_bottle = inventory_usage_number(proposed.get("kg/本"))
+            corrected_quantity = None
+            if inventory_count is not None or delivery_count is not None:
+                if kg_per_bottle is None or kg_per_bottle <= 0:
+                    raise ValueError(
+                        "在庫本数または本数を入れる場合は、kg/本に0より大きい数値が必要です。"
+                    )
+                corrected_quantity = (
+                    (inventory_count or 0) + (delivery_count or 0)
+                ) * kg_per_bottle
+                if not math.isfinite(corrected_quantity):
+                    raise ValueError("配達数量を正しく計算できませんでした。")
+                if corrected_quantity.is_integer():
+                    corrected_quantity = int(corrected_quantity)
+
+            if not same_excel_value(row_values[11], corrected_quantity):
+                _xml_fast_set_cell_value(
+                    row,
+                    row_number,
+                    12,
+                    corrected_quantity,
+                    date1904=date1904,
+                )
+                changed_cells.append(
+                    (sheet_name, row_number, 12, corrected_quantity)
+                )
+                quantity_changed = True
+
+        if date_changed or quantity_changed:
+            corrected_values = list(
+                _xml_fast_row_values(
+                    row,
+                    shared_strings,
+                    max_col=14,
+                    date1904=date1904,
+                    date_columns={11, 13},
+                )
+            )
+            corrected_next_delivery, _ = calculate_delivery_values(corrected_values)
+            if not same_excel_value(row_values[12], corrected_next_delivery):
+                _xml_fast_set_cell_value(
+                    row,
+                    row_number,
+                    13,
+                    corrected_next_delivery,
+                    date1904=date1904,
+                )
+                changed_cells.append(
+                    (sheet_name, row_number, 13, corrected_next_delivery)
+                )
+
+        if not changed_cells:
+            raise ValueError("変更された項目がありません。")
+
+        replacements[sheet_path] = _xml_fast_serialize(sheet_root, sheet_xml)
+        workbook_xml = archive.read("xl/workbook.xml")
+        workbook_root = ET.fromstring(workbook_xml)
+        _xml_fast_patch_recalculation(workbook_root)
+        replacements["xl/workbook.xml"] = _xml_fast_serialize(
+            workbook_root,
+            workbook_xml,
+        )
+
+    if diagnostic_timings is not None:
+        diagnostic_timings["　Excel③ 対象検索・書換え"] = (
+            time.perf_counter() - edit_started
+        )
+
+    save_started = time.perf_counter()
+    saved_content = _xml_fast_rebuild_zip(original_content, replacements)
+    if diagnostic_timings is not None:
+        diagnostic_timings["　Excel④ xlsm保存"] = time.perf_counter() - save_started
+
+    vba_started = time.perf_counter()
+    _xml_fast_validate_vba_unchanged(original_vba, saved_content)
+    if diagnostic_timings is not None:
+        diagnostic_timings["　Excel⑤ 保存後Excelを開く"] = time.perf_counter() - vba_started
+
+    verify_started = time.perf_counter()
+    verify_saved_workbook_lightweight(
+        saved_content,
+        original_sheets,
+        required_sheets,
+        changed_cells,
+    )
+    if diagnostic_timings is not None:
+        diagnostic_timings["　Excel⑥ 保存後内容検証"] = time.perf_counter() - verify_started
+    return saved_content, changed_cells
+
 def update_workbook_bytes(
     original_content,
     customer_name,
@@ -7576,6 +8426,19 @@ def update_workbook_bytes(
     diagnostic_timings=None,
 ):
     """H列の在庫本数・I列の配達本数を含む指定項目とL列配達数量を安全に更新する。"""
+    if is_test_xml_fast_save_enabled():
+        try:
+            return _update_workbook_bytes_xml_fast(
+                original_content,
+                customer_name,
+                product_name,
+                proposed,
+                diagnostic_timings=diagnostic_timings,
+            )
+        except Exception:
+            # PrivateテストのXML直接保存で少しでも問題があれば、
+            # 本番で実績のある従来openpyxl方式へその場で戻す。
+            pass
     diagnostic_step_started = time.perf_counter()
     workbook = load_workbook(BytesIO(original_content), keep_vba=True, data_only=False, read_only=False)
     if diagnostic_timings is not None:
@@ -7828,6 +8691,19 @@ def update_delivery_history_record_bytes(
     diagnostic_timings=None,
 ):
     """納品履歴の指定1行を訂正する。新しい履歴行は追加しない。"""
+    if is_test_xml_fast_save_enabled():
+        try:
+            return _update_delivery_history_record_bytes_xml_fast(
+                original_content,
+                customer_name,
+                product_name,
+                record_ref,
+                proposed,
+                diagnostic_timings=diagnostic_timings,
+            )
+        except Exception:
+            # 過去履歴以外・XML条件不一致・検証失敗は従来方式へ戻す。
+            pass
     diagnostic_step_started = time.perf_counter()
     workbook = load_workbook(
         BytesIO(original_content),
