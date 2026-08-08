@@ -8689,9 +8689,153 @@ def display_change_history_value(value):
     return text
 
 
+def change_history_target_url(parsed):
+    """変更履歴カードから、既存の対象詳細画面へ移動するURLを返す。"""
+    target_type = clean_value(parsed.get("target_type"), blank_text="").strip()
+    target_name = clean_value(parsed.get("target_name"), blank_text="").strip()
+    target_id = clean_value(parsed.get("target_id"), blank_text="").strip()
+
+    if target_type == "顧客" and target_name:
+        return make_app_url(page="detail", customer=target_name)
+    if target_type == "仕入先" and target_id:
+        return make_app_url(
+            page="partner_detail",
+            partner_id=target_id,
+            partner_type="supplier",
+        )
+    if target_type == "運送会社" and target_id:
+        return make_app_url(
+            page="partner_detail",
+            partner_id=target_id,
+            partner_type="carrier",
+        )
+    return ""
+
+
+def render_change_history_card(parsed):
+    """変更履歴1件を、対象詳細へ移動できる1枚のカードとして表示する。"""
+    title = "　".join(
+        part for part in (
+            parsed["target_type"],
+            parsed["target_name"],
+        ) if part
+    ) or "変更履歴"
+    meta = " ｜ ".join(
+        part for part in (
+            format_note_datetime(parsed["created_at"]),
+            parsed["action"],
+        ) if part
+    )
+
+    parts = [
+        '<div class="change-history-card-title">',
+        html.escape(title),
+        '</div>',
+    ]
+    if meta:
+        parts.extend([
+            '<div class="change-history-card-meta">',
+            html.escape(meta),
+            '</div>',
+        ])
+    if parsed["section"]:
+        parts.extend([
+            '<div class="change-history-card-section">変更箇所：',
+            html.escape(parsed["section"]),
+            '</div>',
+        ])
+
+    for change in parsed["changes"]:
+        before = html.escape(
+            display_change_history_value(change.get("before", ""))
+        )
+        after = html.escape(
+            display_change_history_value(change.get("after", ""))
+        )
+        field_name = html.escape(
+            clean_value(change.get("field"), blank_text="変更内容")
+        )
+        parts.extend([
+            '<div class="change-history-card-change">',
+            field_name,
+            '：',
+            before,
+            ' → ',
+            after,
+            '</div>',
+        ])
+
+    body = "".join(parts)
+    target_url = change_history_target_url(parsed)
+    if target_url:
+        safe_url = html.escape(target_url, quote=True)
+        st.markdown(
+            f'<a class="change-history-card" href="{safe_url}" target="_self">{body}</a>',
+            unsafe_allow_html=True,
+        )
+    else:
+        st.markdown(
+            f'<div class="change-history-card change-history-card-static">{body}</div>',
+            unsafe_allow_html=True,
+        )
+
+
 def show_change_history_page():
-    st.header("🕘 配車変更確認")
+    st.header("🕘 変更確認")
     st.caption("アプリから正常に保存された変更を新しい順に表示します。メモ帳は対象外です。")
+    st.markdown(
+        """
+        <style>
+        .change-history-card {
+            display: block;
+            width: 100%;
+            box-sizing: border-box;
+            margin: 0 0 0.8rem 0;
+            padding: 1rem 1.15rem;
+            border: 1px solid rgba(15, 23, 42, 0.16);
+            border-radius: 12px;
+            background: rgba(255, 255, 255, 0.50);
+            color: #172033 !important;
+            text-decoration: none !important;
+            box-shadow: none;
+            overflow-wrap: anywhere;
+        }
+        a.change-history-card:hover {
+            border-color: rgba(37, 99, 235, 0.36);
+            background: rgba(239, 246, 255, 0.82);
+            text-decoration: none !important;
+        }
+        .change-history-card-title {
+            color: #172033;
+            font-weight: 800;
+            font-size: 1rem;
+            line-height: 1.45;
+        }
+        .change-history-card-meta {
+            margin-top: 0.7rem;
+            color: #667085;
+            font-size: 0.86rem;
+            line-height: 1.4;
+        }
+        .change-history-card-section {
+            margin-top: 0.85rem;
+            color: #172033;
+            font-weight: 800;
+            line-height: 1.5;
+        }
+        .change-history-card-change {
+            margin-top: 0.72rem;
+            color: #172033;
+            line-height: 1.65;
+            white-space: pre-wrap;
+        }
+        .change-history-card-static {
+            cursor: default;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
 
     target_label = st.selectbox(
         "対象",
@@ -8746,31 +8890,7 @@ def show_change_history_page():
         )
         for row in visible_rows:
             parsed = parse_change_history_row(row)
-            title = "　".join(
-                part for part in (
-                    parsed["target_type"],
-                    parsed["target_name"],
-                ) if part
-            ) or "変更履歴"
-            with st.container(border=True):
-                st.markdown(f"**{html.escape(title)}**")
-                meta = " ｜ ".join(
-                    part for part in (
-                        format_note_datetime(parsed["created_at"]),
-                        parsed["action"],
-                    ) if part
-                )
-                if meta:
-                    st.caption(meta)
-                if parsed["section"]:
-                    st.markdown(
-                        f"**変更箇所：{html.escape(parsed['section'])}**"
-                    )
-                for change in parsed["changes"]:
-                    before = display_change_history_value(change.get("before", ""))
-                    after = display_change_history_value(change.get("after", ""))
-                    field_name = html.escape(clean_value(change.get("field"), blank_text="変更内容"))
-                    st.write(f"{field_name}：{before} → {after}")
+            render_change_history_card(parsed)
 
     previous_col, page_col, next_col = st.columns([1, 1, 1])
     with previous_col:
