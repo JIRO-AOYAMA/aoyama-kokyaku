@@ -7180,7 +7180,9 @@ def refresh_fast_dropbox_cache_after_save(
                     product_name,
                     diagnostic_timings=diagnostic_timings,
                 )
-            except Exception:
+            except Exception as exc:
+                if diagnostic_timings is not None:
+                    diagnostic_timings["表示高速経路エラー"] = f"{type(exc).__name__}: {exc}"
                 refreshed_df = None
 
         if not isinstance(refreshed_df, pd.DataFrame) or refreshed_df.empty:
@@ -16771,6 +16773,9 @@ def show_customer_detail(df, customer_name):
                 except (TypeError, ValueError):
                     continue
                 st.write(f"{diagnostic_label}：{diagnostic_seconds:.2f}秒")
+            diagnostic_fast_error = diagnostic_timings.get("表示高速経路エラー")
+            if diagnostic_fast_error:
+                st.write(f"**表示高速経路エラー：{diagnostic_fast_error}**")
             try:
                 diagnostic_save_seconds = float(success.get("diagnostic_save_seconds") or 0)
             except (TypeError, ValueError):
