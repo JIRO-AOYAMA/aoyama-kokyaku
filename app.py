@@ -7124,6 +7124,11 @@ def try_refresh_fast_dropbox_cache_for_changed_product(
         return None
 
     base_df = recalculate_customer_inventory_for_today(pd.DataFrame(records))
+    # 既存JSONの配達日は文字列型だが、変更対象の1行はExcelからdate値で戻る。
+    # 値や保存形式は変えず、date値を安全に差し替えられる型へ広げるだけにする。
+    if "配達日" in base_df.columns:
+        base_df["配達日"] = base_df["配達日"].astype("object")
+
     target_customer = normalize_match_value(customer_name)
     target_product = normalize_match_value(product_name)
     matching_indexes = [
@@ -15706,6 +15711,12 @@ def recalculate_customer_inventory_for_today(df):
         return df
 
     recalculated = df.copy()
+    # JSONから戻した日付列は文字列型になるため、再計算したPythonのdate値を
+    # そのまま保持できるよう受け皿だけobject型にする。計算値そのものは変更しない。
+    for result_column in ("次回配達予定", "残数"):
+        if result_column in recalculated.columns:
+            recalculated[result_column] = recalculated[result_column].astype("object")
+
     for index, row in recalculated.iterrows():
         delivery_values = [None] * 12
         delivery_values[6] = row.get("使用数量/日")
