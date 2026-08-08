@@ -7005,13 +7005,13 @@ def _xlsx_verify_changed_cells(
                 )
 
 
-def rebuild_changed_customer_product_record(
+def _rebuild_changed_customer_product_record_full_xml(
     content,
     customer_name,
     product_name,
     base_record,
 ):
-    """保存済みxlsmのXMLを直接読み、変更した1商品の表示値だけを正確に作り直す。"""
+    """従来どおり保存済みxlsmを走査して1商品を作り直す、安全側フォールバック。"""
     with zipfile.ZipFile(BytesIO(content), "r") as archive:
         _, sheet_paths, date1904 = _xlsx_workbook_info(archive)
         if DELIVERY_SHEET_NAME not in sheet_paths:
@@ -7037,7 +7037,6 @@ def rebuild_changed_customer_product_record(
                 continue
             active_rows.append((row_number, values))
 
-        # 既存ルールと同じく、使用中行が1件に確定できない場合は高速経路を使わない。
         if len(active_rows) != 1:
             raise ValueError("変更対象の商品行を1件に確定できません。")
 
@@ -7058,7 +7057,6 @@ def rebuild_changed_customer_product_record(
                 ):
                     if delivery_history_identity(history_values) == history_key:
                         states.append(history_values)
-            # 既存ルールどおり、履歴の後ろへ現在の最新状態を加えて予想使用量を計算する。
             states.append(delivery_values)
             predicted_usage = calculate_predicted_daily_usage_from_states(states)
 
@@ -7086,6 +7084,176 @@ def rebuild_changed_customer_product_record(
         return refreshed_record
 
 
+def _display_delivery_values_from_base_record(base_record, changed_cells):
+    """直前revの表示1行へ、実際に保存した次回配達日シートの変更セルだけを反映する。"""
+    if not isinstance(base_record, dict) or not base_record:
+        return None
+
+    values = [None] * 14
+    values[0] = base_record.get("ID")
+    values[1] = base_record.get("顧客名")
+    values[2] = base_record.get("地域")
+    values[3] = base_record.get("コンサル")
+    values[4] = base_record.get("商品名")
+    values[5] = base_record.get("メーカー")
+    values[6] = base_record.get("使用数量/日")
+    values[7] = base_record.get("在庫本数")
+    values[8] = base_record.get("本数")
+    values[9] = base_record.get("kg/本")
+    values[10] = base_record.get("配達日")
+    values[11] = base_record.get("_配達数量")
+    values[12] = base_record.get("次回配達予定")
+
+    delivery_rows = set()
+    for sheet, row, column, expected in changed_cells or ():
+        if sheet != DELIVERY_SHEET_NAME:
+            continue
+        try:
+            row_number = int(row)
+            column_number = int(column)
+        except Exception:
+            return None
+        delivery_rows.add(row_number)
+        if 1 <= column_number <= len(values):
+            values[column_number - 1] = expected
+
+    # 1回の保存で別々の現在行を同時更新する既存ルールはない。
+    # 万一その状態になった場合は高速経路を使わず従来処理へ戻す。
+    if len(delivery_rows) > 1:
+        return None
+    return tuple(values)
+
+
+def _xlsx_matching_history_states_lightweight(
+    archive,
+    sheet_path,
+    shared_strings,
+    history_key,
+    date1904=False,
+):
+    """履歴XMLを流し読みし、対象ID/顧客・商品に必要な列だけPython値へ戻す。"""
+    main_ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+    row_tag = f"{{{main_ns}}}row"
+    cell_tag = f"{{{main_ns}}}c"
+    identity_columns = {1, 2, 5}
+    calculation_columns = {8, 9, 10, 11}
+    states = []
+
+    with archive.open(sheet_path) as stream:
+        for _, element in ET.iterparse(stream, events=("end",)):
+            if element.tag != row_tag:
+                continue
+
+            identity_values = [None] * 14
+            for cell in element:
+                if cell.tag != cell_tag:
+                    continue
+                column_number = _xlsx_column_number_from_reference(cell.attrib.get("r"))
+                if column_number not in identity_columns:
+                    continue
+                identity_values[column_number - 1] = _xlsx_cell_value(
+                    cell,
+                    shared_strings,
+                    date1904=date1904,
+                    force_date=False,
+                )
+
+            if delivery_history_identity(identity_values) == history_key:
+                values = list(identity_values)
+                for cell in element:
+                    if cell.tag != cell_tag:
+                        continue
+                    column_number = _xlsx_column_number_from_reference(cell.attrib.get("r"))
+                    if column_number not in calculation_columns:
+                        continue
+                    values[column_number - 1] = _xlsx_cell_value(
+                        cell,
+                        shared_strings,
+                        date1904=date1904,
+                        force_date=column_number == 11,
+                    )
+                states.append(tuple(values))
+
+            element.clear()
+
+    return states
+
+
+def rebuild_changed_customer_product_record(
+    content,
+    customer_name,
+    product_name,
+    base_record,
+    changed_cells=None,
+):
+    """直前revの1行を土台に履歴だけ読み、無理な場合は従来の全XML走査へ戻す。"""
+    try:
+        delivery_values = _display_delivery_values_from_base_record(
+            base_record,
+            changed_cells,
+        )
+        if delivery_values is None:
+            raise ValueError("表示用の現在行を安全に組み立てられません。")
+
+        if normalize_match_value(delivery_values[1]) != normalize_match_value(customer_name):
+            raise ValueError("表示用の顧客が一致しません。")
+        if normalize_match_value(delivery_values[4]) != normalize_match_value(product_name):
+            raise ValueError("表示用の商品が一致しません。")
+        if is_blank_or_zero(delivery_values[6]):
+            raise ValueError("表示用の使用中商品を確認できません。")
+
+        history_key = delivery_history_identity(delivery_values)
+        predicted_usage = None
+        if history_key is not None:
+            with zipfile.ZipFile(BytesIO(content), "r") as archive:
+                _, sheet_paths, date1904 = _xlsx_workbook_info(archive)
+                history_path = sheet_paths.get(DELIVERY_HISTORY_SHEET_NAME)
+                if not history_path or history_path not in archive.namelist():
+                    raise ValueError("配達履歴シートが見つかりません。")
+                shared_strings = _xlsx_shared_strings(archive)
+                states = _xlsx_matching_history_states_lightweight(
+                    archive,
+                    history_path,
+                    shared_strings,
+                    history_key,
+                    date1904=date1904,
+                )
+            states.append(delivery_values)
+            predicted_usage = calculate_predicted_daily_usage_from_states(states)
+
+        next_delivery, remaining = calculate_delivery_values(delivery_values)
+        refreshed_record = dict(base_record)
+        refreshed_record.update(
+            {
+                "ID": delivery_values[0],
+                "顧客名": delivery_values[1],
+                "地域": delivery_values[2],
+                "コンサル": delivery_values[3],
+                "商品名": delivery_values[4],
+                "使用数量/日": delivery_values[6],
+                "予想使用量/日": predicted_usage,
+                "次回配達予定": next_delivery,
+                "残数": remaining,
+                "メーカー": delivery_values[5],
+                "在庫本数": delivery_values[7],
+                "本数": delivery_values[8],
+                "kg/本": delivery_values[9],
+                "配達日": delivery_values[10],
+                "_配達数量": delivery_values[11],
+            }
+        )
+        return refreshed_record
+    except Exception:
+        # 表示用の高速化だけの失敗で本体保存を危険にしない。
+        # 従来と同じ保存済みxlsm全走査へ戻して正確さを優先する。
+        return _rebuild_changed_customer_product_record_full_xml(
+            content,
+            customer_name,
+            product_name,
+            base_record,
+        )
+
+
 
 def try_refresh_fast_dropbox_cache_for_changed_product(
     content,
@@ -7093,6 +7261,7 @@ def try_refresh_fast_dropbox_cache_for_changed_product(
     access_token,
     customer_name,
     product_name,
+    changed_cells=None,
     diagnostic_timings=None,
 ):
     """直前revと一致する表示用JSONがある時だけ、変更した1商品を差し替える。"""
@@ -7149,6 +7318,7 @@ def try_refresh_fast_dropbox_cache_for_changed_product(
         customer_name,
         product_name,
         base_df.loc[target_index].to_dict(),
+        changed_cells=changed_cells,
     )
     for column, value in refreshed_record.items():
         if column not in base_df.columns:
@@ -7166,6 +7336,7 @@ def refresh_fast_dropbox_cache_after_save(
     previous_revision="",
     customer_name="",
     product_name="",
+    changed_cells=None,
     diagnostic_timings=None,
 ):
     """保存直後の表示用JSONを更新する。安全に差分更新できない時は従来の全体再生成へ戻す。"""
@@ -7183,6 +7354,7 @@ def refresh_fast_dropbox_cache_after_save(
                     access_token,
                     customer_name,
                     product_name,
+                    changed_cells=changed_cells,
                     diagnostic_timings=diagnostic_timings,
                 )
             except Exception as exc:
@@ -7592,6 +7764,7 @@ def save_customer_excel_changes(customer_name, product_name, proposed):
         previous_revision=revision,
         customer_name=customer_name,
         product_name=product_name,
+        changed_cells=changed_cells,
         diagnostic_timings=diagnostic_timings,
     )
     diagnostic_timings["表示用データ更新"] = time.perf_counter() - diagnostic_step_started
@@ -7912,6 +8085,7 @@ def save_customer_delivery_history_correction(
         previous_revision=revision,
         customer_name=customer_name,
         product_name=product_name,
+        changed_cells=changed_cells,
         diagnostic_timings=diagnostic_timings,
     )
     diagnostic_timings["表示用データ更新"] = time.perf_counter() - diagnostic_step_started
