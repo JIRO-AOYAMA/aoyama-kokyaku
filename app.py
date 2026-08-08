@@ -6827,6 +6827,24 @@ def refresh_fast_dropbox_cache_after_save(content, excel_revision, access_token)
         return "保存は完了しましたが、表示用キャッシュを更新できませんでした。更新ボタンを押してください。"
 
 
+def clear_customer_excel_caches_after_save():
+    """顧客Excel更新で内容が変わるキャッシュだけを無効化する。
+
+    写真・メモ・OneDrive・配車表・取引先など、在庫変更と無関係な
+    キャッシュは残し、保存直後の画面再表示を重くしない。
+    """
+    cache_function_names = (
+        "get_cached_dropbox_excel_content",
+        "load_fast_dropbox_data",
+        "load_data",
+        "load_product_search_index",
+    )
+    for function_name in cache_function_names:
+        cached_function = globals().get(function_name)
+        if cached_function is not None and hasattr(cached_function, "clear"):
+            cached_function.clear()
+
+
 def find_next_delivery_history_row(ws):
     """配達履歴A列の最終データ行の次を返す。書式だけの空行は数えない。"""
     row = max(int(ws.max_row or 1), 1)
@@ -7067,7 +7085,9 @@ def save_customer_excel_changes(customer_name, product_name, proposed):
     # Keep the existing exact rule: retain the newest 30 backups.
     cleanup_warning = trim_old_dropbox_backups(access_token, keep=30)
     warnings = [warning for warning in (cleanup_warning, cache_warning) if warning]
-    st.cache_data.clear()
+    # 在庫保存では顧客Excelに関係するキャッシュだけを更新する。
+    # 他機能のキャッシュを残し、保存直後の画面再表示を軽くする。
+    clear_customer_excel_caches_after_save()
     return {
         "backup_path": backup_path,
         "updated_at": get_jst_now(),
