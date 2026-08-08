@@ -8211,10 +8211,10 @@ def _update_delivery_history_record_bytes_xml_fast(
     proposed,
     diagnostic_timings=None,
 ):
-    """Privateテスト用。過去の配達履歴1行だけをXML直接更新する。現在行修正は従来方式へ戻す。"""
+    """Privateテスト用。現在行または過去履歴の指定1行だけをXML直接更新する。"""
     source = str((record_ref or {}).get("source") or "").strip()
-    if source != "history":
-        raise _XmlFastSaveUnavailable("現在行の履歴修正は従来方式を使用します。")
+    if source not in {"current", "history"}:
+        raise _XmlFastSaveUnavailable("修正対象の種類を確認できないため従来方式を使用します。")
 
     initial_started = time.perf_counter()
     replacements = {}
@@ -8238,7 +8238,11 @@ def _update_delivery_history_record_bytes_xml_fast(
         original_vba = archive.read("xl/vbaProject.bin")
         shared_strings = _xlsx_shared_strings(archive)
 
-        sheet_name = DELIVERY_HISTORY_SHEET_NAME
+        sheet_name = (
+            DELIVERY_SHEET_NAME
+            if source == "current"
+            else DELIVERY_HISTORY_SHEET_NAME
+        )
         sheet_path = sheet_paths[sheet_name]
         sheet_xml = archive.read(sheet_path)
         sheet_root = ET.fromstring(sheet_xml)
@@ -8254,6 +8258,34 @@ def _update_delivery_history_record_bytes_xml_fast(
                 date_columns={11, 13},
             )
         )
+
+        # 現在行には共有数式が含まれる場合があり、XML単体では数式文字列を
+        # openpyxlと完全に同じ形へ復元できないことがある。競合検知の指紋は
+        # 従来と同じA:Nの値で比較するため、現在行だけ読み取り専用で1行取得する。
+        # 編集・保存自体はXML直接更新のままなので、通常の重いopenpyxl保存には戻さない。
+        if source == "current":
+            validation_workbook = load_workbook(
+                BytesIO(original_content),
+                keep_vba=False,
+                data_only=False,
+                read_only=True,
+            )
+            try:
+                validation_ws = validation_workbook[DELIVERY_SHEET_NAME]
+                validation_rows = list(
+                    validation_ws.iter_rows(
+                        min_row=row_number,
+                        max_row=row_number,
+                        max_col=14,
+                        values_only=True,
+                    )
+                )
+                if not validation_rows:
+                    raise ValueError("修正対象の行が見つかりません。再読み込みしてください。")
+                row_values = list(validation_rows[0])
+            finally:
+                validation_workbook.close()
+
         if diagnostic_timings is not None:
             diagnostic_timings["　Excel① マクロ付きExcelを開く"] = (
                 time.perf_counter() - initial_started
@@ -8357,7 +8389,10 @@ def _update_delivery_history_record_bytes_xml_fast(
                 )
                 quantity_changed = True
 
-        if date_changed or quantity_changed:
+        # 配達履歴シートは数式ではないため、訂正後の次回配達予定も同じ行で再計算する。
+        # 次回配達日シート（現在の登録）は従来どおりM列数式そのものを維持し、
+        # Excel再計算に任せる。ここではM列の式や計算ルールを変更しない。
+        if source == "history" and (date_changed or quantity_changed):
             corrected_values = list(
                 _xml_fast_row_values(
                     row,
@@ -8382,6 +8417,11 @@ def _update_delivery_history_record_bytes_xml_fast(
 
         if not changed_cells:
             raise ValueError("変更された項目がありません。")
+
+        if source == "current":
+            # 現在行のM列など既存数式は残したまま、古い計算キャッシュだけを消す。
+            # 通常のXML高速保存と同じ扱いにしてExcel再計算へ任せる。
+            _xml_fast_clear_formula_caches(row)
 
         replacements[sheet_path] = _xml_fast_serialize(sheet_root, sheet_xml)
         workbook_xml = archive.read("xl/workbook.xml")
@@ -17134,6 +17174,46 @@ def display_change_value(value):
     return str(value)
 
 
+def render_delivery_history_scroll_to_top_once(key_suffix):
+    """納品履歴を開いた直後だけ、履歴欄の先頭が見える位置へ戻す。"""
+    safe_suffix = re.sub(r"[^0-9A-Za-z_-]", "", str(key_suffix or ""))
+    anchor_id = f"aoyama-delivery-history-top-{safe_suffix}"
+    scroll_key = f"delivery_history_scroll_to_top_{key_suffix}"
+
+    st.markdown(
+        f'<div id="{html.escape(anchor_id, quote=True)}"></div>',
+        unsafe_allow_html=True,
+    )
+    if not st.session_state.pop(scroll_key, False):
+        return
+
+    components.html(
+        f"""
+        <script>
+        (() => {{
+          const parentWindow = window.parent;
+          const parentDocument = parentWindow.document;
+          const anchorId = {json.dumps(anchor_id)};
+          const move = () => {{
+            const target = parentDocument.getElementById(anchorId);
+            if (!target) return;
+            const rect = target.getBoundingClientRect();
+            parentWindow.scrollTo({{
+              top: Math.max(0, parentWindow.scrollY + rect.top - 78),
+              left: parentWindow.scrollX || 0,
+              behavior: 'auto',
+            }});
+          }};
+          parentWindow.requestAnimationFrame(move);
+          [80, 220, 520].forEach((delay) => parentWindow.setTimeout(move, delay));
+        }})();
+        </script>
+        """,
+        height=0,
+        scrolling=False,
+    )
+
+
 def render_customer_delivery_history_editor(
     customer_name,
     product_name,
@@ -17143,6 +17223,7 @@ def render_customer_delivery_history_editor(
 ):
     """編集画面の中だけで、現在の登録と過去の納品履歴を修正できるようにする。"""
     history_limit_key = f"delivery_history_limit_{key_suffix}"
+    render_delivery_history_scroll_to_top_once(key_suffix)
     st.markdown("#### 納品履歴")
     st.caption(
         "Excelの納品ボタンまたはアプリから登録した履歴です。"
@@ -17502,6 +17583,7 @@ def render_customer_excel_editor(customer_name, customer_key, product_name, curr
     ):
         st.session_state[history_open_key] = True
         st.session_state[history_limit_key] = 20
+        st.session_state[f"delivery_history_scroll_to_top_{key_suffix}"] = True
         st.session_state.pop(history_edit_key, None)
         st.rerun()
 
