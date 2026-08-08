@@ -7005,6 +7005,72 @@ def _xlsx_verify_changed_cells(
                 )
 
 
+def build_changed_product_display_patch_from_open_workbook(
+    workbook,
+    customer_name,
+    product_name,
+):
+    """すでに開いている保存対象ブックから、変更した1商品の表示更新値だけを作る。
+
+    表示高速化専用。業務データの保存内容は変更しない。
+    1件に確定できない場合はNoneを返し、従来の安全な再読込処理へ戻す。
+    """
+    try:
+        if DELIVERY_SHEET_NAME not in workbook.sheetnames:
+            return None
+
+        delivery_ws = workbook[DELIVERY_SHEET_NAME]
+        _, active_rows, _ = find_product_rows_by_usage(
+            delivery_ws,
+            customer_name,
+            product_name,
+        )
+        if len(active_rows) != 1:
+            return None
+
+        product_row = active_rows[0]
+        delivery_values = tuple(
+            delivery_ws.cell(product_row, column).value
+            for column in range(1, 17)
+        )
+        history_key = delivery_history_identity(delivery_values)
+        predicted_usage = None
+        if history_key is not None and DELIVERY_HISTORY_SHEET_NAME in workbook.sheetnames:
+            states = []
+            history_ws = workbook[DELIVERY_HISTORY_SHEET_NAME]
+            for history_values in history_ws.iter_rows(
+                min_row=2,
+                max_col=14,
+                values_only=True,
+            ):
+                if delivery_history_identity(history_values) == history_key:
+                    states.append(history_values)
+            states.append(delivery_values)
+            predicted_usage = calculate_predicted_daily_usage_from_states(states)
+
+        next_delivery, remaining = calculate_delivery_values(delivery_values)
+        return {
+            "ID": delivery_values[0] if len(delivery_values) >= 1 else None,
+            "顧客名": delivery_values[1] if len(delivery_values) >= 2 else None,
+            "地域": delivery_values[2] if len(delivery_values) >= 3 else None,
+            "コンサル": delivery_values[3] if len(delivery_values) >= 4 else None,
+            "商品名": delivery_values[4] if len(delivery_values) >= 5 else None,
+            "使用数量/日": delivery_values[6] if len(delivery_values) >= 7 else None,
+            "予想使用量/日": predicted_usage,
+            "次回配達予定": next_delivery,
+            "残数": remaining,
+            "メーカー": delivery_values[5] if len(delivery_values) >= 6 else None,
+            "在庫本数": delivery_values[7] if len(delivery_values) >= 8 else None,
+            "本数": delivery_values[8] if len(delivery_values) >= 9 else None,
+            "kg/本": delivery_values[9] if len(delivery_values) >= 10 else None,
+            "配達日": delivery_values[10] if len(delivery_values) >= 11 else None,
+            "_配達数量": delivery_values[11] if len(delivery_values) >= 12 else None,
+        }
+    except Exception:
+        # 表示高速化だけの補助処理なので、失敗時は保存を止めず従来経路へ戻す。
+        return None
+
+
 def rebuild_changed_customer_product_record(
     content,
     customer_name,
@@ -7093,6 +7159,7 @@ def try_refresh_fast_dropbox_cache_for_changed_product(
     access_token,
     customer_name,
     product_name,
+    display_patch=None,
 ):
     """直前revと一致する表示用JSONがある時だけ、変更した1商品を差し替える。"""
     cache_content, _ = download_dropbox_file(
@@ -7125,12 +7192,22 @@ def try_refresh_fast_dropbox_cache_for_changed_product(
         return None
 
     target_index = matching_indexes[0]
-    refreshed_record = rebuild_changed_customer_product_record(
-        content,
-        customer_name,
-        product_name,
-        base_df.loc[target_index].to_dict(),
-    )
+    refreshed_record = None
+    if isinstance(display_patch, dict) and display_patch:
+        patch_customer = normalize_match_value(display_patch.get("顧客名"))
+        patch_product = normalize_match_value(display_patch.get("商品名"))
+        if patch_customer == target_customer and patch_product == target_product:
+            refreshed_record = dict(base_df.loc[target_index].to_dict())
+            refreshed_record.update(display_patch)
+
+    # 表示用パッチを安全に使えない時だけ、従来どおり保存済みxlsmを読み直す。
+    if not isinstance(refreshed_record, dict):
+        refreshed_record = rebuild_changed_customer_product_record(
+            content,
+            customer_name,
+            product_name,
+            base_df.loc[target_index].to_dict(),
+        )
     for column, value in refreshed_record.items():
         if column not in base_df.columns:
             base_df[column] = None
@@ -7145,6 +7222,7 @@ def refresh_fast_dropbox_cache_after_save(
     previous_revision="",
     customer_name="",
     product_name="",
+    display_patch=None,
 ):
     """保存直後の表示用JSONを更新する。安全に差分更新できない時は従来の全体再生成へ戻す。"""
     try:
@@ -7161,6 +7239,7 @@ def refresh_fast_dropbox_cache_after_save(
                     access_token,
                     customer_name,
                     product_name,
+                    display_patch=display_patch,
                 )
             except Exception:
                 refreshed_df = None
@@ -7348,6 +7427,7 @@ def update_workbook_bytes(
 
     original_sheets = list(workbook.sheetnames)
     changed_cells = []
+    display_patch = None
     diagnostic_step_started = time.perf_counter()
     try:
         if DELIVERY_SHEET_NAME not in workbook.sheetnames or SHEET_NAME not in workbook.sheetnames:
@@ -7432,6 +7512,14 @@ def update_workbook_bytes(
 
         if not changed_cells:
             raise ValueError("変更された項目がありません。")
+
+        # 保存後に同じxlsmを再走査しなくて済むよう、すでに開いているブックから
+        # 表示更新に必要な1商品分だけ作る。失敗時は従来の再読込へ戻る。
+        display_patch = build_changed_product_display_patch_from_open_workbook(
+            workbook,
+            customer_name,
+            product_name,
+        )
         enable_excel_recalculation(workbook)
         if diagnostic_timings is not None:
             diagnostic_timings["　Excel② 計算値用Excelを開く"] = cached_values_seconds
@@ -7472,7 +7560,7 @@ def update_workbook_bytes(
     )
     if diagnostic_timings is not None:
         diagnostic_timings["　Excel⑥ 保存後内容検証"] = time.perf_counter() - diagnostic_step_started
-    return saved_content, changed_cells
+    return saved_content, changed_cells, display_patch
 
 
 def save_customer_excel_changes(customer_name, product_name, proposed):
@@ -7509,7 +7597,7 @@ def save_customer_excel_changes(customer_name, product_name, proposed):
     diagnostic_timings["バックアップ作成"] = time.perf_counter() - diagnostic_step_started
 
     diagnostic_step_started = time.perf_counter()
-    saved_content, changed_cells = update_workbook_bytes(
+    saved_content, changed_cells, display_patch = update_workbook_bytes(
         original_content,
         customer_name,
         product_name,
@@ -7554,6 +7642,7 @@ def save_customer_excel_changes(customer_name, product_name, proposed):
         previous_revision=revision,
         customer_name=customer_name,
         product_name=product_name,
+        display_patch=display_patch,
     )
     diagnostic_timings["表示用データ更新"] = time.perf_counter() - diagnostic_step_started
 
@@ -7600,6 +7689,7 @@ def update_delivery_history_record_bytes(
 
     original_sheets = list(workbook.sheetnames)
     changed_cells = []
+    display_patch = None
     diagnostic_step_started = time.perf_counter()
     try:
         source = str((record_ref or {}).get("source") or "").strip()
@@ -7739,6 +7829,13 @@ def update_delivery_history_record_bytes(
         if not changed_cells:
             raise ValueError("変更された項目がありません。")
 
+        # 履歴訂正でも、現在の1商品分の表示値を開いているブックから作る。
+        # 対象を安全に確定できない場合は従来の再読込へ戻る。
+        display_patch = build_changed_product_display_patch_from_open_workbook(
+            workbook,
+            customer_name,
+            product_name,
+        )
         enable_excel_recalculation(workbook)
         if diagnostic_timings is not None:
             diagnostic_timings["　Excel③ 対象検索・書換え"] = time.perf_counter() - diagnostic_step_started
@@ -7776,7 +7873,7 @@ def update_delivery_history_record_bytes(
     )
     if diagnostic_timings is not None:
         diagnostic_timings["　Excel⑥ 保存後内容検証"] = time.perf_counter() - diagnostic_step_started
-    return saved_content, changed_cells
+    return saved_content, changed_cells, display_patch
 
 
 def save_customer_delivery_history_correction(
@@ -7823,7 +7920,7 @@ def save_customer_delivery_history_correction(
     diagnostic_timings["バックアップ作成"] = time.perf_counter() - diagnostic_step_started
 
     diagnostic_step_started = time.perf_counter()
-    saved_content, changed_cells = update_delivery_history_record_bytes(
+    saved_content, changed_cells, display_patch = update_delivery_history_record_bytes(
         original_content,
         customer_name,
         product_name,
@@ -7873,6 +7970,7 @@ def save_customer_delivery_history_correction(
         previous_revision=revision,
         customer_name=customer_name,
         product_name=product_name,
+        display_patch=display_patch,
     )
     diagnostic_timings["表示用データ更新"] = time.perf_counter() - diagnostic_step_started
     diagnostic_step_started = time.perf_counter()
