@@ -7364,7 +7364,10 @@ def save_customer_delivery_history_correction(
     )
     cleanup_warning = trim_old_dropbox_backups(access_token, keep=30)
     warnings = [warning for warning in (cleanup_warning, cache_warning) if warning]
-    st.cache_data.clear()
+    # 納品履歴の訂正でも、顧客Excelに関係するキャッシュだけを更新する。
+    # 写真・メモ・OneDrive・配車表・取引先など、納品履歴修正と無関係な
+    # キャッシュは残し、保存直後の画面再表示を重くしない。
+    clear_customer_excel_caches_after_save()
     return {
         "backup_path": backup_path,
         "updated_at": get_jst_now(),
