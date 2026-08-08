@@ -7058,10 +7058,21 @@ def copy_previous_delivery_state_to_history(
     changed_cells.append((MANAGEMENT_SHEET_NAME, 8, 2, history_count))
 
 
-def update_workbook_bytes(original_content, customer_name, product_name, proposed):
+def update_workbook_bytes(
+    original_content,
+    customer_name,
+    product_name,
+    proposed,
+    diagnostic_timings=None,
+):
     """H列の在庫本数・I列の配達本数を含む指定項目とL列配達数量を安全に更新する。"""
+    diagnostic_step_started = time.perf_counter()
     workbook = load_workbook(BytesIO(original_content), keep_vba=True, data_only=False, read_only=False)
+    if diagnostic_timings is not None:
+        diagnostic_timings["　Excel① マクロ付きExcelを開く"] = time.perf_counter() - diagnostic_step_started
+
     cached_workbook = None
+    diagnostic_step_started = time.perf_counter()
     try:
         cached_workbook = load_workbook(
             BytesIO(original_content),
@@ -7071,9 +7082,12 @@ def update_workbook_bytes(original_content, customer_name, product_name, propose
         )
     except Exception:
         cached_workbook = None
+    if diagnostic_timings is not None:
+        diagnostic_timings["　Excel② 計算値用Excelを開く"] = time.perf_counter() - diagnostic_step_started
 
     original_sheets = list(workbook.sheetnames)
     changed_cells = []
+    diagnostic_step_started = time.perf_counter()
     try:
         if DELIVERY_SHEET_NAME not in workbook.sheetnames or SHEET_NAME not in workbook.sheetnames:
             raise ValueError("必要なシート（次回配達日 または Sheet1）が見つかりません。")
@@ -7149,15 +7163,26 @@ def update_workbook_bytes(original_content, customer_name, product_name, propose
         if not changed_cells:
             raise ValueError("変更された項目がありません。")
         enable_excel_recalculation(workbook)
+        if diagnostic_timings is not None:
+            diagnostic_timings["　Excel③ 対象検索・書換え"] = time.perf_counter() - diagnostic_step_started
+
         output = BytesIO()
+        diagnostic_step_started = time.perf_counter()
         workbook.save(output)
+        if diagnostic_timings is not None:
+            diagnostic_timings["　Excel④ xlsm保存"] = time.perf_counter() - diagnostic_step_started
     finally:
         workbook.close()
         if cached_workbook is not None:
             cached_workbook.close()
 
     saved_content = output.getvalue()
+    diagnostic_step_started = time.perf_counter()
     verified = load_workbook(BytesIO(saved_content), keep_vba=True, data_only=False, read_only=False)
+    if diagnostic_timings is not None:
+        diagnostic_timings["　Excel⑤ 保存後Excelを開く"] = time.perf_counter() - diagnostic_step_started
+
+    diagnostic_step_started = time.perf_counter()
     try:
         if list(verified.sheetnames) != original_sheets:
             raise ValueError("保存後にシート構成が変わったため、更新を中止しました。")
@@ -7176,6 +7201,8 @@ def update_workbook_bytes(original_content, customer_name, product_name, propose
             if not same_excel_value(actual, expected):
                 coordinate = verified[sheet].cell(row, column).coordinate
                 raise ValueError(f"保存後の検証で{sheet}!{coordinate}の値が一致しません。")
+        if diagnostic_timings is not None:
+            diagnostic_timings["　Excel⑥ 保存後内容検証"] = time.perf_counter() - diagnostic_step_started
     finally:
         verified.close()
     return saved_content, changed_cells
@@ -7220,6 +7247,7 @@ def save_customer_excel_changes(customer_name, product_name, proposed):
         customer_name,
         product_name,
         proposed,
+        diagnostic_timings=diagnostic_timings,
     )
     diagnostic_timings["Excel編集・保存・検証"] = time.perf_counter() - diagnostic_step_started
 
@@ -7290,16 +7318,22 @@ def update_delivery_history_record_bytes(
     product_name,
     record_ref,
     proposed,
+    diagnostic_timings=None,
 ):
     """納品履歴の指定1行を訂正する。新しい履歴行は追加しない。"""
+    diagnostic_step_started = time.perf_counter()
     workbook = load_workbook(
         BytesIO(original_content),
         keep_vba=True,
         data_only=False,
         read_only=False,
     )
+    if diagnostic_timings is not None:
+        diagnostic_timings["　Excel① マクロ付きExcelを開く"] = time.perf_counter() - diagnostic_step_started
+
     original_sheets = list(workbook.sheetnames)
     changed_cells = []
+    diagnostic_step_started = time.perf_counter()
     try:
         source = str((record_ref or {}).get("source") or "").strip()
         row_number = int((record_ref or {}).get("row_number") or 0)
@@ -7439,18 +7473,29 @@ def update_delivery_history_record_bytes(
             raise ValueError("変更された項目がありません。")
 
         enable_excel_recalculation(workbook)
+        if diagnostic_timings is not None:
+            diagnostic_timings["　Excel③ 対象検索・書換え"] = time.perf_counter() - diagnostic_step_started
+
         output = BytesIO()
+        diagnostic_step_started = time.perf_counter()
         workbook.save(output)
+        if diagnostic_timings is not None:
+            diagnostic_timings["　Excel④ xlsm保存"] = time.perf_counter() - diagnostic_step_started
     finally:
         workbook.close()
 
     saved_content = output.getvalue()
+    diagnostic_step_started = time.perf_counter()
     verified = load_workbook(
         BytesIO(saved_content),
         keep_vba=True,
         data_only=False,
         read_only=False,
     )
+    if diagnostic_timings is not None:
+        diagnostic_timings["　Excel⑤ 保存後Excelを開く"] = time.perf_counter() - diagnostic_step_started
+
+    diagnostic_step_started = time.perf_counter()
     try:
         if list(verified.sheetnames) != original_sheets:
             raise ValueError("保存後にシート構成が変わったため、更新を中止しました。")
@@ -7471,6 +7516,8 @@ def update_delivery_history_record_bytes(
                 raise ValueError(
                     f"保存後の検証で{sheet}!{coordinate}の値が一致しません。"
                 )
+        if diagnostic_timings is not None:
+            diagnostic_timings["　Excel⑥ 保存後内容検証"] = time.perf_counter() - diagnostic_step_started
     finally:
         verified.close()
     return saved_content, changed_cells
@@ -7526,6 +7573,7 @@ def save_customer_delivery_history_correction(
         product_name,
         record_ref,
         proposed,
+        diagnostic_timings=diagnostic_timings,
     )
     diagnostic_timings["Excel編集・保存・検証"] = time.perf_counter() - diagnostic_step_started
 
@@ -16406,6 +16454,12 @@ def show_customer_detail(df, customer_name):
                 "Excel取得",
                 "バックアップ作成",
                 "Excel編集・保存・検証",
+                "　Excel① マクロ付きExcelを開く",
+                "　Excel② 計算値用Excelを開く",
+                "　Excel③ 対象検索・書換え",
+                "　Excel④ xlsm保存",
+                "　Excel⑤ 保存後Excelを開く",
+                "　Excel⑥ 保存後内容検証",
                 "Dropbox本番保存",
                 "保存結果確認",
                 "表示用データ更新",
