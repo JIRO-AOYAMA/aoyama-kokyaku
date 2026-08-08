@@ -6785,10 +6785,168 @@ def confirm_dropbox_upload(target_path, access_token, changed_cells):
     return uploaded_content, get_download_revision(response)
 
 
-def refresh_fast_dropbox_cache_after_save(content, excel_revision, access_token):
-    """保存直後のExcelから表示用JSONを更新し、次の再表示で新しい値を出す。"""
+def rebuild_changed_customer_product_record(
+    content,
+    customer_name,
+    product_name,
+    base_record,
+):
+    """保存済みExcelから、変更した顧客・商品の表示用1行だけを正確に作り直す。"""
+    workbook = load_workbook(
+        BytesIO(content),
+        keep_vba=False,
+        data_only=False,
+        read_only=True,
+    )
     try:
-        refreshed_df = rebuild_sheet1_from_formula_references(BytesIO(content))
+        if DELIVERY_SHEET_NAME not in workbook.sheetnames:
+            raise ValueError("次回配達日シートが見つかりません。")
+
+        target_customer = normalize_match_value(customer_name)
+        target_product = normalize_match_value(product_name)
+        delivery_ws = workbook[DELIVERY_SHEET_NAME]
+        active_rows = []
+        for row_number, values in enumerate(
+            delivery_ws.iter_rows(min_row=1, max_col=16, values_only=True),
+            start=1,
+        ):
+            values = tuple(values or ())
+            if normalize_match_value(values[1] if len(values) >= 2 else None) != target_customer:
+                continue
+            if normalize_match_value(values[4] if len(values) >= 5 else None) != target_product:
+                continue
+            if is_blank_or_zero(values[6] if len(values) >= 7 else None):
+                continue
+            active_rows.append((row_number, values))
+
+        # 既存ルールと同じく、使用中行が1件に確定できない場合は高速経路を使わない。
+        if len(active_rows) != 1:
+            raise ValueError("変更対象の商品行を1件に確定できません。")
+
+        _, delivery_values = active_rows[0]
+        history_key = delivery_history_identity(delivery_values)
+        predicted_usage = None
+        if history_key is not None:
+            states = []
+            if DELIVERY_HISTORY_SHEET_NAME in workbook.sheetnames:
+                history_ws = workbook[DELIVERY_HISTORY_SHEET_NAME]
+                for history_values in history_ws.iter_rows(
+                    min_row=2,
+                    max_col=14,
+                    values_only=True,
+                ):
+                    if delivery_history_identity(history_values) == history_key:
+                        states.append(history_values)
+            # 既存ルールどおり、履歴の後ろへ現在の最新状態を加えて予想使用量を計算する。
+            states.append(delivery_values)
+            predicted_usage = calculate_predicted_daily_usage_from_states(states)
+
+        next_delivery, remaining = calculate_delivery_values(delivery_values)
+        refreshed_record = dict(base_record or {})
+        refreshed_record.update(
+            {
+                "ID": delivery_values[0] if len(delivery_values) >= 1 else None,
+                "顧客名": delivery_values[1] if len(delivery_values) >= 2 else None,
+                "地域": delivery_values[2] if len(delivery_values) >= 3 else None,
+                "コンサル": delivery_values[3] if len(delivery_values) >= 4 else None,
+                "商品名": delivery_values[4] if len(delivery_values) >= 5 else None,
+                "使用数量/日": delivery_values[6] if len(delivery_values) >= 7 else None,
+                "予想使用量/日": predicted_usage,
+                "次回配達予定": next_delivery,
+                "残数": remaining,
+                "メーカー": delivery_values[5] if len(delivery_values) >= 6 else None,
+                "在庫本数": delivery_values[7] if len(delivery_values) >= 8 else None,
+                "本数": delivery_values[8] if len(delivery_values) >= 9 else None,
+                "kg/本": delivery_values[9] if len(delivery_values) >= 10 else None,
+                "配達日": delivery_values[10] if len(delivery_values) >= 11 else None,
+                "_配達数量": delivery_values[11] if len(delivery_values) >= 12 else None,
+            }
+        )
+        return refreshed_record
+    finally:
+        workbook.close()
+
+
+def try_refresh_fast_dropbox_cache_for_changed_product(
+    content,
+    previous_revision,
+    access_token,
+    customer_name,
+    product_name,
+):
+    """直前revと一致する表示用JSONがある時だけ、変更した1商品を差し替える。"""
+    cache_content, _ = download_dropbox_file(
+        DROPBOX_FAST_CACHE_FILE,
+        access_token,
+    )
+    if cache_content is None:
+        return None
+
+    payload = json.loads(cache_content.decode("utf-8"))
+    if payload.get("cache_version") != DROPBOX_FAST_CACHE_VERSION:
+        return None
+    if str(payload.get("excel_revision") or "") != str(previous_revision or ""):
+        return None
+
+    records = payload.get("records", [])
+    if not isinstance(records, list) or not records:
+        return None
+
+    base_df = recalculate_customer_inventory_for_today(pd.DataFrame(records))
+    target_customer = normalize_match_value(customer_name)
+    target_product = normalize_match_value(product_name)
+    matching_indexes = [
+        index
+        for index, row in base_df.iterrows()
+        if normalize_match_value(row.get("顧客名")) == target_customer
+        and normalize_match_value(row.get("商品名")) == target_product
+    ]
+    if len(matching_indexes) != 1:
+        return None
+
+    target_index = matching_indexes[0]
+    refreshed_record = rebuild_changed_customer_product_record(
+        content,
+        customer_name,
+        product_name,
+        base_df.loc[target_index].to_dict(),
+    )
+    for column, value in refreshed_record.items():
+        if column not in base_df.columns:
+            base_df[column] = None
+        base_df.at[target_index, column] = value
+    return base_df
+
+
+def refresh_fast_dropbox_cache_after_save(
+    content,
+    excel_revision,
+    access_token,
+    previous_revision="",
+    customer_name="",
+    product_name="",
+):
+    """保存直後の表示用JSONを更新する。安全に差分更新できない時は従来の全体再生成へ戻す。"""
+    try:
+        refreshed_df = None
+
+        # 保存直前のExcel revと既存JSONのrevが完全一致する場合だけ、
+        # 変更した顧客・商品1行の差分更新を使う。
+        # 条件が1つでも合わない場合は、従来どおりExcel全体から作り直す。
+        if previous_revision and customer_name and product_name:
+            try:
+                refreshed_df = try_refresh_fast_dropbox_cache_for_changed_product(
+                    content,
+                    previous_revision,
+                    access_token,
+                    customer_name,
+                    product_name,
+                )
+            except Exception:
+                refreshed_df = None
+
+        if not isinstance(refreshed_df, pd.DataFrame) or refreshed_df.empty:
+            refreshed_df = rebuild_sheet1_from_formula_references(BytesIO(content))
         if refreshed_df.empty:
             return "保存は完了しましたが、表示用キャッシュを更新できませんでした。更新ボタンを押してください。"
 
@@ -7098,6 +7256,9 @@ def save_customer_excel_changes(customer_name, product_name, proposed):
         saved_content,
         confirmed_revision,
         access_token,
+        previous_revision=revision,
+        customer_name=customer_name,
+        product_name=product_name,
     )
     diagnostic_timings["表示用データ更新"] = time.perf_counter() - diagnostic_step_started
 
@@ -7405,6 +7566,9 @@ def save_customer_delivery_history_correction(
         saved_content,
         confirmed_revision,
         access_token,
+        previous_revision=revision,
+        customer_name=customer_name,
+        product_name=product_name,
     )
     diagnostic_timings["表示用データ更新"] = time.perf_counter() - diagnostic_step_started
     diagnostic_step_started = time.perf_counter()
