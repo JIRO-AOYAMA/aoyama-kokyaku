@@ -996,6 +996,17 @@ def get_microsoft_user_claims():
     return dict(claims or {})
 
 
+def is_private_test_login_bypass_enabled():
+    """Privateなテストアプリで明示的に許可した時だけMicrosoftログインを省略する。"""
+    try:
+        value = st.secrets.get("TEST_PRIVATE_BYPASS_LOGIN", False)
+    except Exception:
+        return False
+    if isinstance(value, bool):
+        return value
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 def get_configured_auth_client_id():
     """[auth] に設定されたログイン専用MicrosoftアプリのClient IDを返す。"""
     try:
@@ -1133,6 +1144,8 @@ def clear_application_login_state(revoke_current=True):
 @st.fragment(run_every="10s")
 def enforce_login_expiry():
     """Microsoft本人確認と独自トークンを確認し、利用中は期限を12時間へ更新する。"""
+    if is_private_test_login_bypass_enabled():
+        return
     claims = get_microsoft_user_claims()
     token = str(st.session_state.get("login_token", "") or "").strip()
     identity_error = validate_microsoft_identity(claims, require_allowed_sub=True)
@@ -5182,7 +5195,19 @@ remove_obsolete_login_query_params()
 if "authenticated" not in st.session_state:
     st.session_state.authenticated = False
 
-microsoft_claims = get_microsoft_user_claims()
+private_test_login_bypass = is_private_test_login_bypass_enabled()
+if private_test_login_bypass:
+    microsoft_claims = {
+        "is_logged_in": True,
+        "sub": str(MICROSOFT_ALLOWED_SUB or "private-test-user"),
+        "iss": MICROSOFT_ISSUER_PREFIX + "private-test",
+        "aud": get_configured_auth_client_id(),
+        "iat": int(time.time()),
+        "preferred_username": "Private test app",
+        "name": "Private test app",
+    }
+else:
+    microsoft_claims = get_microsoft_user_claims()
 microsoft_is_logged_in = bool(microsoft_claims.get("is_logged_in"))
 
 # 期限切れを検知したフラグがある場合は、OIDC Cookieも削除してログイン画面へ戻す。
@@ -5229,7 +5254,7 @@ microsoft_account_name = str(
 ).strip()
 
 # 初回だけ、本人のsubを確認してSecretsへ登録する。登録されるまではアプリデータを表示しない。
-if not MICROSOFT_ALLOWED_SUB:
+if not MICROSOFT_ALLOWED_SUB and not private_test_login_bypass:
     clear_application_login_state(revoke_current=False)
     st.title("🔐 Microsoftログイン 初回確認")
     st.success(f"Microsoftへのログインに成功しました：{microsoft_account_name}")
@@ -5241,7 +5266,7 @@ if not MICROSOFT_ALLOWED_SUB:
         st.logout()
     st.stop()
 
-if not hmac.compare_digest(microsoft_sub, MICROSOFT_ALLOWED_SUB):
+if not private_test_login_bypass and not hmac.compare_digest(microsoft_sub, MICROSOFT_ALLOWED_SUB):
     record_denied_microsoft_login(microsoft_claims, "account_not_allowed")
     clear_application_login_state(revoke_current=False)
     st.title("⛔ ログインできません")
@@ -5302,10 +5327,13 @@ if not active_login_payload:
     set_query_params_safely({"page": "home", "auth_invalid": "1"})
     st.rerun()
 
-login_audit_warning = ensure_login_audit_for_current_session(
-    microsoft_claims,
-    active_login_payload,
-)
+if private_test_login_bypass:
+    login_audit_warning = ""
+else:
+    login_audit_warning = ensure_login_audit_for_current_session(
+        microsoft_claims,
+        active_login_payload,
+    )
 if login_audit_warning:
     st.session_state["login_audit_warning"] = login_audit_warning
 
