@@ -62,6 +62,59 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 
+
+
+def disable_browser_input_history():
+    """入力値や保存処理は変えず、ブラウザの過去入力候補だけを全入力欄で抑止する。"""
+    st.html(
+        r"""
+<script>
+(() => {
+  const ATTR = "data-aoyama-autocomplete-off";
+
+  function applyToDocument(doc) {
+    if (!doc || !doc.documentElement) return;
+
+    try {
+      doc.querySelectorAll('input:not([type="file"]), textarea').forEach((element) => {
+        element.setAttribute('autocomplete', 'off');
+      });
+    } catch (_) {}
+
+    try {
+      doc.querySelectorAll('iframe').forEach((frame) => {
+        try {
+          if (!frame.dataset.aoyamaAutocompleteLoadHook) {
+            frame.dataset.aoyamaAutocompleteLoadHook = '1';
+            frame.addEventListener('load', () => {
+              try { applyToDocument(frame.contentDocument); } catch (_) {}
+            });
+          }
+          applyToDocument(frame.contentDocument);
+        } catch (_) {}
+      });
+    } catch (_) {}
+
+    if (doc.documentElement.getAttribute(ATTR) === '1') return;
+    doc.documentElement.setAttribute(ATTR, '1');
+    try {
+      const observer = new MutationObserver(() => applyToDocument(doc));
+      observer.observe(doc.documentElement, {childList: true, subtree: true});
+    } catch (_) {}
+  }
+
+  applyToDocument(document);
+  setTimeout(() => applyToDocument(document), 250);
+  setTimeout(() => applyToDocument(document), 1000);
+})();
+</script>
+""",
+        unsafe_allow_javascript=True,
+    )
+
+
+disable_browser_input_history()
+
 # 画像処理の診断記録は画面や保存データを変えず、Streamlitのサーバーログへだけ出す。
 # アクセストークン・ダウンロードURL・画像本体は絶対に記録しない。
 IMAGE_EVENT_LOGGER = logging.getLogger("aoyama.image")
@@ -7887,6 +7940,118 @@ def _xml_fast_find_recent_date_style(sheet_data, column_number):
     return None
 
 
+
+def _xml_fast_next_history_row_bytes(history_xml):
+    """配達履歴XMLを丸ごとElementTree化せず、A列の最終データ行の次を安全に返す。"""
+    raw = bytes(history_xml or b"")
+    if b"</sheetData>" not in raw:
+        raise _XmlFastSaveUnavailable("配達履歴シートのデータ末尾を確認できません。")
+
+    # 現在のExcelが使っている標準的なworksheet XMLだけ高速経路を使う。
+    root_match = re.search(br"<worksheet\b[^>]*>", raw[:4096])
+    if not root_match:
+        raise _XmlFastSaveUnavailable("配達履歴XMLの形式が高速経路の想定と異なります。")
+    if b'xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"' not in root_match.group(0):
+        raise _XmlFastSaveUnavailable("配達履歴XMLの名前空間が高速経路の想定と異なります。")
+
+    # 従来処理と同じく「A列に値がある最終行 + 1」。空の書式行は数えない。
+    last_nonblank_row = None
+    cell_pattern = re.compile(
+        br'<c\b[^>]*\br="A([0-9]+)"[^>]*>(.*?)</c>',
+        flags=re.DOTALL,
+    )
+    for match in cell_pattern.finditer(raw):
+        content = re.sub(br"<[^>]+>", b"", match.group(2)).strip()
+        if not content:
+            continue
+        try:
+            row_number = int(match.group(1))
+        except Exception:
+            continue
+        if last_nonblank_row is None or row_number > last_nonblank_row:
+            last_nonblank_row = row_number
+
+    if last_nonblank_row is None:
+        raise _XmlFastSaveUnavailable("配達履歴A列の最終データ行を確認できません。")
+
+    next_row = int(last_nonblank_row) + 1
+    duplicate_pattern = re.compile(
+        br'<row\b[^>]*\br="' + str(next_row).encode("ascii") + br'"(?:\s[^>]*)?>'
+    )
+    if duplicate_pattern.search(raw):
+        raise _XmlFastSaveUnavailable("配達履歴の次行に既存行があるため従来XML経路を使用します。")
+    return next_row
+
+
+def _xml_fast_find_recent_date_style_bytes(history_xml, column_number):
+    """大きい履歴XMLを解析せず、指定列で最後に使われたstyle番号だけを取得する。"""
+    column_letters = re.sub(r"[0-9]+$", "", _xlsx_cell_reference(1, column_number))
+    pattern = re.compile(
+        br'<c\b[^>]*\br="'
+        + column_letters.encode("ascii")
+        + br'[0-9]+"[^>]*>'
+    )
+    recent_style = None
+    for match in pattern.finditer(bytes(history_xml or b"")):
+        style_match = re.search(br'\bs="([^"]+)"', match.group(0))
+        if style_match:
+            recent_style = style_match.group(1).decode("ascii", errors="ignore")
+    return recent_style or None
+
+
+def _xml_fast_history_row_bytes(row, history_xml):
+    """新しい履歴1行だけをXML化する。既存の巨大な履歴XML全体は再シリアライズしない。"""
+    row_xml = ET.tostring(row, encoding="utf-8")
+    main_namespace = b"http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+
+    # ElementTreeがこの1行だけに付けたnamespace宣言/prefixを、
+    # 既存worksheetのdefault namespace配下へ差し込める形に戻す。
+    default_namespace = b' xmlns="' + main_namespace + b'"'
+    if row_xml.startswith(b"<row"):
+        row_xml = row_xml.replace(default_namespace, b"", 1)
+    else:
+        prefix_match = re.match(br"<([A-Za-z_][A-Za-z0-9_.-]*):row\b", row_xml)
+        if not prefix_match:
+            raise _XmlFastSaveUnavailable("追加する配達履歴行のXML namespaceを確認できません。")
+        prefix = prefix_match.group(1)
+        declaration = b' xmlns:' + prefix + b'="' + main_namespace + b'"'
+        row_xml = row_xml.replace(declaration, b"", 1)
+        row_xml = row_xml.replace(b"<" + prefix + b":", b"<")
+        row_xml = row_xml.replace(b"</" + prefix + b":", b"</")
+
+    if not row_xml.startswith(b"<row") or not row_xml.endswith(b"</row>"):
+        raise _XmlFastSaveUnavailable("追加する配達履歴行を安全にXML化できません。")
+    return row_xml
+
+
+def _xml_fast_append_history_row_bytes(history_xml, row_xml, history_row_number):
+    """既存履歴XMLへ1行だけ差し込み、dimensionだけ従来ルールどおり更新する。"""
+    raw = bytes(history_xml or b"")
+    row_xml = bytes(row_xml or b"")
+    target_row = int(history_row_number)
+
+    dimension_match = re.search(
+        br'<dimension\b[^>]*\bref="([^"]+)"[^>]*/>',
+        raw,
+    )
+    if not dimension_match:
+        raise _XmlFastSaveUnavailable("配達履歴シートのdimensionを確認できません。")
+    current_ref = dimension_match.group(1).decode("ascii", errors="ignore")
+    if ":" not in current_ref:
+        raise _XmlFastSaveUnavailable("配達履歴シートのdimension形式を確認できません。")
+    first_ref, last_ref = current_ref.split(":", 1)
+    last_column_match = re.match(r"^([A-Za-z]+)", last_ref)
+    if not last_column_match:
+        raise _XmlFastSaveUnavailable("配達履歴シートの最終列を確認できません。")
+    new_ref = f"{first_ref}:{last_column_match.group(1)}{target_row}".encode("ascii")
+    raw = raw[: dimension_match.start(1)] + new_ref + raw[dimension_match.end(1) :]
+
+    sheet_data_end = raw.find(b"</sheetData>")
+    if sheet_data_end < 0:
+        raise _XmlFastSaveUnavailable("配達履歴シートの追加位置を確認できません。")
+    return raw[:sheet_data_end] + row_xml + raw[sheet_data_end:]
+
+
 def _xml_fast_patch_recalculation(workbook_root):
     main_ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
     calculation = workbook_root.find(f"{{{main_ns}}}calcPr")
@@ -8043,12 +8208,23 @@ def _update_workbook_bytes_xml_fast(
         if event_changed:
             history_path = sheet_paths[DELIVERY_HISTORY_SHEET_NAME]
             history_xml = archive.read(history_path)
-            history_root = ET.fromstring(history_xml)
-            history_row_number, history_sheet_data = _xml_fast_next_history_row(
-                history_root,
-                shared_strings,
-                date1904=date1904,
-            )
+
+            # 巨大な配達履歴XMLは、想定どおりの形式なら「新しい1行だけ」を差し込む。
+            # 少しでも形式が違えば、直前まで使っていたElementTree経路へ自動で戻す。
+            history_fast_bytes = False
+            history_root = None
+            history_sheet_data = None
+            try:
+                history_row_number = _xml_fast_next_history_row_bytes(history_xml)
+                history_fast_bytes = True
+            except _XmlFastSaveUnavailable:
+                history_root = ET.fromstring(history_xml)
+                history_row_number, history_sheet_data = _xml_fast_next_history_row(
+                    history_root,
+                    shared_strings,
+                    date1904=date1904,
+                )
+
             new_history_row = ET.Element(
                 "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}row",
                 {"r": str(history_row_number)},
@@ -8071,10 +8247,16 @@ def _update_workbook_bytes_xml_fast(
                 if value is not None:
                     date_style = None
                     if isinstance(value, (date, datetime)):
-                        date_style = _xml_fast_find_recent_date_style(
-                            history_sheet_data,
-                            column,
-                        )
+                        if history_fast_bytes:
+                            date_style = _xml_fast_find_recent_date_style_bytes(
+                                history_xml,
+                                column,
+                            )
+                        else:
+                            date_style = _xml_fast_find_recent_date_style(
+                                history_sheet_data,
+                                column,
+                            )
                         if not date_style and source_cell is not None:
                             date_style = source_cell.attrib.get("s")
                     _xml_fast_set_cell_value(
@@ -8089,9 +8271,20 @@ def _update_workbook_bytes_xml_fast(
                     (DELIVERY_HISTORY_SHEET_NAME, history_row_number, column, value)
                 )
 
-            history_sheet_data.append(new_history_row)
-            _xml_fast_update_dimension(history_root, history_row_number)
-            replacements[history_path] = _xml_fast_serialize(history_root, history_xml)
+            if history_fast_bytes:
+                new_history_xml = _xml_fast_history_row_bytes(
+                    new_history_row,
+                    history_xml,
+                )
+                replacements[history_path] = _xml_fast_append_history_row_bytes(
+                    history_xml,
+                    new_history_xml,
+                    history_row_number,
+                )
+            else:
+                history_sheet_data.append(new_history_row)
+                _xml_fast_update_dimension(history_root, history_row_number)
+                replacements[history_path] = _xml_fast_serialize(history_root, history_xml)
 
             management_path = sheet_paths[MANAGEMENT_SHEET_NAME]
             management_xml = archive.read(management_path)
