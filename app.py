@@ -11303,17 +11303,19 @@ def show_hotel_information_editor_dialog(record=None):
         st.session_state[initialized_key] = True
 
     st.caption("必須項目はホテル名だけです。住所・Googleマップやその他の項目は、あとから追加できます。")
-    st.text_input("ホテル名（必須）", key=hotel_name_key)
+    st.text_input("ホテル名（必須）", key=hotel_name_key, autocomplete="off")
     st.text_input(
         "地域（任意）",
         key=region_key,
         placeholder="例：札幌、帯広、名古屋",
+        autocomplete="off",
     )
     st.text_area("住所（任意）", key=address_key, height=90)
     st.text_input(
         "Googleマップ（任意）",
         key=google_map_key,
         placeholder="共有URL・緯度経度・施設名のいずれでも入力できます",
+        autocomplete="off",
     )
 
     st.markdown("#### 自由項目")
@@ -11340,6 +11342,7 @@ def show_hotel_information_editor_dialog(record=None):
                 f"自由項目 {index + 1}：項目名",
                 key=name_key,
                 placeholder="例：バイク駐車場",
+                autocomplete="off",
             )
             st.text_area(
                 f"自由項目 {index + 1}：内容",
@@ -11511,6 +11514,7 @@ def show_hotel_information_page():
         "ホテル名・地域・住所・自由項目を検索",
         key=query_key,
         placeholder="ホテル名・地域・住所・項目名・内容の一部を入力",
+        autocomplete="off",
     )
     normalized_query = clean_value(query, blank_text="").strip().casefold()
     query_terms = [
@@ -13230,6 +13234,7 @@ def render_customer_attachments_section(
                         "選択した写真の新しいタグ",
                         placeholder="例：北海道、タンク、要確認",
                         key=f"onedrive_attachment_recent_new_tags_{recent_widget_suffix}",
+                        autocomplete="off",
                     )
                     recent_remarks = st.text_area(
                         "選択した写真の備考",
@@ -13412,6 +13417,7 @@ def render_customer_attachments_section(
                     "新しいタグ（候補にない場合）",
                     placeholder="例：北海道、タンク、要確認",
                     key=f"onedrive_attachment_new_tags_{add_widget_suffix}",
+                    autocomplete="off",
                 )
                 if add_tag_history_options:
                     st.caption(
@@ -13584,6 +13590,7 @@ def render_customer_attachments_section(
                         "新しいタグ（候補にない場合）",
                         placeholder="例：北海道、タンク、要確認",
                         key=f"onedrive_attachment_camera_new_tags_{camera_widget_suffix}",
+                        autocomplete="off",
                     )
                     if camera_tag_history_options:
                         st.caption(
@@ -13843,6 +13850,7 @@ def render_customer_attachments_section(
                                 value="",
                                 placeholder="候補にないタグだけ入力",
                                 key=f"onedrive_attachment_edit_new_{group_ui_id}",
+                                autocomplete="off",
                             )
                             edited_remarks = st.text_area(
                                 "備考を編集",
@@ -14008,6 +14016,7 @@ def show_attachment_search_page():
         "取引先名・タグ・備考を検索",
         placeholder="文字を入力",
         key="attachment_global_text_filter",
+        autocomplete="off",
     )
     tag_options = attachment_tag_history_options(attachments)
     selected_tags = st.multiselect(
@@ -14943,9 +14952,9 @@ def render_customer_estimates_section(customer_name, customer_key=None):
                     "提案日",
                     value=get_jst_now().date(),
                 )
-                product_name = st.text_input("商品名")
-                manufacturer = st.text_input("メーカー")
-                unit_price = st.text_input("単価", placeholder="例：85、3,500")
+                product_name = st.text_input("商品名", autocomplete="off")
+                manufacturer = st.text_input("メーカー", autocomplete="off")
+                unit_price = st.text_input("単価", placeholder="例：85、3,500", autocomplete="off")
                 remarks = st.text_area("備考", height=110)
                 save_col, cancel_col = st.columns(2)
                 with save_col:
@@ -15014,13 +15023,16 @@ def render_customer_estimates_section(customer_name, customer_key=None):
                             value=estimate_date_input_value(estimate.get("proposal_date")),
                         )
                         product_name = st.text_input(
-                            "商品名", value=estimate.get("product_name", "")
+                            "商品名", value=estimate.get("product_name", ""),
+                            autocomplete="off",
                         )
                         manufacturer = st.text_input(
-                            "メーカー", value=estimate.get("manufacturer", "")
+                            "メーカー", value=estimate.get("manufacturer", ""),
+                            autocomplete="off",
                         )
                         unit_price = st.text_input(
-                            "単価", value=estimate.get("unit_price", "")
+                            "単価", value=estimate.get("unit_price", ""),
+                            autocomplete="off",
                         )
                         remarks = st.text_area(
                             "備考", value=estimate.get("remarks", ""), height=110
@@ -15668,12 +15680,14 @@ def render_carrier_freight_form(form_key, existing=None):
             value=existing.get("pickup_location", ""),
             placeholder="例：○○工場",
             key=f"{form_key}_pickup_location",
+            autocomplete="off",
         )
         delivery_destination = st.text_input(
             "納品先",
             value=existing.get("delivery_destination", ""),
             placeholder="例：△△牧場",
             key=f"{form_key}_delivery_destination",
+            autocomplete="off",
         )
         truck_col, quantity_col, rate_col = st.columns(3)
         with truck_col:
@@ -15682,6 +15696,7 @@ def render_carrier_freight_form(form_key, existing=None):
                 value=existing.get("truck_freight", ""),
                 placeholder="例：200000",
                 key=f"{form_key}_truck_freight",
+                autocomplete="off",
             )
         with quantity_col:
             quantity_kg = st.text_input(
@@ -15689,6 +15704,7 @@ def render_carrier_freight_form(form_key, existing=None):
                 value=existing.get("quantity_kg", ""),
                 placeholder="例：20000",
                 key=f"{form_key}_quantity_kg",
+                autocomplete="off",
             )
         with rate_col:
             kg_rate = st.text_input(
@@ -15696,6 +15712,7 @@ def render_carrier_freight_form(form_key, existing=None):
                 value=existing.get("kg_rate", ""),
                 placeholder="例：10",
                 key=f"{form_key}_kg_rate",
+                autocomplete="off",
             )
         st.caption(
             "数量と1車運賃がある場合はkg単価を自動計算します。"
@@ -16159,7 +16176,7 @@ def render_customer_information_form(customer_name, customer_key, items, state_s
 
     st.markdown("**新しい項目**")
     with st.form(f"customer_information_add_form_{state_suffix}"):
-        field_name = st.text_input("項目名", placeholder="例：担当者")
+        field_name = st.text_input("項目名", placeholder="例：担当者", autocomplete="off")
         content = st.text_area(
             "内容",
             placeholder="内容を入力（複数行可）",
@@ -16276,7 +16293,7 @@ def render_customer_information_card(customer_name, customer_key=None):
 
             if edit_mode and active_edit_id == item_id:
                 with st.form(f"customer_information_edit_form_{item_id}"):
-                    edited_name = st.text_input("項目名", value=field_name)
+                    edited_name = st.text_input("項目名", value=field_name, autocomplete="off")
                     edited_content = st.text_area(
                         "内容", value=content, height=120
                     )
@@ -17306,27 +17323,32 @@ def render_customer_delivery_history_editor(
                     "メーカー",
                     value=value_for_input(record.get("メーカー")),
                     help=VOICE_INPUT_HELP,
+                    autocomplete="off",
                 )
                 inventory_bottles = st.text_input(
                     "在庫本数",
                     value=value_for_input(record.get("在庫本数")),
                     help=VOICE_INPUT_HELP,
+                    autocomplete="off",
                 )
                 bottles = st.text_input(
                     "本数",
                     value=value_for_input(record.get("本数")),
                     help=VOICE_INPUT_HELP,
+                    autocomplete="off",
                 )
                 kg_per_bottle = st.text_input(
                     "kg/本",
                     value=value_for_input(record.get("kg/本")),
                     help=VOICE_INPUT_HELP,
+                    autocomplete="off",
                 )
                 delivery_date = st.text_input(
                     "配達日",
                     value=date_for_input(record.get("配達日")),
                     placeholder="例：2026年7月15日",
                     help=VOICE_INPUT_HELP,
+                    autocomplete="off",
                 )
                 save_col, cancel_col = st.columns(2)
                 with save_col:
@@ -17544,6 +17566,7 @@ def render_customer_excel_editor(customer_name, customer_key, product_name, curr
             value="",
             placeholder="メーカー名を入力",
             help=VOICE_INPUT_HELP,
+            autocomplete="off",
         )
         st.caption(
             "在庫本数＝配達前に確認した本数、本数＝今回配達する本数です。"
@@ -17554,24 +17577,28 @@ def render_customer_excel_editor(customer_name, customer_key, product_name, curr
             value="",
             placeholder="確認できた場合：例 3本",
             help=VOICE_INPUT_HELP,
+            autocomplete="off",
         )
         bottles = st.text_input(
             "本数",
             value="",
             placeholder="今回配達：例 10本",
             help=VOICE_INPUT_HELP,
+            autocomplete="off",
         )
         kg_per_bottle = st.text_input(
             "kg/本",
             value="",
             placeholder="例：450キロ",
             help=VOICE_INPUT_HELP,
+            autocomplete="off",
         )
         delivery_date = st.text_input(
             "配達日",
             value="",
             placeholder="例：2026年7月15日",
             help=VOICE_INPUT_HELP,
+            autocomplete="off",
         )
         save_col, cancel_col = st.columns(2)
         with save_col:
@@ -17760,11 +17787,13 @@ def render_customer_map_editor(customer_name, current):
             "住所",
             value=value_for_input(current.get("住所")),
             help=VOICE_INPUT_HELP,
+            autocomplete="off",
         )
         map_location = st.text_input(
             "マップ位置",
             value=value_for_input(current.get("マップ位置")),
             help=f"緯度,経度／Googleマップ共有URL／文字列を入力できます。{VOICE_INPUT_HELP}",
+            autocomplete="off",
         )
         save_col, cancel_col = st.columns(2)
         with save_col:
@@ -18169,6 +18198,7 @@ def show_customer_directory(df=None):
         "一覧を絞り込み",
         placeholder="顧客名・ひらがな・地域",
         key="customer_directory_keyword",
+        autocomplete="off",
     ).strip()
 
     filtered = customers
@@ -18360,6 +18390,7 @@ def render_global_customer_search():
             placeholder="例：三谷、みたに、帯広、帯広 牧場",
             key=GLOBAL_CUSTOMER_SEARCH_INPUT_KEY,
             help=VOICE_INPUT_HELP,
+            autocomplete="off",
         ).strip()
 
     if not keyword:
@@ -18423,6 +18454,7 @@ def show_customer_search(df=None, show_home_link=False):
             placeholder="例：三谷、みたに、帯広、帯広 牧場",
             key="customer_search_input",
             help=VOICE_INPUT_HELP,
+            autocomplete="off",
         ).strip()
 
     if keyword:
@@ -18745,6 +18777,7 @@ def show_product_search(df=None):
             placeholder="例：酒、日清丸紅",
             key="product_search_input",
             help=VOICE_INPUT_HELP,
+            autocomplete="off",
         ).strip()
 
     if keyword:
@@ -18813,6 +18846,7 @@ def show_region_search(df=None):
         placeholder="例：帯広、芽室、釧路",
         key="region_search_input",
         help=VOICE_INPUT_HELP,
+        autocomplete="off",
     ).strip()
 
     if keyword:
@@ -19814,36 +19848,43 @@ def show_dispatch_filters(df):
                 "引取日",
                 key="dispatch_filter_pickup_date_text",
                 placeholder="例：8/1、8月1日、2026/8/1",
+                autocomplete="off",
             ).strip()
             arrival_date_keyword = st.text_input(
                 "着日",
                 key="dispatch_filter_arrival_date_text",
                 placeholder="例：8/1、8月1日、2026/8/1",
+                autocomplete="off",
             ).strip()
             pickup_place_keyword = st.text_input(
                 "引取先",
                 key="dispatch_filter_pickup_place_text",
                 placeholder="引取先の一部を入力",
+                autocomplete="off",
             ).strip()
             product_keyword = st.text_input(
                 "商品名",
                 key="dispatch_filter_product_text",
                 placeholder="商品名の一部を入力",
+                autocomplete="off",
             ).strip()
             quantity_keyword = st.text_input(
                 "数量",
                 key="dispatch_filter_quantity",
                 placeholder="例：450㎏、44本",
+                autocomplete="off",
             ).strip()
             carrier_keyword = st.text_input(
                 "運送会社",
                 key="dispatch_filter_carrier_text",
                 placeholder="運送会社の一部を入力",
+                autocomplete="off",
             ).strip()
             destination_keyword = st.text_input(
                 "納品先",
                 key="dispatch_filter_destination_text",
                 placeholder="納品先の一部を入力",
+                autocomplete="off",
             ).strip()
 
             if st.button("条件をすべて解除", use_container_width=True, key="dispatch_filter_clear"):
@@ -21262,18 +21303,21 @@ def render_soluble_customer_editor(customer_name, current, key_scope):
             value="",
             placeholder="例：2026年7月15日",
             help=VOICE_INPUT_HELP,
+            autocomplete="off",
         )
         delivery_quantity_text = st.text_input(
             "配達数量",
             value="",
             placeholder="例：15000",
             help=VOICE_INPUT_HELP,
+            autocomplete="off",
         )
         usage_text = st.text_input(
             "使用数量/日",
             value="",
             placeholder="例：1000",
             help=VOICE_INPUT_HELP,
+            autocomplete="off",
         )
         st.caption("次回配達予定はExcelの数式で計算されるため、直接編集しません。")
         save_col, cancel_col = st.columns(2)
@@ -22311,11 +22355,13 @@ def show_soluble_inventory_page():
                     "使用量/日",
                     value=soluble_input_value(usage),
                     key=f"{form_key}_usage",
+                    autocomplete="off",
                 )
                 delivery_text = st.text_input(
                     "納品",
                     value=soluble_input_value(delivery),
                     key=f"{form_key}_delivery",
+                    autocomplete="off",
                 )
                 current_formula = bool(row.get(f"{location}_inventory_formula")) and not bool(
                     row.get(f"{location}_inventory_manual")
@@ -22329,6 +22375,7 @@ def show_soluble_inventory_page():
                     "在庫（自動計算を外した場合に使用）",
                     value=soluble_input_value(inventory),
                     key=f"{form_key}_inventory",
+                    autocomplete="off",
                 )
                 submitted = st.form_submit_button("バックアップして保存", use_container_width=True)
 
@@ -24419,6 +24466,7 @@ def show_trade_partner_search(partner_type):
         value=default_keyword,
         placeholder="入力すると候補を表示します",
         key=f"{partner_type}_partner_search_input",
+        autocomplete="off",
     ).strip()
     update_query_params(
         page=trade_partner_search_page(partner_type),
@@ -24457,6 +24505,7 @@ def show_supplier_product_search():
         "商品名で検索",
         placeholder="例：酒、醤油粕",
         key="supplier_product_search_input",
+        autocomplete="off",
     ).strip()
     if not keyword:
         st.info("商品名を入力してください。")
@@ -24513,6 +24562,7 @@ def show_carrier_condition_search():
         "納品先・地域・運賃などで検索",
         placeholder="例：帯広、釧路",
         key="carrier_condition_search_input",
+        autocomplete="off",
     ).strip()
     if not keyword:
         st.info("検索文字を入力してください。")
@@ -24612,6 +24662,7 @@ def render_trade_partner_form_input(header, value="", key=None):
         header,
         value=trade_partner_text(value),
         key=key,
+        autocomplete="off",
     )
 
 
