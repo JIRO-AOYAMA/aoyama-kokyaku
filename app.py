@@ -7011,9 +7011,104 @@ def find_next_delivery_history_row(ws):
     return row + 1
 
 
+def read_cached_delivery_row_values_lightweight(original_content, product_row):
+    """計算済み値だけを読み取り専用で取得する。元Excelやマクロは変更しない。"""
+    cached_workbook = load_workbook(
+        BytesIO(original_content),
+        keep_vba=False,
+        data_only=True,
+        read_only=True,
+    )
+    try:
+        if DELIVERY_SHEET_NAME not in cached_workbook.sheetnames:
+            return None
+        cached_delivery_ws = cached_workbook[DELIVERY_SHEET_NAME]
+        row_values = next(
+            cached_delivery_ws.iter_rows(
+                min_row=product_row,
+                max_row=product_row,
+                min_col=1,
+                max_col=14,
+                values_only=True,
+            ),
+            None,
+        )
+        return tuple(row_values) if row_values is not None else None
+    finally:
+        cached_workbook.close()
+
+
+def verify_saved_workbook_lightweight(
+    saved_content,
+    original_sheets,
+    required_sheets,
+    changed_cells,
+):
+    """保存後の確認項目はそのままに、読み取り専用で必要箇所だけ検証する。"""
+    verified = load_workbook(
+        BytesIO(saved_content),
+        keep_vba=False,
+        data_only=False,
+        read_only=True,
+    )
+    try:
+        if list(verified.sheetnames) != original_sheets:
+            raise ValueError("保存後にシート構成が変わったため、更新を中止しました。")
+        if not set(required_sheets).issubset(set(verified.sheetnames)):
+            raise ValueError("保存後の検証で必要なシートが見つかりません。")
+
+        targets_by_sheet = {}
+        for sheet, row, column, expected in changed_cells:
+            targets_by_sheet.setdefault(sheet, {}).setdefault(int(row), {})[int(column)] = expected
+
+        for sheet, row_targets in targets_by_sheet.items():
+            if sheet not in verified.sheetnames:
+                raise ValueError(f"保存後の検証で{sheet}シートが見つかりません。")
+            ws = verified[sheet]
+            target_rows = sorted(row_targets)
+            min_row = target_rows[0]
+            max_row = target_rows[-1]
+            max_col = max(
+                column
+                for columns in row_targets.values()
+                for column in columns
+            )
+            seen_rows = set()
+            for row_number, values in enumerate(
+                ws.iter_rows(
+                    min_row=min_row,
+                    max_row=max_row,
+                    min_col=1,
+                    max_col=max_col,
+                    values_only=True,
+                ),
+                start=min_row,
+            ):
+                if row_number not in row_targets:
+                    continue
+                seen_rows.add(row_number)
+                values = tuple(values or ())
+                for column, expected in row_targets[row_number].items():
+                    actual = values[column - 1] if len(values) >= column else None
+                    if not same_excel_value(actual, expected):
+                        # 不一致時だけ座標名を取り直す。正常時の速度には影響しない。
+                        coordinate = ws.cell(row_number, column).coordinate
+                        raise ValueError(
+                            f"保存後の検証で{sheet}!{coordinate}の値が一致しません。"
+                        )
+            missing_rows = set(row_targets) - seen_rows
+            if missing_rows:
+                missing_row = min(missing_rows)
+                raise ValueError(
+                    f"保存後の検証で{sheet}の{missing_row}行目を確認できません。"
+                )
+    finally:
+        verified.close()
+
+
 def copy_previous_delivery_state_to_history(
     workbook,
-    cached_workbook,
+    cached_row_values,
     delivery_ws,
     product_row,
     changed_cells,
@@ -7026,11 +7121,6 @@ def copy_previous_delivery_state_to_history(
 
     history_ws = workbook[DELIVERY_HISTORY_SHEET_NAME]
     management_ws = workbook[MANAGEMENT_SHEET_NAME]
-    cached_delivery_ws = (
-        cached_workbook[DELIVERY_SHEET_NAME]
-        if cached_workbook is not None and DELIVERY_SHEET_NAME in cached_workbook.sheetnames
-        else None
-    )
     history_row = find_next_delivery_history_row(history_ws)
 
     old_values = [delivery_ws.cell(product_row, column).value for column in range(1, 17)]
@@ -7040,8 +7130,8 @@ def copy_previous_delivery_state_to_history(
         value = delivery_ws.cell(product_row, column).value
         if isinstance(value, str) and value.startswith("="):
             cached_value = (
-                cached_delivery_ws.cell(product_row, column).value
-                if cached_delivery_ws is not None
+                cached_row_values[column - 1]
+                if cached_row_values is not None and len(cached_row_values) >= column
                 else None
             )
             if cached_value is not None:
@@ -7071,19 +7161,8 @@ def update_workbook_bytes(
     if diagnostic_timings is not None:
         diagnostic_timings["　Excel① マクロ付きExcelを開く"] = time.perf_counter() - diagnostic_step_started
 
-    cached_workbook = None
-    diagnostic_step_started = time.perf_counter()
-    try:
-        cached_workbook = load_workbook(
-            BytesIO(original_content),
-            keep_vba=False,
-            data_only=True,
-            read_only=False,
-        )
-    except Exception:
-        cached_workbook = None
-    if diagnostic_timings is not None:
-        diagnostic_timings["　Excel② 計算値用Excelを開く"] = time.perf_counter() - diagnostic_step_started
+    cached_row_values = None
+    cached_values_seconds = 0.0
 
     original_sheets = list(workbook.sheetnames)
     changed_cells = []
@@ -7120,9 +7199,18 @@ def update_workbook_bytes(
             }.items()
         )
         if event_changed:
+            cached_values_started = time.perf_counter()
+            try:
+                cached_row_values = read_cached_delivery_row_values_lightweight(
+                    original_content,
+                    product_row,
+                )
+            except Exception:
+                cached_row_values = None
+            cached_values_seconds = time.perf_counter() - cached_values_started
             copy_previous_delivery_state_to_history(
                 workbook,
-                cached_workbook,
+                cached_row_values,
                 delivery_ws,
                 product_row,
                 changed_cells,
@@ -7164,7 +7252,10 @@ def update_workbook_bytes(
             raise ValueError("変更された項目がありません。")
         enable_excel_recalculation(workbook)
         if diagnostic_timings is not None:
-            diagnostic_timings["　Excel③ 対象検索・書換え"] = time.perf_counter() - diagnostic_step_started
+            diagnostic_timings["　Excel② 計算値用Excelを開く"] = cached_values_seconds
+            diagnostic_timings["　Excel③ 対象検索・書換え"] = (
+                time.perf_counter() - diagnostic_step_started - cached_values_seconds
+            )
 
         output = BytesIO()
         diagnostic_step_started = time.perf_counter()
@@ -7173,38 +7264,32 @@ def update_workbook_bytes(
             diagnostic_timings["　Excel④ xlsm保存"] = time.perf_counter() - diagnostic_step_started
     finally:
         workbook.close()
-        if cached_workbook is not None:
-            cached_workbook.close()
 
     saved_content = output.getvalue()
     diagnostic_step_started = time.perf_counter()
-    verified = load_workbook(BytesIO(saved_content), keep_vba=True, data_only=False, read_only=False)
+    try:
+        with zipfile.ZipFile(BytesIO(saved_content), "r") as archive:
+            if "xl/vbaProject.bin" not in archive.namelist():
+                raise ValueError("保存後の検証でVBAプロジェクトを確認できません。")
+    except zipfile.BadZipFile as exc:
+        raise ValueError("保存後の検証でExcelファイルを開けません。") from exc
     if diagnostic_timings is not None:
         diagnostic_timings["　Excel⑤ 保存後Excelを開く"] = time.perf_counter() - diagnostic_step_started
 
     diagnostic_step_started = time.perf_counter()
-    try:
-        if list(verified.sheetnames) != original_sheets:
-            raise ValueError("保存後にシート構成が変わったため、更新を中止しました。")
-        required_sheets = {
+    verify_saved_workbook_lightweight(
+        saved_content,
+        original_sheets,
+        {
             DELIVERY_SHEET_NAME,
             SHEET_NAME,
             DELIVERY_HISTORY_SHEET_NAME,
             MANAGEMENT_SHEET_NAME,
-        }
-        if not required_sheets.issubset(set(verified.sheetnames)):
-            raise ValueError("保存後の検証で必要なシートが見つかりません。")
-        if verified.vba_archive is None:
-            raise ValueError("保存後の検証でVBAプロジェクトを確認できません。")
-        for sheet, row, column, expected in changed_cells:
-            actual = verified[sheet].cell(row, column).value
-            if not same_excel_value(actual, expected):
-                coordinate = verified[sheet].cell(row, column).coordinate
-                raise ValueError(f"保存後の検証で{sheet}!{coordinate}の値が一致しません。")
-        if diagnostic_timings is not None:
-            diagnostic_timings["　Excel⑥ 保存後内容検証"] = time.perf_counter() - diagnostic_step_started
-    finally:
-        verified.close()
+        },
+        changed_cells,
+    )
+    if diagnostic_timings is not None:
+        diagnostic_timings["　Excel⑥ 保存後内容検証"] = time.perf_counter() - diagnostic_step_started
     return saved_content, changed_cells
 
 
@@ -7486,40 +7571,29 @@ def update_delivery_history_record_bytes(
 
     saved_content = output.getvalue()
     diagnostic_step_started = time.perf_counter()
-    verified = load_workbook(
-        BytesIO(saved_content),
-        keep_vba=True,
-        data_only=False,
-        read_only=False,
-    )
+    try:
+        with zipfile.ZipFile(BytesIO(saved_content), "r") as archive:
+            if "xl/vbaProject.bin" not in archive.namelist():
+                raise ValueError("保存後の検証でVBAプロジェクトを確認できません。")
+    except zipfile.BadZipFile as exc:
+        raise ValueError("保存後の検証でExcelファイルを開けません。") from exc
     if diagnostic_timings is not None:
         diagnostic_timings["　Excel⑤ 保存後Excelを開く"] = time.perf_counter() - diagnostic_step_started
 
     diagnostic_step_started = time.perf_counter()
-    try:
-        if list(verified.sheetnames) != original_sheets:
-            raise ValueError("保存後にシート構成が変わったため、更新を中止しました。")
-        required_sheets = {
+    verify_saved_workbook_lightweight(
+        saved_content,
+        original_sheets,
+        {
             DELIVERY_SHEET_NAME,
             DELIVERY_HISTORY_SHEET_NAME,
             MANAGEMENT_SHEET_NAME,
             SHEET_NAME,
-        }
-        if not required_sheets.issubset(set(verified.sheetnames)):
-            raise ValueError("保存後の検証で必要なシートが見つかりません。")
-        if verified.vba_archive is None:
-            raise ValueError("保存後の検証でVBAプロジェクトを確認できません。")
-        for sheet, row, column, expected in changed_cells:
-            actual = verified[sheet].cell(row, column).value
-            if not same_excel_value(actual, expected):
-                coordinate = verified[sheet].cell(row, column).coordinate
-                raise ValueError(
-                    f"保存後の検証で{sheet}!{coordinate}の値が一致しません。"
-                )
-        if diagnostic_timings is not None:
-            diagnostic_timings["　Excel⑥ 保存後内容検証"] = time.perf_counter() - diagnostic_step_started
-    finally:
-        verified.close()
+        },
+        changed_cells,
+    )
+    if diagnostic_timings is not None:
+        diagnostic_timings["　Excel⑥ 保存後内容検証"] = time.perf_counter() - diagnostic_step_started
     return saved_content, changed_cells
 
 
