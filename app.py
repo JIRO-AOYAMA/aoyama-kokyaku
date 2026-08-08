@@ -8727,22 +8727,24 @@ def render_change_history_card(parsed):
         ) if part
     )
 
+    # クリック可能なカード内はspanだけで構成する。
+    # st.markdownがリンク内のブロック要素を分割して、各項目が別カードに見えるのを防ぐ。
     parts = [
-        '<div class="change-history-card-title">',
+        '<span class="change-history-card-title">',
         html.escape(title),
-        '</div>',
+        '</span>',
     ]
     if meta:
         parts.extend([
-            '<div class="change-history-card-meta">',
+            '<span class="change-history-card-meta">',
             html.escape(meta),
-            '</div>',
+            '</span>',
         ])
     if parsed["section"]:
         parts.extend([
-            '<div class="change-history-card-section">変更箇所：',
+            '<span class="change-history-card-section">変更箇所：',
             html.escape(parsed["section"]),
-            '</div>',
+            '</span>',
         ])
 
     for change in parsed["changes"]:
@@ -8756,13 +8758,13 @@ def render_change_history_card(parsed):
             clean_value(change.get("field"), blank_text="変更内容")
         )
         parts.extend([
-            '<div class="change-history-card-change">',
+            '<span class="change-history-card-change">',
             field_name,
             '：',
             before,
             ' → ',
             after,
-            '</div>',
+            '</span>',
         ])
 
     body = "".join(parts)
@@ -8806,24 +8808,28 @@ def show_change_history_page():
             text-decoration: none !important;
         }
         .change-history-card-title {
+            display: block;
             color: #172033;
             font-weight: 800;
             font-size: 1rem;
             line-height: 1.45;
         }
         .change-history-card-meta {
+            display: block;
             margin-top: 0.7rem;
             color: #667085;
             font-size: 0.86rem;
             line-height: 1.4;
         }
         .change-history-card-section {
+            display: block;
             margin-top: 0.85rem;
             color: #172033;
             font-weight: 800;
             line-height: 1.5;
         }
         .change-history-card-change {
+            display: block;
             margin-top: 0.72rem;
             color: #172033;
             line-height: 1.65;
