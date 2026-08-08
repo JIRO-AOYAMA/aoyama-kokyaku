@@ -6632,15 +6632,16 @@ def read_product_delivery_history_from_bytes(
                 int(row_number),
             )
 
-        # 候補は画面に必要な件数だけ保持する。全履歴件数は「さらに表示」のため数える。
-        candidates = [
-            {
-                "source": "current",
-                "row_number": current_row,
-                "values": current_values,
-                "sort_key": candidate_sort_key("current", current_row, current_values),
-            }
-        ]
+        # 「現在の登録」は配達日に関係なく必ず先頭に固定する。
+        # requested_limit の総表示件数は従来どおり維持し、残り枠に新しい履歴だけを保持する。
+        current_candidate = {
+            "source": "current",
+            "row_number": current_row,
+            "values": current_values,
+            "sort_key": candidate_sort_key("current", current_row, current_values),
+        }
+        history_candidates = []
+        history_capacity = max(0, requested_limit - 1)
         total_count = 1
 
         history_ws = workbook[DELIVERY_HISTORY_SHEET_NAME]
@@ -6653,24 +6654,28 @@ def read_product_delivery_history_from_bytes(
                 continue
 
             total_count += 1
+            if history_capacity <= 0:
+                continue
+
             candidate = {
                 "source": "history",
                 "row_number": row_number,
                 "values": values,
                 "sort_key": candidate_sort_key("history", row_number, values),
             }
-            if len(candidates) < requested_limit:
-                candidates.append(candidate)
+            if len(history_candidates) < history_capacity:
+                history_candidates.append(candidate)
                 continue
 
             oldest_index = min(
-                range(len(candidates)),
-                key=lambda index: candidates[index]["sort_key"],
+                range(len(history_candidates)),
+                key=lambda index: history_candidates[index]["sort_key"],
             )
-            if candidate["sort_key"] > candidates[oldest_index]["sort_key"]:
-                candidates[oldest_index] = candidate
+            if candidate["sort_key"] > history_candidates[oldest_index]["sort_key"]:
+                history_candidates[oldest_index] = candidate
 
-        candidates.sort(key=lambda item: item["sort_key"], reverse=True)
+        history_candidates.sort(key=lambda item: item["sort_key"], reverse=True)
+        candidates = [current_candidate] + history_candidates
 
         records = []
         for candidate in candidates:
@@ -8211,10 +8216,10 @@ def _update_delivery_history_record_bytes_xml_fast(
     proposed,
     diagnostic_timings=None,
 ):
-    """Privateテスト用。現在行または過去履歴の指定1行だけをXML直接更新する。"""
+    """Privateテスト用。現在行または過去の配達履歴1行だけをXML直接更新する。"""
     source = str((record_ref or {}).get("source") or "").strip()
     if source not in {"current", "history"}:
-        raise _XmlFastSaveUnavailable("修正対象の種類を確認できないため従来方式を使用します。")
+        raise _XmlFastSaveUnavailable("修正対象の納品履歴を特定できません。")
 
     initial_started = time.perf_counter()
     replacements = {}
@@ -8258,34 +8263,6 @@ def _update_delivery_history_record_bytes_xml_fast(
                 date_columns={11, 13},
             )
         )
-
-        # 現在行には共有数式が含まれる場合があり、XML単体では数式文字列を
-        # openpyxlと完全に同じ形へ復元できないことがある。競合検知の指紋は
-        # 従来と同じA:Nの値で比較するため、現在行だけ読み取り専用で1行取得する。
-        # 編集・保存自体はXML直接更新のままなので、通常の重いopenpyxl保存には戻さない。
-        if source == "current":
-            validation_workbook = load_workbook(
-                BytesIO(original_content),
-                keep_vba=False,
-                data_only=False,
-                read_only=True,
-            )
-            try:
-                validation_ws = validation_workbook[DELIVERY_SHEET_NAME]
-                validation_rows = list(
-                    validation_ws.iter_rows(
-                        min_row=row_number,
-                        max_row=row_number,
-                        max_col=14,
-                        values_only=True,
-                    )
-                )
-                if not validation_rows:
-                    raise ValueError("修正対象の行が見つかりません。再読み込みしてください。")
-                row_values = list(validation_rows[0])
-            finally:
-                validation_workbook.close()
-
         if diagnostic_timings is not None:
             diagnostic_timings["　Excel① マクロ付きExcelを開く"] = (
                 time.perf_counter() - initial_started
@@ -8390,8 +8367,7 @@ def _update_delivery_history_record_bytes_xml_fast(
                 quantity_changed = True
 
         # 配達履歴シートは数式ではないため、訂正後の次回配達予定も同じ行で再計算する。
-        # 次回配達日シート（現在の登録）は従来どおりM列数式そのものを維持し、
-        # Excel再計算に任せる。ここではM列の式や計算ルールを変更しない。
+        # 次回配達日シート（現在の登録）は従来方式どおりM列数式を維持し、Excel再計算に任せる。
         if source == "history" and (date_changed or quantity_changed):
             corrected_values = list(
                 _xml_fast_row_values(
@@ -8419,8 +8395,7 @@ def _update_delivery_history_record_bytes_xml_fast(
             raise ValueError("変更された項目がありません。")
 
         if source == "current":
-            # 現在行のM列など既存数式は残したまま、古い計算キャッシュだけを消す。
-            # 通常のXML高速保存と同じ扱いにしてExcel再計算へ任せる。
+            # 従来の通常保存と同じく、現在行の数式キャッシュは消して再計算を促す。
             _xml_fast_clear_formula_caches(row)
 
         replacements[sheet_path] = _xml_fast_serialize(sheet_root, sheet_xml)
@@ -17174,46 +17149,6 @@ def display_change_value(value):
     return str(value)
 
 
-def render_delivery_history_scroll_to_top_once(key_suffix):
-    """納品履歴を開いた直後だけ、履歴欄の先頭が見える位置へ戻す。"""
-    safe_suffix = re.sub(r"[^0-9A-Za-z_-]", "", str(key_suffix or ""))
-    anchor_id = f"aoyama-delivery-history-top-{safe_suffix}"
-    scroll_key = f"delivery_history_scroll_to_top_{key_suffix}"
-
-    st.markdown(
-        f'<div id="{html.escape(anchor_id, quote=True)}"></div>',
-        unsafe_allow_html=True,
-    )
-    if not st.session_state.pop(scroll_key, False):
-        return
-
-    components.html(
-        f"""
-        <script>
-        (() => {{
-          const parentWindow = window.parent;
-          const parentDocument = parentWindow.document;
-          const anchorId = {json.dumps(anchor_id)};
-          const move = () => {{
-            const target = parentDocument.getElementById(anchorId);
-            if (!target) return;
-            const rect = target.getBoundingClientRect();
-            parentWindow.scrollTo({{
-              top: Math.max(0, parentWindow.scrollY + rect.top - 78),
-              left: parentWindow.scrollX || 0,
-              behavior: 'auto',
-            }});
-          }};
-          parentWindow.requestAnimationFrame(move);
-          [80, 220, 520].forEach((delay) => parentWindow.setTimeout(move, delay));
-        }})();
-        </script>
-        """,
-        height=0,
-        scrolling=False,
-    )
-
-
 def render_customer_delivery_history_editor(
     customer_name,
     product_name,
@@ -17223,7 +17158,6 @@ def render_customer_delivery_history_editor(
 ):
     """編集画面の中だけで、現在の登録と過去の納品履歴を修正できるようにする。"""
     history_limit_key = f"delivery_history_limit_{key_suffix}"
-    render_delivery_history_scroll_to_top_once(key_suffix)
     st.markdown("#### 納品履歴")
     st.caption(
         "Excelの納品ボタンまたはアプリから登録した履歴です。"
@@ -17412,9 +17346,12 @@ def render_customer_delivery_history_editor(
 
                     result["diagnostic_started_at"] = diagnostic_started_at
                     result["diagnostic_before_rerun_seconds"] = time.time() - diagnostic_started_at
+                    # 納品履歴修正が完了したら、履歴欄・修正欄・通常編集欄をすべて閉じる。
                     st.session_state.pop(history_edit_key, None)
                     st.session_state.pop(history_open_key, None)
-                    st.session_state[f"excel_edit_{key_suffix}"] = True
+                    st.session_state.pop(history_limit_key, None)
+                    st.session_state.pop(f"excel_edit_{key_suffix}", None)
+                    st.session_state.pop(f"excel_confirm_{key_suffix}", None)
                     st.session_state["excel_save_success"] = {
                         **result,
                         "customer_name": customer_name,
@@ -17583,7 +17520,6 @@ def render_customer_excel_editor(customer_name, customer_key, product_name, curr
     ):
         st.session_state[history_open_key] = True
         st.session_state[history_limit_key] = 20
-        st.session_state[f"delivery_history_scroll_to_top_{key_suffix}"] = True
         st.session_state.pop(history_edit_key, None)
         st.rerun()
 
