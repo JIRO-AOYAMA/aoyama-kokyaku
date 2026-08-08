@@ -114,7 +114,7 @@ FULL_DATA_BACKUP_DROPBOX_FOLDER = st.secrets.get(
 )
 DROPBOX_FAST_CACHE_FILE = "/1共有　青山商店　本社/配車表-北海道-/顧客検索キャッシュ.json"
 # Excelの列構成や読み込み処理を変更した時は、この番号を上げて古いJSONを無効化する。
-DROPBOX_FAST_CACHE_VERSION = 5
+DROPBOX_FAST_CACHE_VERSION = 6
 DISPATCH_DROPBOX_DEFAULT_FILE_PATH = "/1共有　青山商店　本社/配車表-次郎-/配車表1.xlsm"
 DISPATCH_DROPBOX_FILE_PATH = st.secrets.get(
     "DISPATCH_DROPBOX_FILE_PATH",
@@ -15001,6 +15001,7 @@ def rebuild_sheet1_from_formula_references(excel_source):
                     "ID": delivery_values[0] if len(delivery_values) >= 1 else None,
                     "顧客名": customer_name,
                     "地域": delivery_values[2] if len(delivery_values) >= 3 else None,
+                    "コンサル": delivery_values[3] if len(delivery_values) >= 4 else None,
                     "商品名": product_name,
                     "使用数量/日": delivery_values[6] if len(delivery_values) >= 7 else None,
                     "予想使用量/日": predicted_usage_map.get(history_key),
@@ -16068,6 +16069,7 @@ def show_customer_detail(df, customer_name):
     has_named_product = bool(named_product_mask.any())
 
     region = clean_value(detail.iloc[0]["地域"])
+    consultant = clean_value(detail.iloc[0].get("コンサル"), blank_text="")
 
     st.markdown("---")
     line_connected = get_line_connected(customer_name)
@@ -16099,6 +16101,7 @@ def show_customer_detail(df, customer_name):
                             st.rerun()
 
     st.write(f"**地域：** {region}")
+    st.write(f"**コンサル：** {consultant}")
     st.write(f"**商品数：** {len(visible_detail)}件")
 
     success = st.session_state.pop("excel_save_success", None)
