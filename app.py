@@ -7025,9 +7025,17 @@ def update_workbook_bytes(original_content, customer_name, product_name, propose
 
 def save_customer_excel_changes(customer_name, product_name, proposed):
     """Fast save path with backup, local validation, rev conflict protection, and hash verification."""
+    diagnostic_total_started = time.perf_counter()
+    diagnostic_timings = {}
+
+    diagnostic_step_started = time.perf_counter()
     access_token = get_dropbox_access_token()
     target_path = get_dropbox_file_path()
+    diagnostic_timings["Dropbox接続準備"] = time.perf_counter() - diagnostic_step_started
+
+    diagnostic_step_started = time.perf_counter()
     original_content, download_response = download_dropbox_file(target_path, access_token)
+    diagnostic_timings["Excel取得"] = time.perf_counter() - diagnostic_step_started
     if original_content is None:
         raise RuntimeError("\u6700\u65b0\u306eExcel\u3092\u53d6\u5f97\u3067\u304d\u307e\u305b\u3093\u3067\u3057\u305f\u3002\n" + dropbox_error_text(download_response))
     revision = get_download_revision(download_response)
@@ -7039,19 +7047,25 @@ def save_customer_excel_changes(customer_name, product_name, proposed):
 
     # Dropbox-internal copy avoids uploading the same 1.8 MB file a second time.
     # The copied backup is hash-checked before the production file is touched.
+    diagnostic_step_started = time.perf_counter()
     create_dropbox_backup(
         target_path,
         backup_path,
         original_content,
         access_token,
     )
+    diagnostic_timings["バックアップ作成"] = time.perf_counter() - diagnostic_step_started
 
+    diagnostic_step_started = time.perf_counter()
     saved_content, changed_cells = update_workbook_bytes(
         original_content,
         customer_name,
         product_name,
         proposed,
     )
+    diagnostic_timings["Excel編集・保存・検証"] = time.perf_counter() - diagnostic_step_started
+
+    diagnostic_step_started = time.perf_counter()
     upload_response = upload_dropbox_file(
         target_path,
         saved_content,
@@ -7059,6 +7073,7 @@ def save_customer_excel_changes(customer_name, product_name, proposed):
         mode="update",
         rev=revision,
     )
+    diagnostic_timings["Dropbox本番保存"] = time.perf_counter() - diagnostic_step_started
     if upload_response.status_code == 409:
         raise RuntimeError("PC\u307e\u305f\u306f\u5225\u7aef\u672b\u3067Excel\u304c\u66f4\u65b0\u3055\u308c\u3066\u3044\u307e\u3059\u3002\u518d\u8aad\u307f\u8fbc\u307f\u3057\u3066\u304b\u3089\u3084\u308a\u76f4\u3057\u3066\u304f\u3060\u3055\u3044")
     if upload_response.status_code != 200:
@@ -7066,6 +7081,7 @@ def save_customer_excel_changes(customer_name, product_name, proposed):
 
     # The upload response contains size, rev, and content_hash. Verifying those
     # guarantees the bytes without downloading the full workbook again.
+    diagnostic_step_started = time.perf_counter()
     upload_metadata = get_dropbox_response_metadata(upload_response)
     if not upload_metadata.get("content_hash") or upload_metadata.get("size") is None:
         upload_metadata = get_dropbox_file_metadata(target_path, access_token)
@@ -7074,25 +7090,35 @@ def save_customer_excel_changes(customer_name, product_name, proposed):
         saved_content,
         previous_revision=revision,
     )
+    diagnostic_timings["保存結果確認"] = time.perf_counter() - diagnostic_step_started
 
     # Use the already verified local bytes to rebuild the immediate-display JSON.
+    diagnostic_step_started = time.perf_counter()
     cache_warning = refresh_fast_dropbox_cache_after_save(
         saved_content,
         confirmed_revision,
         access_token,
     )
+    diagnostic_timings["表示用データ更新"] = time.perf_counter() - diagnostic_step_started
 
     # Keep the existing exact rule: retain the newest 30 backups.
+    diagnostic_step_started = time.perf_counter()
     cleanup_warning = trim_old_dropbox_backups(access_token, keep=30)
+    diagnostic_timings["バックアップ整理"] = time.perf_counter() - diagnostic_step_started
     warnings = [warning for warning in (cleanup_warning, cache_warning) if warning]
     # 在庫保存では顧客Excelに関係するキャッシュだけを更新する。
     # 他機能のキャッシュを残し、保存直後の画面再表示を軽くする。
+    diagnostic_step_started = time.perf_counter()
     clear_customer_excel_caches_after_save()
+    diagnostic_timings["関連キャッシュ更新"] = time.perf_counter() - diagnostic_step_started
+    diagnostic_save_seconds = time.perf_counter() - diagnostic_total_started
     return {
         "backup_path": backup_path,
         "updated_at": get_jst_now(),
         "changed_cells": changed_cells,
         "cleanup_warning": "\n".join(warnings),
+        "diagnostic_timings": diagnostic_timings,
+        "diagnostic_save_seconds": diagnostic_save_seconds,
     }
 
 
@@ -7296,12 +7322,20 @@ def save_customer_delivery_history_correction(
     proposed,
 ):
     """バックアップ・競合防止・ハッシュ確認付きで納品履歴の1件を訂正する。"""
+    diagnostic_total_started = time.perf_counter()
+    diagnostic_timings = {}
+
+    diagnostic_step_started = time.perf_counter()
     access_token = get_dropbox_access_token()
     target_path = get_dropbox_file_path()
+    diagnostic_timings["Dropbox接続準備"] = time.perf_counter() - diagnostic_step_started
+
+    diagnostic_step_started = time.perf_counter()
     original_content, download_response = download_dropbox_file(
         target_path,
         access_token,
     )
+    diagnostic_timings["Excel取得"] = time.perf_counter() - diagnostic_step_started
     if original_content is None:
         raise RuntimeError(
             "最新のExcelを取得できませんでした。\n"
@@ -7315,13 +7349,16 @@ def save_customer_delivery_history_correction(
 
     timestamp = get_jst_now().strftime("%Y%m%d_%H%M%S_%f")
     backup_path = f"{DROPBOX_BACKUP_FOLDER}/配車予定 次郎_{timestamp}.xlsm"
+    diagnostic_step_started = time.perf_counter()
     create_dropbox_backup(
         target_path,
         backup_path,
         original_content,
         access_token,
     )
+    diagnostic_timings["バックアップ作成"] = time.perf_counter() - diagnostic_step_started
 
+    diagnostic_step_started = time.perf_counter()
     saved_content, changed_cells = update_delivery_history_record_bytes(
         original_content,
         customer_name,
@@ -7329,6 +7366,9 @@ def save_customer_delivery_history_correction(
         record_ref,
         proposed,
     )
+    diagnostic_timings["Excel編集・保存・検証"] = time.perf_counter() - diagnostic_step_started
+
+    diagnostic_step_started = time.perf_counter()
     upload_response = upload_dropbox_file(
         target_path,
         saved_content,
@@ -7336,6 +7376,7 @@ def save_customer_delivery_history_correction(
         mode="update",
         rev=revision,
     )
+    diagnostic_timings["Dropbox本番保存"] = time.perf_counter() - diagnostic_step_started
     if upload_response.status_code == 409:
         raise RuntimeError(
             "PCまたは別端末でExcelが更新されています。"
@@ -7347,6 +7388,7 @@ def save_customer_delivery_history_correction(
             + dropbox_error_text(upload_response)
         )
 
+    diagnostic_step_started = time.perf_counter()
     upload_metadata = get_dropbox_response_metadata(upload_response)
     if not upload_metadata.get("content_hash") or upload_metadata.get("size") is None:
         upload_metadata = get_dropbox_file_metadata(target_path, access_token)
@@ -7355,24 +7397,34 @@ def save_customer_delivery_history_correction(
         saved_content,
         previous_revision=revision,
     )
+    diagnostic_timings["保存結果確認"] = time.perf_counter() - diagnostic_step_started
 
     # 過去履歴の訂正でも予想使用量が変わるため、表示用JSONを必ず作り直す。
+    diagnostic_step_started = time.perf_counter()
     cache_warning = refresh_fast_dropbox_cache_after_save(
         saved_content,
         confirmed_revision,
         access_token,
     )
+    diagnostic_timings["表示用データ更新"] = time.perf_counter() - diagnostic_step_started
+    diagnostic_step_started = time.perf_counter()
     cleanup_warning = trim_old_dropbox_backups(access_token, keep=30)
+    diagnostic_timings["バックアップ整理"] = time.perf_counter() - diagnostic_step_started
     warnings = [warning for warning in (cleanup_warning, cache_warning) if warning]
     # 納品履歴の訂正でも、顧客Excelに関係するキャッシュだけを更新する。
     # 写真・メモ・OneDrive・配車表・取引先など、納品履歴修正と無関係な
     # キャッシュは残し、保存直後の画面再表示を重くしない。
+    diagnostic_step_started = time.perf_counter()
     clear_customer_excel_caches_after_save()
+    diagnostic_timings["関連キャッシュ更新"] = time.perf_counter() - diagnostic_step_started
+    diagnostic_save_seconds = time.perf_counter() - diagnostic_total_started
     return {
         "backup_path": backup_path,
         "updated_at": get_jst_now(),
         "changed_cells": changed_cells,
         "cleanup_warning": "\n".join(warnings),
+        "diagnostic_timings": diagnostic_timings,
+        "diagnostic_save_seconds": diagnostic_save_seconds,
     }
 
 
@@ -15657,6 +15709,7 @@ def render_customer_delivery_history_editor(
                         st.warning("変更された項目がありません。")
                         continue
 
+                    diagnostic_started_at = time.time()
                     with st.spinner("バックアップを作成して履歴を修正しています…"):
                         result = save_customer_delivery_history_correction(
                             customer_name,
@@ -15665,6 +15718,7 @@ def render_customer_delivery_history_editor(
                             proposed,
                         )
                         result["usage_warning"] = ""
+                        diagnostic_history_started = time.perf_counter()
                         result["history_warning"] = record_change_history_safely(
                             "顧客",
                             "",
@@ -15673,7 +15727,12 @@ def render_customer_delivery_history_editor(
                             changes,
                             section=f"商品：{product_name}／納品履歴",
                         )
+                        result.setdefault("diagnostic_timings", {})["変更履歴保存"] = (
+                            time.perf_counter() - diagnostic_history_started
+                        )
 
+                    result["diagnostic_started_at"] = diagnostic_started_at
+                    result["diagnostic_before_rerun_seconds"] = time.time() - diagnostic_started_at
                     st.session_state.pop(history_edit_key, None)
                     st.session_state.pop(history_open_key, None)
                     st.session_state[f"excel_edit_{key_suffix}"] = True
@@ -15758,9 +15817,11 @@ def render_customer_excel_editor(customer_name, customer_key, product_name, curr
         with save_col:
             if st.button("保存", key=f"save_confirm_{key_suffix}", type="primary", use_container_width=True):
                 try:
+                    diagnostic_started_at = time.time()
                     with st.spinner("バックアップを作成して保存しています…"):
                         result = save_customer_excel_changes(customer_name, product_name, pending["proposed"])
                         result["usage_warning"] = ""
+                        diagnostic_history_started = time.perf_counter()
                         result["history_warning"] = record_change_history_safely(
                             "顧客",
                             "",
@@ -15769,6 +15830,11 @@ def render_customer_excel_editor(customer_name, customer_key, product_name, curr
                             pending["changes"],
                             section=f"商品：{product_name}",
                         )
+                        result.setdefault("diagnostic_timings", {})["変更履歴保存"] = (
+                            time.perf_counter() - diagnostic_history_started
+                        )
+                    result["diagnostic_started_at"] = diagnostic_started_at
+                    result["diagnostic_before_rerun_seconds"] = time.time() - diagnostic_started_at
                     st.session_state.pop(confirm_key, None)
                     st.session_state.pop(edit_key, None)
                     st.session_state.pop(history_open_key, None)
@@ -15895,6 +15961,7 @@ def render_customer_excel_editor(customer_name, customer_key, product_name, curr
             if not changes:
                 st.warning("変更された項目がありません。")
             else:
+                diagnostic_started_at = time.time()
                 with st.spinner("DropboxのExcelへ保存しています…"):
                     result = save_customer_excel_changes(
                         customer_name,
@@ -15902,6 +15969,7 @@ def render_customer_excel_editor(customer_name, customer_key, product_name, curr
                         proposed,
                     )
                     result["usage_warning"] = ""
+                    diagnostic_history_started = time.perf_counter()
                     result["history_warning"] = record_change_history_safely(
                         "顧客",
                         "",
@@ -15910,6 +15978,11 @@ def render_customer_excel_editor(customer_name, customer_key, product_name, curr
                         changes,
                         section=f"商品：{product_name}",
                     )
+                    result.setdefault("diagnostic_timings", {})["変更履歴保存"] = (
+                        time.perf_counter() - diagnostic_history_started
+                    )
+                result["diagnostic_started_at"] = diagnostic_started_at
+                result["diagnostic_before_rerun_seconds"] = time.time() - diagnostic_started_at
                 st.session_state.pop(confirm_key, None)
                 st.session_state.pop(edit_key, None)
                 st.session_state.pop(history_open_key, None)
@@ -16139,6 +16212,59 @@ def show_customer_detail(df, customer_name):
             st.warning(success["usage_warning"])
         if success.get("history_warning"):
             st.warning(success["history_warning"])
+
+        diagnostic_timings = success.get("diagnostic_timings") or {}
+        if diagnostic_timings:
+            try:
+                diagnostic_started_at = float(success.get("diagnostic_started_at") or 0)
+            except (TypeError, ValueError):
+                diagnostic_started_at = 0.0
+            try:
+                diagnostic_before_rerun = float(
+                    success.get("diagnostic_before_rerun_seconds") or 0
+                )
+            except (TypeError, ValueError):
+                diagnostic_before_rerun = 0.0
+
+            diagnostic_total_to_display = (
+                max(0.0, time.time() - diagnostic_started_at)
+                if diagnostic_started_at > 0
+                else diagnostic_before_rerun
+            )
+            diagnostic_rerun_seconds = max(
+                0.0,
+                diagnostic_total_to_display - diagnostic_before_rerun,
+            )
+
+            st.markdown("**⏱ 保存時間診断**")
+            diagnostic_order = (
+                "Dropbox接続準備",
+                "Excel取得",
+                "バックアップ作成",
+                "Excel編集・保存・検証",
+                "Dropbox本番保存",
+                "保存結果確認",
+                "表示用データ更新",
+                "バックアップ整理",
+                "関連キャッシュ更新",
+                "変更履歴保存",
+            )
+            for diagnostic_label in diagnostic_order:
+                if diagnostic_label not in diagnostic_timings:
+                    continue
+                try:
+                    diagnostic_seconds = float(diagnostic_timings[diagnostic_label])
+                except (TypeError, ValueError):
+                    continue
+                st.write(f"{diagnostic_label}：{diagnostic_seconds:.2f}秒")
+            try:
+                diagnostic_save_seconds = float(success.get("diagnostic_save_seconds") or 0)
+            except (TypeError, ValueError):
+                diagnostic_save_seconds = 0.0
+            if diagnostic_save_seconds > 0:
+                st.write(f"**保存処理小計：{diagnostic_save_seconds:.2f}秒**")
+            st.write(f"画面再表示：{diagnostic_rerun_seconds:.2f}秒")
+            st.write(f"**保存開始から表示まで：{diagnostic_total_to_display:.2f}秒**")
 
     try:
         map_info = get_customer_map_info(detail)
